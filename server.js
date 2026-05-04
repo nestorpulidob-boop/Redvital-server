@@ -110,6 +110,29 @@ app.get('/api/alertas', (req, res) => {
   if (totalIngresos < metaHora) alertas.push({ nivel: 'media', mensaje: 'Ingresos bajo lo esperado', actual: totalIngresos, esperado: Math.round(metaHora), accion: 'Revisar slots y contactar lista de espera' });
   res.json({ ok: true, alertas, total: alertas.length });
 });
+async function registrarWebhook(token, sedeNombre) {
+  try {
+    const res = await axios.post(`${RESERVO_API}/webhooks/`, {
+      email_contacto: 'contacto@redvital.cl',
+      descripcion: `Dashboard Redvital - ${sedeNombre}`,
+      url: 'https://redvital-server.onrender.com/webhook/reservo',
+      suscripciones: ['citas', 'pacientes', 'ventas']
+    }, {
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+    });
+    console.log(`Webhook OK ${sedeNombre}:`, res.data);
+    return res.data;
+  } catch (err) {
+    console.log(`Webhook error ${sedeNombre}:`, err.response?.data || err.message);
+    return null;
+  }
+}
+
+app.get('/api/registrar-webhooks', async (req, res) => {
+  const r1 = await registrarWebhook(SEDES.sede1.token, SEDES.sede1.nombre);
+  const r2 = await registrarWebhook(SEDES.sede2.token, SEDES.sede2.nombre);
+  res.json({ ok: true, sede1: r1, sede2: r2 });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
