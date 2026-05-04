@@ -118,7 +118,7 @@ async function registrarWebhook(token, sedeNombre) {
       url: 'https://redvital-server.onrender.com/webhook/reservo',
       suscripciones: ['citas', 'pacientes', 'ventas']
     }, {
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
+      headers: { Authorization: `Token ${token}`, 'Content-Type': 'application/json' }
     });
     console.log(`Webhook OK ${sedeNombre}:`, res.data);
     return res.data;
