@@ -48,12 +48,28 @@ async function actualizarDatos() {
   console.log('Datos actualizados:', new Date().toLocaleTimeString());
 }
 
-app.post('/webhook/reservo', (req, res) => {
-  cache.webhookEventos.unshift({ ...req.body, recibidoEn: new Date().toISOString() });
+const evento = req.body;
+  console.log('Webhook recibido:', evento.evento);
+  cache.webhookEventos.unshift({ ...evento, recibidoEn: new Date().toISOString() });
   if (cache.webhookEventos.length > 100) cache.webhookEventos = cache.webhookEventos.slice(0, 100);
-  actualizarDatos();
+  if (evento.evento === 'citas' && evento.datos) {
+    const cita = evento.datos;
+    const sede = evento.fuente === 'd6993f4e-a5e8-4c89-92e4-85826858da11' ? 'sede2' : 'sede1';
+    const idx = cache[sede].citas.findIndex(c => c.uuid === cita.uuid);
+    if (idx >= 0) cache[sede].citas[idx] = cita;
+    else cache[sede].citas.unshift(cita);
+    cache[sede].ultimaActualizacion = new Date().toISOString();
+  }
+  if (evento.evento === 'ventas' && evento.datos) {
+    const venta = evento.datos;
+    const sede = evento.fuente === 'd6993f4e-a5e8-4c89-92e4-85826858da11' ? 'sede2' : 'sede1';
+    const idx = cache[sede].ventas.findIndex(v => v.uuid === venta.uuid);
+    if (idx >= 0) cache[sede].ventas[idx] = venta;
+    else cache[sede].ventas.unshift(venta);
+    cache[sede].ultimaActualizacion = new Date().toISOString();
+  }
   res.json({ mensaje: 'Validación de salud completada con éxito.' });
-});
+
 
 app.get('/api/status', (req, res) => {
   res.json({
