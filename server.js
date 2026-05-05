@@ -1,475 +1,520 @@
-const express = require(‘express’);
-const cors = require(‘cors’);
-const axios = require(‘axios’);
-const { Pool } = require(‘pg’);
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const { Pool } = require("pg");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// =============================================
-// CONEXIÓN A POSTGRESQL
-// =============================================
+// ============================================
+// CONEXION A POSTGRESQL
+// ============================================
 const pool = new Pool({
-connectionString: process.env.DATABASE_URL,
-ssl: { rejectUnauthorized: false }
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-// =============================================
-// TOKENS DE RESERVO — AMBAS SEDES
-// =============================================
+// ============================================
+// CONFIGURACION DE SEDES
+// ============================================
 const SEDES = {
-sede1: {
-nombre: ‘RedVital Sede Maturana’,
-token: process.env.TOKEN_SEDE1,
-box: 7
-},
-sede2: {
-nombre: ‘Centro Médico Redvital’,
-token: process.env.TOKEN_SEDE2,
-box: 5
-}
-};
-
-const RESERVO_API = ‘https://reservo.cl/APIpublica/v2’;
-
-// =============================================
-// CACHE EN MEMORIA (para respuestas rápidas)
-// =============================================
-let cache = {
-sede1: { citas: [], ventas: [], pacientes: [], ultimaActualizacion: null },
-sede2: { citas: [], ventas: [], pacientes: [], ultimaActualizacion: null },
-webhookEventos: []
-};
-
-// =============================================
-// CREAR TABLAS AUTOMÁTICAMENTE AL ARRANCAR
-// =============================================
-async function crearTablas() {
-const client = await pool.connect();
-try {
-await client.query(`
-CREATE TABLE IF NOT EXISTS citas (
-id SERIAL PRIMARY KEY,
-reservo_id VARCHAR(100) UNIQUE,
-sede VARCHAR(20) NOT NULL,
-paciente_nombre VARCHAR(200),
-paciente_rut VARCHAR(20),
-paciente_telefono VARCHAR(20),
-profesional_nombre VARCHAR(200),
-especialidad VARCHAR(150),
-fecha DATE NOT NULL,
-hora TIME,
-estado VARCHAR(50),
-monto INTEGER DEFAULT 0,
-pagado BOOLEAN DEFAULT FALSE,
-creada_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-actualizada_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-raw_data JSONB
-);
-
-```
-  CREATE TABLE IF NOT EXISTS pacientes (
-    id SERIAL PRIMARY KEY,
-    rut VARCHAR(20) UNIQUE,
-    nombre VARCHAR(200),
-    telefono VARCHAR(20),
-    email VARCHAR(200),
-    sede VARCHAR(20),
-    primera_visita DATE,
-    ultima_visita DATE,
-    total_visitas INTEGER DEFAULT 0,
-    creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS ventas (
-    id SERIAL PRIMARY KEY,
-    reservo_id VARCHAR(100) UNIQUE,
-    cita_id INTEGER REFERENCES citas(id),
-    sede VARCHAR(20),
-    monto INTEGER NOT NULL,
-    metodo_pago VARCHAR(50),
-    fecha DATE NOT NULL,
-    creada_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    raw_data JSONB
-  );
-
-  CREATE TABLE IF NOT EXISTS webhook_eventos (
-    id SERIAL PRIMARY KEY,
-    tipo VARCHAR(100),
-    sede VARCHAR(20),
-    payload JSONB,
-    recibido_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_citas_fecha ON citas(fecha);
-  CREATE INDEX IF NOT EXISTS idx_citas_especialidad ON citas(especialidad);
-  CREATE INDEX IF NOT EXISTS idx_citas_sede ON citas(sede);
-  CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON ventas(fecha);
-`);
-console.log('✅ Tablas creadas/verificadas en PostgreSQL');
-```
-
-} catch (err) {
-console.error(‘❌ Error creando tablas:’, err.message);
-} finally {
-client.release();
-}
-}
-
-// =============================================
-// GUARDAR CITA EN BD (UPSERT)
-// =============================================
-async function guardarCita(cita, sede) {
-if (!cita || !cita.id) return;
-try {
-await pool.query(`INSERT INTO citas (reservo_id, sede, paciente_nombre, paciente_rut, paciente_telefono, profesional_nombre, especialidad, fecha, hora, estado, monto, raw_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (reservo_id) DO UPDATE SET estado = EXCLUDED.estado, monto = EXCLUDED.monto, actualizada_en = CURRENT_TIMESTAMP, raw_data = EXCLUDED.raw_data`, [
-String(cita.id),
-sede,
-cita.paciente_nombre || cita.paciente || null,
-cita.paciente_rut || cita.rut || null,
-cita.paciente_telefono || cita.telefono || null,
-cita.profesional_nombre || cita.profesional || null,
-cita.especialidad || null,
-cita.fecha || new Date().toISOString().split(‘T’)[0],
-cita.hora || cita.hora_inicio || null,
-cita.estado || ‘pendiente’,
-cita.monto || cita.precio || 0,
-cita
-]);
-} catch (err) {
-console.error(‘Error guardando cita:’, err.message);
-}
-}
-
-// =============================================
-// LLAMAR API RESERVO
-// =============================================
-async function llamarReservo(endpoint, token, params = {}) {
-try {
-const res = await axios.get(`${RESERVO_API}${endpoint}`, {
-headers: { Authorization: `Bearer ${token}` },
-params,
-timeout: 30000
-});
-return res.data;
-} catch (err) {
-console.error(`Error API Reservo ${endpoint}:`, err.message);
-return null;
-}
-}
-
-// =============================================
-// ACTUALIZAR DATOS DE AMBAS SEDES (cache + BD)
-// =============================================
-async function actualizarDatos() {
-const hoy = new Date().toISOString().split(‘T’)[0];
-console.log(`[${new Date().toLocaleTimeString()}] Actualizando datos...`);
-
-for (const [key, sede] of Object.entries(SEDES)) {
-if (!sede.token) continue;
-
-```
-const [citas, ventas, pacientes] = await Promise.all([
-  llamarReservo('/citas', sede.token, { fecha: hoy }),
-  llamarReservo('/ventas', sede.token, { fecha: hoy }),
-  llamarReservo('/pacientes', sede.token, { limit: 100 })
-]);
-
-if (citas) {
-  cache[key].citas = citas;
-  // Guardar cada cita en BD
-  for (const cita of citas) {
-    await guardarCita(cita, key);
-  }
-}
-if (ventas) cache[key].ventas = ventas;
-if (pacientes) cache[key].pacientes = pacientes;
-cache[key].ultimaActualizacion = new Date().toISOString();
-```
-
-}
-
-console.log(‘✅ Datos actualizados (cache + BD)’);
-}
-
-// =============================================
-// WEBHOOK RESERVO
-// =============================================
-app.post(’/webhook/reservo’, async (req, res) => {
-const evento = req.body;
-console.log(‘📩 Webhook recibido’);
-
-// Guardar evento en BD
-try {
-await pool.query(
-‘INSERT INTO webhook_eventos (tipo, payload) VALUES ($1, $2)’,
-[evento.tipo || ‘unknown’, evento]
-);
-} catch (err) {
-console.error(‘Error guardando webhook:’, err.message);
-}
-
-cache.webhookEventos.unshift({ …evento, recibidoEn: new Date().toISOString() });
-if (cache.webhookEventos.length > 100) cache.webhookEventos = cache.webhookEventos.slice(0, 100);
-
-actualizarDatos();
-res.json({ mensaje: ‘Validación de salud completada con éxito.’ });
-});
-
-// =============================================
-// ENDPOINT: CARGAR HISTÓRICO DE RESERVO
-// Uso: /api/cargar-historico?desde=2026-02-01&hasta=2026-05-04
-// =============================================
-app.get(’/api/cargar-historico’, async (req, res) => {
-const { desde = ‘2026-02-01’, hasta = new Date().toISOString().split(‘T’)[0] } = req.query;
-let totalGuardadas = 0;
-const errores = [];
-
-res.json({
-ok: true,
-mensaje: ‘Carga histórica iniciada en background’,
-desde, hasta,
-nota: ‘Revisa logs y /api/stats para ver progreso’
-});
-
-// Procesar en background
-(async () => {
-for (const [key, sede] of Object.entries(SEDES)) {
-if (!sede.token) continue;
-console.log(`📥 Cargando histórico ${sede.nombre} desde ${desde} hasta ${hasta}...`);
-
-```
-  try {
-    const citas = await llamarReservo('/citas', sede.token, { desde, hasta, limit: 5000 });
-    if (citas && Array.isArray(citas)) {
-      for (const cita of citas) {
-        await guardarCita(cita, key);
-        totalGuardadas++;
-      }
-      console.log(`✅ ${sede.nombre}: ${citas.length} citas procesadas`);
-    }
-  } catch (err) {
-    console.error(`❌ Error en ${sede.nombre}:`, err.message);
-    errores.push({ sede: key, error: err.message });
-  }
-}
-console.log(`🎉 Histórico completo: ${totalGuardadas} citas guardadas`);
-```
-
-})();
-});
-
-// =============================================
-// ENDPOINT: ESTADÍSTICAS DE BD
-// =============================================
-app.get(’/api/stats’, async (req, res) => {
-try {
-const [citas, pacientes, ventas, eventos] = await Promise.all([
-pool.query(‘SELECT COUNT(*) FROM citas’),
-pool.query(’SELECT COUNT(*) FROM pacientes’),
-pool.query(‘SELECT COUNT(*) FROM ventas’),
-pool.query(’SELECT COUNT(*) FROM webhook_eventos’)
-]);
-const fechas = await pool.query(‘SELECT MIN(fecha) as desde, MAX(fecha) as hasta FROM citas’);
-const porEsp = await pool.query(`SELECT especialidad, COUNT(*) as total FROM citas WHERE especialidad IS NOT NULL GROUP BY especialidad ORDER BY total DESC LIMIT 20`);
-
-```
-res.json({
-  ok: true,
-  bd: {
-    total_citas: parseInt(citas.rows[0].count),
-    total_pacientes: parseInt(pacientes.rows[0].count),
-    total_ventas: parseInt(ventas.rows[0].count),
-    total_eventos_webhook: parseInt(eventos.rows[0].count)
+  sede1: {
+    nombre: "RedVital Sede Maturana",
+    token: process.env.TOKEN_SEDE1,
+    box: 7
   },
-  rango: fechas.rows[0],
-  top_especialidades: porEsp.rows
-});
-```
+  sede2: {
+    nombre: "Centro Medico Redvital",
+    token: process.env.TOKEN_SEDE2,
+    box: 5
+  }
+};
 
-} catch (err) {
-res.status(500).json({ ok: false, error: err.message });
+const ultimaActualizacion = {
+  sede1: null,
+  sede2: null
+};
+
+// ============================================
+// INICIALIZAR BASE DE DATOS
+// ============================================
+async function inicializarBD() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS citas (
+        uuid TEXT PRIMARY KEY,
+        sede TEXT NOT NULL,
+        sucursal_uuid TEXT,
+        sucursal_nombre TEXT,
+        agenda_uuid TEXT,
+        agenda_descripcion TEXT,
+        profesional_uuid TEXT,
+        profesional_nombre TEXT,
+        especialidad TEXT,
+        cliente_uuid TEXT,
+        cliente_nombre TEXT,
+        cliente_apellido TEXT,
+        cliente_rut TEXT,
+        cliente_telefono TEXT,
+        cliente_email TEXT,
+        inicio TIMESTAMPTZ,
+        fin TIMESTAMPTZ,
+        estado_codigo TEXT,
+        estado_descripcion TEXT,
+        estado_pago TEXT,
+        tratamientos JSONB,
+        datos_completos JSONB,
+        fecha_creacion TIMESTAMPTZ,
+        actualizado_en TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ventas (
+        uuid TEXT PRIMARY KEY,
+        sede TEXT NOT NULL,
+        sucursal_uuid TEXT,
+        sucursal_nombre TEXT,
+        cita_uuid TEXT,
+        receptor_uuid TEXT,
+        receptor_nombre TEXT,
+        receptor_rut TEXT,
+        monto NUMERIC,
+        estado_codigo TEXT,
+        estado_descripcion TEXT,
+        fecha DATE,
+        fecha_ingreso TIMESTAMPTZ,
+        items JSONB,
+        pagos JSONB,
+        datos_completos JSONB,
+        actualizado_en TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_inicio ON citas(inicio)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_sede ON citas(sede)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_especialidad ON citas(especialidad)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON ventas(fecha)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ventas_sede ON ventas(sede)`);
+
+    console.log("Base de datos inicializada correctamente");
+  } catch (err) {
+    console.error("Error inicializando BD:", err.message);
+  }
 }
-});
 
-// =============================================
-// ENDPOINT: COMPARATIVA POR ESPECIALIDAD
-// Uso: /api/comparativa/especialidad?periodo=semana
-// =============================================
-app.get(’/api/comparativa/especialidad’, async (req, res) => {
-const { periodo = ‘semana’ } = req.query;
-const dias = periodo === ‘mes’ ? 30 : periodo === ‘trimestre’ ? 90 : 7;
+// ============================================
+// GUARDAR CITA EN BD
+// ============================================
+async function guardarCita(sedeKey, datos) {
+  try {
+    const tratamientos = datos.tratamientos || [];
+    const especialidad = tratamientos.length > 0 ? tratamientos[0].nombre : (datos.agenda ? datos.agenda.descripcion : null);
 
-try {
-const result = await pool.query(`WITH actual AS ( SELECT especialidad, COUNT(*) as citas, SUM(monto) as ingresos FROM citas WHERE fecha >= CURRENT_DATE - INTERVAL '${dias} days' AND fecha <= CURRENT_DATE AND especialidad IS NOT NULL GROUP BY especialidad ), anterior AS ( SELECT especialidad, COUNT(*) as citas, SUM(monto) as ingresos FROM citas WHERE fecha >= CURRENT_DATE - INTERVAL '${dias * 2} days' AND fecha < CURRENT_DATE - INTERVAL '${dias} days' AND especialidad IS NOT NULL GROUP BY especialidad ) SELECT COALESCE(a.especialidad, b.especialidad) as especialidad, COALESCE(a.citas, 0) as citas_actual, COALESCE(b.citas, 0) as citas_anterior, COALESCE(a.ingresos, 0) as ingresos_actual, COALESCE(b.ingresos, 0) as ingresos_anterior, CASE WHEN COALESCE(b.citas, 0) = 0 THEN NULL ELSE ROUND(((COALESCE(a.citas, 0) - b.citas) * 100.0 / b.citas), 1) END as variacion_pct FROM actual a FULL OUTER JOIN anterior b ON a.especialidad = b.especialidad ORDER BY citas_actual DESC`);
-
-```
-res.json({ ok: true, periodo, dias, especialidades: result.rows });
-```
-
-} catch (err) {
-res.status(500).json({ ok: false, error: err.message });
+    await pool.query(`
+      INSERT INTO citas (
+        uuid, sede, sucursal_uuid, sucursal_nombre,
+        agenda_uuid, agenda_descripcion,
+        profesional_uuid, profesional_nombre, especialidad,
+        cliente_uuid, cliente_nombre, cliente_apellido, cliente_rut,
+        cliente_telefono, cliente_email,
+        inicio, fin, estado_codigo, estado_descripcion, estado_pago,
+        tratamientos, datos_completos, fecha_creacion, actualizado_en
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+        $16, $17, $18, $19, $20, $21, $22, $23, NOW()
+      )
+      ON CONFLICT (uuid) DO UPDATE SET
+        estado_codigo = EXCLUDED.estado_codigo,
+        estado_descripcion = EXCLUDED.estado_descripcion,
+        estado_pago = EXCLUDED.estado_pago,
+        inicio = EXCLUDED.inicio,
+        fin = EXCLUDED.fin,
+        datos_completos = EXCLUDED.datos_completos,
+        actualizado_en = NOW()
+    `, [
+      datos.uuid,
+      sedeKey,
+      datos.sucursal ? datos.sucursal.uuid : null,
+      datos.sucursal ? datos.sucursal.nombre : null,
+      datos.agenda ? datos.agenda.uuid : null,
+      datos.agenda ? datos.agenda.descripcion : null,
+      datos.profesional ? datos.profesional.uuid : null,
+      datos.profesional ? datos.profesional.nombre : null,
+      especialidad,
+      datos.cliente ? datos.cliente.uuid : null,
+      datos.cliente ? datos.cliente.nombre : null,
+      datos.cliente ? datos.cliente.apellido_paterno : null,
+      datos.cliente ? datos.cliente.identificador : null,
+      datos.cliente ? datos.cliente.telefono_1 : null,
+      datos.cliente ? datos.cliente.mail : null,
+      datos.inicio,
+      datos.fin,
+      datos.estado ? datos.estado.codigo : null,
+      datos.estado ? datos.estado.descripcion : null,
+      datos.estado_pago ? datos.estado_pago.codigo : null,
+      JSON.stringify(tratamientos),
+      JSON.stringify(datos),
+      datos.fecha_creacion
+    ]);
+  } catch (err) {
+    console.error("Error guardando cita:", err.message);
+  }
 }
-});
 
-// =============================================
-// ENDPOINT: CITAS FUTURAS
-// =============================================
-app.get(’/api/citas-futuras’, async (req, res) => {
-const { desde = new Date().toISOString().split(‘T’)[0], dias = 30 } = req.query;
-try {
-const result = await pool.query(`SELECT * FROM citas WHERE fecha >= $1 AND fecha <= $1::date + INTERVAL '${parseInt(dias)} days' ORDER BY fecha ASC, hora ASC`, [desde]);
-res.json({ ok: true, desde, dias: parseInt(dias), total: result.rows.length, citas: result.rows });
-} catch (err) {
-res.status(500).json({ ok: false, error: err.message });
+// ============================================
+// GUARDAR VENTA EN BD
+// ============================================
+async function guardarVenta(sedeKey, datos) {
+  try {
+    const items = datos.items || [];
+    const citaUuid = items.length > 0 && items[0].meta_data ? items[0].meta_data.uuid_cita : null;
+
+    await pool.query(`
+      INSERT INTO ventas (
+        uuid, sede, sucursal_uuid, sucursal_nombre, cita_uuid,
+        receptor_uuid, receptor_nombre, receptor_rut,
+        monto, estado_codigo, estado_descripcion,
+        fecha, fecha_ingreso, items, pagos, datos_completos, actualizado_en
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW()
+      )
+      ON CONFLICT (uuid) DO UPDATE SET
+        monto = EXCLUDED.monto,
+        estado_codigo = EXCLUDED.estado_codigo,
+        datos_completos = EXCLUDED.datos_completos,
+        actualizado_en = NOW()
+    `, [
+      datos.uuid,
+      sedeKey,
+      datos.sucursal ? datos.sucursal.uuid : null,
+      datos.sucursal ? datos.sucursal.nombre : null,
+      citaUuid,
+      datos.receptor ? datos.receptor.uuid : null,
+      datos.receptor ? (datos.receptor.nombre + " " + (datos.receptor.apellido_paterno || "")) : null,
+      datos.receptor ? datos.receptor.identificador : null,
+      parseFloat(datos.monto || 0),
+      datos.estado ? datos.estado.codigo : null,
+      datos.estado ? datos.estado.descripcion : null,
+      datos.fecha,
+      datos.fecha_ingreso,
+      JSON.stringify(items),
+      JSON.stringify(datos.pagos || []),
+      JSON.stringify(datos)
+    ]);
+  } catch (err) {
+    console.error("Error guardando venta:", err.message);
+  }
 }
-});
 
-// =============================================
-// ENDPOINT: DASHBOARD (compatible con frontend actual)
-// =============================================
-app.get(’/api/dashboard’, (req, res) => {
-const { sede = ‘ambas’ } = req.query;
-let citas = [], ventas = [], pacientes = [];
+// ============================================
+// ENDPOINT STATUS
+// ============================================
+app.get("/api/status", async (req, res) => {
+  let bdConectada = false;
+  try {
+    await pool.query("SELECT 1");
+    bdConectada = true;
+  } catch (e) {
+    bdConectada = false;
+  }
 
-if (sede === ‘ambas’) {
-citas = […cache.sede1.citas, …cache.sede2.citas];
-ventas = […cache.sede1.ventas, …cache.sede2.ventas];
-pacientes = […cache.sede1.pacientes, …cache.sede2.pacientes];
-} else {
-const s = cache[sede];
-citas = s?.citas || [];
-ventas = s?.ventas || [];
-pacientes = s?.pacientes || [];
-}
-
-const totalIngresos = ventas.reduce((sum, v) => sum + (v.monto || 0), 0);
-const citasConfirmadas = citas.filter(c => c.estado === ‘confirmada’).length;
-const citasCanceladas = citas.filter(c => c.estado === ‘cancelada’).length;
-const citasNoShow = citas.filter(c => c.estado === ‘no_show’).length;
-const pacientesNuevos = pacientes.filter(p => {
-const hoy = new Date().toDateString();
-return p.fecha_creacion && new Date(p.fecha_creacion).toDateString() === hoy;
-}).length;
-
-const COSTO_FIJO_DIARIO = 733000;
-const META_DIARIA = 2770000;
-const pctMeta = Math.min(Math.round((totalIngresos / META_DIARIA) * 100), 100);
-const semaforo = pctMeta >= 100 ? ‘verde’ : pctMeta >= 75 ? ‘amarillo’ : ‘rojo’;
-
-res.json({
-ok: true,
-actualizadoEn: new Date().toISOString(),
-sede,
-metricas: {
-totalIngresos,
-citasTotal: citas.length,
-citasConfirmadas, citasCanceladas, citasNoShow,
-pacientesNuevos,
-ocupacionPct: citas.length > 0 ? Math.round((citasConfirmadas / citas.length) * 100) : 0,
-meta: {
-costoFijoDiario: COSTO_FIJO_DIARIO,
-metaDiaria: META_DIARIA,
-pctCumplimiento: pctMeta,
-semaforo,
-faltaParaMeta: Math.max(0, META_DIARIA - totalIngresos)
-}
-},
-sedes: {
-sede1: {
-nombre: SEDES.sede1.nombre, box: SEDES.sede1.box,
-citas: cache.sede1.citas.length,
-ingresos: cache.sede1.ventas.reduce((s, v) => s + (v.monto || 0), 0),
-ultimaActualizacion: cache.sede1.ultimaActualizacion
-},
-sede2: {
-nombre: SEDES.sede2.nombre, box: SEDES.sede2.box,
-citas: cache.sede2.citas.length,
-ingresos: cache.sede2.ventas.reduce((s, v) => s + (v.monto || 0), 0),
-ultimaActualizacion: cache.sede2.ultimaActualizacion
-}
-},
-citas: citas.slice(0, 50),
-ventas: ventas.slice(0, 50),
-eventos: cache.webhookEventos.slice(0, 10)
-});
-});
-
-// =============================================
-// ENDPOINT: ALERTAS (con datos reales de BD)
-// =============================================
-app.get(’/api/alertas’, async (req, res) => {
-const alertas = [];
-const META_DIARIA = 2770000;
-
-// Alertas de cache (tiempo real)
-const ocup1 = cache.sede1.citas.length > 0
-? Math.round((cache.sede1.citas.filter(c => c.estado === ‘confirmada’).length / cache.sede1.citas.length) * 100) : 0;
-const ocup2 = cache.sede2.citas.length > 0
-? Math.round((cache.sede2.citas.filter(c => c.estado === ‘confirmada’).length / cache.sede2.citas.length) * 100) : 0;
-
-if (ocup1 < 60) alertas.push({ nivel: ‘critica’, sede: ‘Sede 1’, mensaje: `Sede 1 al ${ocup1}% de ocupación`, accion: ‘Activar Google Ads automáticamente’, tipo: ‘ocupacion’ });
-if (ocup2 < 60) alertas.push({ nivel: ‘critica’, sede: ‘Sede 2’, mensaje: `Sede 2 al ${ocup2}% de ocupación`, accion: ‘Activar Google Ads automáticamente’, tipo: ‘ocupacion’ });
-
-// Alertas inteligentes desde BD (especialidades cayendo)
-try {
-const caidas = await pool.query(`WITH actual AS ( SELECT especialidad, COUNT(*) as c FROM citas WHERE fecha >= CURRENT_DATE - INTERVAL '7 days' AND especialidad IS NOT NULL GROUP BY especialidad ), anterior AS ( SELECT especialidad, COUNT(*) as c FROM citas WHERE fecha >= CURRENT_DATE - INTERVAL '14 days' AND fecha < CURRENT_DATE - INTERVAL '7 days' AND especialidad IS NOT NULL GROUP BY especialidad ) SELECT a.especialidad, a.c as actual, b.c as anterior, ROUND(((a.c - b.c) * 100.0 / b.c), 1) as variacion FROM actual a JOIN anterior b ON a.especialidad = b.especialidad WHERE b.c >= 5 AND ((a.c - b.c) * 100.0 / b.c) <= -20 ORDER BY variacion ASC LIMIT 5`);
-
-```
-for (const row of caidas.rows) {
-  alertas.push({
-    nivel: 'media',
-    mensaje: `${row.especialidad}: ${row.variacion}% esta semana`,
-    accion: `Activar campaña Google Ads + avisar derivadores`,
-    tipo: 'especialidad_cayendo',
-    datos: { actual: row.actual, anterior: row.anterior }
+  res.json({
+    ok: true,
+    servidor: "Redvital Backend v4.0",
+    timestamp: new Date().toISOString(),
+    bd_conectada: bdConectada,
+    sedes: {
+      sede1: {
+        conectada: ultimaActualizacion.sede1 !== null,
+        ultimaActualizacion: ultimaActualizacion.sede1
+      },
+      sede2: {
+        conectada: ultimaActualizacion.sede2 !== null,
+        ultimaActualizacion: ultimaActualizacion.sede2
+      }
+    }
   });
-}
-```
-
-} catch (err) {
-console.error(‘Error alertas BD:’, err.message);
-}
-
-res.json({ ok: true, alertas, total: alertas.length });
 });
 
-// =============================================
-// ENDPOINT: STATUS
-// =============================================
-app.get(’/api/status’, async (req, res) => {
-let bdOk = false;
-try {
-await pool.query(‘SELECT 1’);
-bdOk = true;
-} catch {}
+// ============================================
+// WEBHOOK SEDE 1
+// ============================================
+app.post("/webhook/sede1", async (req, res) => {
+  ultimaActualizacion.sede1 = new Date().toISOString();
+  const evento = req.body.evento;
+  const datos = req.body.datos;
 
-res.json({
-ok: true,
-servidor: ‘Redvital Backend v4.0’,
-timestamp: new Date().toISOString(),
-bd_conectada: bdOk,
-sedes: {
-sede1: { conectada: !!SEDES.sede1.token, ultimaActualizacion: cache.sede1.ultimaActualizacion },
-sede2: { conectada: !!SEDES.sede2.token, ultimaActualizacion: cache.sede2.ultimaActualizacion }
-}
-});
+  console.log("Webhook sede1:", evento);
+
+  if (evento === "citas" && datos) {
+    await guardarCita("sede1", datos);
+  } else if (evento === "ventas" && datos) {
+    await guardarVenta("sede1", datos);
+  }
+
+  res.json({ ok: true });
 });
 
-// =============================================
-// INICIO DEL SERVIDOR
-// =============================================
+// ============================================
+// WEBHOOK SEDE 2
+// ============================================
+app.post("/webhook/sede2", async (req, res) => {
+  ultimaActualizacion.sede2 = new Date().toISOString();
+  const evento = req.body.evento;
+  const datos = req.body.datos;
+
+  console.log("Webhook sede2:", evento);
+
+  if (evento === "citas" && datos) {
+    await guardarCita("sede2", datos);
+  } else if (evento === "ventas" && datos) {
+    await guardarVenta("sede2", datos);
+  }
+
+  res.json({ ok: true });
+});
+
+// ============================================
+// ENDPOINT DASHBOARD
+// ============================================
+app.get("/api/dashboard", async (req, res) => {
+  try {
+    const sede = req.query.sede || "ambas";
+    const hoy = new Date().toISOString().split("T")[0];
+
+    let filtroSede = "";
+    const params = [hoy];
+
+    if (sede !== "ambas") {
+      filtroSede = " AND sede = $2";
+      params.push(sede);
+    }
+
+    const citasHoy = await pool.query(
+      `SELECT * FROM citas WHERE DATE(inicio AT TIME ZONE 'America/Santiago') = $1 ${filtroSede}`,
+      params
+    );
+
+    const ventasHoy = await pool.query(
+      `SELECT * FROM ventas WHERE fecha = $1 ${filtroSede}`,
+      params
+    );
+
+    const totalIngresos = ventasHoy.rows.reduce((sum, v) => sum + parseFloat(v.monto || 0), 0);
+    const citasConfirmadas = citasHoy.rows.filter(c => c.estado_codigo === "C" || c.estado_codigo === "A").length;
+    const citasCanceladas = citasHoy.rows.filter(c => c.estado_codigo === "X").length;
+    const citasNoShow = citasHoy.rows.filter(c => c.estado_codigo === "NS").length;
+
+    const sede1Citas = citasHoy.rows.filter(c => c.sede === "sede1").length;
+    const sede2Citas = citasHoy.rows.filter(c => c.sede === "sede2").length;
+    const sede1Ingresos = ventasHoy.rows.filter(v => v.sede === "sede1").reduce((s, v) => s + parseFloat(v.monto || 0), 0);
+    const sede2Ingresos = ventasHoy.rows.filter(v => v.sede === "sede2").reduce((s, v) => s + parseFloat(v.monto || 0), 0);
+
+    const costoFijoDiario = 733000;
+    const metaDiaria = 2770000;
+    const pctCumplimiento = Math.round((totalIngresos / metaDiaria) * 100);
+    let semaforo = "rojo";
+    if (pctCumplimiento >= 100) semaforo = "verde";
+    else if (pctCumplimiento >= 60) semaforo = "amarillo";
+
+    const totalBox = 12;
+    const ocupacionPct = Math.round((citasHoy.rows.length / (totalBox * 8)) * 100);
+
+    res.json({
+      ok: true,
+      actualizadoEn: new Date().toISOString(),
+      sede: sede,
+      metricas: {
+        totalIngresos: totalIngresos,
+        citasTotal: citasHoy.rows.length,
+        citasConfirmadas: citasConfirmadas,
+        citasCanceladas: citasCanceladas,
+        citasNoShow: citasNoShow,
+        ocupacionPct: ocupacionPct,
+        meta: {
+          costoFijoDiario: costoFijoDiario,
+          metaDiaria: metaDiaria,
+          pctCumplimiento: pctCumplimiento,
+          semaforo: semaforo,
+          faltaParaMeta: Math.max(0, metaDiaria - totalIngresos)
+        }
+      },
+      sedes: {
+        sede1: {
+          nombre: SEDES.sede1.nombre,
+          box: SEDES.sede1.box,
+          citas: sede1Citas,
+          ingresos: sede1Ingresos,
+          ultimaActualizacion: ultimaActualizacion.sede1
+        },
+        sede2: {
+          nombre: SEDES.sede2.nombre,
+          box: SEDES.sede2.box,
+          citas: sede2Citas,
+          ingresos: sede2Ingresos,
+          ultimaActualizacion: ultimaActualizacion.sede2
+        }
+      },
+      citas: citasHoy.rows.slice(0, 50),
+      ventas: ventasHoy.rows.slice(0, 50)
+    });
+  } catch (err) {
+    console.error("Error en dashboard:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================
+// ENDPOINT STATS
+// ============================================
+app.get("/api/stats", async (req, res) => {
+  try {
+    const totalCitas = await pool.query("SELECT COUNT(*) FROM citas");
+    const totalVentas = await pool.query("SELECT COUNT(*), SUM(monto) FROM ventas");
+
+    res.json({
+      ok: true,
+      total_citas: parseInt(totalCitas.rows[0].count),
+      total_ventas: parseInt(totalVentas.rows[0].count),
+      monto_total: parseFloat(totalVentas.rows[0].sum || 0)
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================
+// COMPARATIVA POR ESPECIALIDAD
+// ============================================
+app.get("/api/comparativa/especialidad", async (req, res) => {
+  try {
+    const periodo = req.query.periodo || "semana";
+    let dias = 7;
+    if (periodo === "mes") dias = 30;
+    if (periodo === "trimestre") dias = 90;
+
+    const resultado = await pool.query(`
+      SELECT
+        especialidad,
+        COUNT(*) as citas_actual,
+        (SELECT COUNT(*) FROM citas c2
+         WHERE c2.especialidad = c1.especialidad
+         AND c2.inicio >= NOW() - INTERVAL '${dias * 2} days'
+         AND c2.inicio < NOW() - INTERVAL '${dias} days') as citas_anterior
+      FROM citas c1
+      WHERE inicio >= NOW() - INTERVAL '${dias} days'
+      AND especialidad IS NOT NULL
+      GROUP BY especialidad
+      ORDER BY citas_actual DESC
+    `);
+
+    const conVariacion = resultado.rows.map(r => {
+      const actual = parseInt(r.citas_actual);
+      const anterior = parseInt(r.citas_anterior);
+      const variacion = anterior > 0 ? Math.round(((actual - anterior) / anterior) * 100) : 0;
+      return {
+        especialidad: r.especialidad,
+        citas_actual: actual,
+        citas_anterior: anterior,
+        variacion_pct: variacion,
+        alerta: variacion <= -20
+      };
+    });
+
+    res.json({
+      ok: true,
+      periodo: periodo,
+      dias: dias,
+      especialidades: conVariacion
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================
+// CARGAR HISTORICO DESDE RESERVO
+// ============================================
+app.get("/api/cargar-historico", async (req, res) => {
+  try {
+    const desde = req.query.desde || "2026-02-01";
+    let totalCitas = 0;
+    let totalVentas = 0;
+
+    for (const sedeKey of Object.keys(SEDES)) {
+      const token = SEDES[sedeKey].token;
+      if (!token) continue;
+
+      try {
+        const respCitas = await axios.get("https://reservo.cl/APIcustom/v2/cita/listar", {
+          headers: { Authorization: "Bearer " + token },
+          params: { fecha_inicio: desde, limit: 1000 }
+        });
+
+        if (respCitas.data && respCitas.data.data) {
+          for (const cita of respCitas.data.data) {
+            await guardarCita(sedeKey, cita);
+            totalCitas++;
+          }
+        }
+      } catch (e) {
+        console.error("Error citas " + sedeKey + ":", e.message);
+      }
+
+      try {
+        const respVentas = await axios.get("https://reservo.cl/APIcustom/v2/venta/listar", {
+          headers: { Authorization: "Bearer " + token },
+          params: { fecha_inicio: desde, limit: 1000 }
+        });
+
+        if (respVentas.data && respVentas.data.data) {
+          for (const venta of respVentas.data.data) {
+            await guardarVenta(sedeKey, venta);
+            totalVentas++;
+          }
+        }
+      } catch (e) {
+        console.error("Error ventas " + sedeKey + ":", e.message);
+      }
+    }
+
+    res.json({
+      ok: true,
+      desde: desde,
+      citas_cargadas: totalCitas,
+      ventas_cargadas: totalVentas
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================
+// HOME
+// ============================================
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    servidor: "Redvital Backend v4.0",
+    endpoints: [
+      "/api/status",
+      "/api/dashboard",
+      "/api/stats",
+      "/api/comparativa/especialidad",
+      "/api/cargar-historico",
+      "/webhook/sede1",
+      "/webhook/sede2"
+    ]
+  });
+});
+
+// ============================================
+// INICIAR SERVIDOR
+// ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-console.log(`🚀 Servidor Redvital v4.0 corriendo en puerto ${PORT}`);
-
-// Crear tablas si no existen
-await crearTablas();
-
-// Primera carga
-await actualizarDatos();
-
-// Actualizar cada 5 minutos
-setInterval(actualizarDatos, 5 * 60 * 1000);
+  console.log("Servidor Redvital v4.0 corriendo en puerto " + PORT);
+  await inicializarBD();
 });
