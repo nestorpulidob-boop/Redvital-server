@@ -82,6 +82,18 @@ const WEBHOOK_UUIDS = {
   sede1: process.env.WEBHOOK_UUID_SEDE1 || "db625bcc-b469-4637-be0e-24cb00eb3826",
   sede2: process.env.WEBHOOK_UUID_SEDE2 || "d6993f4e-a5e8-4c89-92e4-85826858da11"
 };
+// Mapeo de TODOS los UUIDs de webhooks conocidos a su sede
+// Usado en /webhook/reservo para identificar de que sede viene cada notificacion
+const WEBHOOK_TO_SEDE = {
+  // Sede1 (RedVital Sede Maturana)
+  "db625bcc-b469-4637-be0e-24cb00eb3826": "sede1",
+  "7854ea21-206d-45e6-b164-7171ed8b2ea6": "sede1",
+  "608efcc9-234b-46b5-a916-2e594de6b9b3": "sede1",
+  // Sede2 (Centro Medico Redvital)
+  "d6993f4e-a5e8-4c89-92e4-85826858da11": "sede2",
+  "6598f956-dc73-4418-8d88-20cb7d1e4de9": "sede2",
+  "a5299762-f11e-4c62-b997-ef1b1ad63988": "sede2"
+};
 
 // Costos fijos mensuales (para calculo de utilidad)
 const COSTO_FIJO_MENSUAL = 20637600;
@@ -983,7 +995,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.5",
+    servidor: "Redvital Backend v5.6",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -1014,6 +1026,30 @@ app.post("/webhook/sede2", async (req, res) => {
   ultimaActualizacion.sede2 = new Date().toISOString();
   res.status(200).json({ ok: true });
   manejarWebhook("sede2", req.body).catch(err => console.error("Error sede2:", err.message));
+});
+
+// Endpoint generico /webhook/reservo (este es el que apuntan los webhooks reales)
+// Identifica la sede leyendo body.fuente (UUID del webhook) contra WEBHOOK_TO_SEDE
+app.post("/webhook/reservo", async (req, res) => {
+  // SIEMPRE responder 200 rapido, especialmente para health check (ping)
+  res.status(200).json({ ok: true });
+
+  const fuente = req.body && req.body.fuente;
+  const evento = req.body && req.body.evento;
+
+  // Si es ping (health check), responder y NO procesar (no hay 'fuente' en pings)
+  if (evento === "ping") {
+    console.log(`[webhook /reservo] PING (health check Reservo) ${new Date().toISOString()}`);
+    return;
+  }
+
+  // Identificar sede por UUID de fuente
+  const sede = WEBHOOK_TO_SEDE[fuente] || "desconocida";
+  if (sede === "sede1") ultimaActualizacion.sede1 = new Date().toISOString();
+  else if (sede === "sede2") ultimaActualizacion.sede2 = new Date().toISOString();
+  else console.warn(`[webhook /reservo] fuente desconocida: ${fuente}`);
+
+  manejarWebhook(sede, req.body).catch(err => console.error(`Error /webhook/reservo (${sede}):`, err.message));
 });
 
 // ============================================
@@ -1193,12 +1229,12 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.5",
+    servidor: "Redvital Backend v5.6",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
-      webhooks: ["/webhook/sede1", "/webhook/sede2"],
+      webhooks: ["/webhook/sede1", "/webhook/sede2", "/webhook/reservo"],
       debug_webhooks: [
         "/api/webhooks/resumen",
         "/api/webhooks/recientes",
@@ -1242,6 +1278,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.5 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.6 corriendo en puerto " + PORT);
   await inicializarBD();
 });
