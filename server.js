@@ -74,6 +74,15 @@ const TICKET_PROMEDIO = 30000;
 const COSTO_FIJO_DIARIO = 733000;
 const META_DIARIA = 2770000;
 
+// API de Reservo (para listar/validar webhooks)
+// IMPORTANTE: Reservo usa "Token", NO "Bearer"
+const RESERVO_API = "https://reservo.cl/APIpublica/v2";
+const RESERVO_AUTH = (token) => `Token ${token}`;
+const WEBHOOK_UUIDS = {
+  sede1: process.env.WEBHOOK_UUID_SEDE1 || "db625bcc-b469-4637-be0e-24cb00eb3826",
+  sede2: process.env.WEBHOOK_UUID_SEDE2 || "d6993f4e-a5e8-4c89-92e4-85826858da11"
+};
+
 // Costos fijos mensuales (para calculo de utilidad)
 const COSTO_FIJO_MENSUAL = 20637600;
 //   - Creditos: 9.600.000
@@ -134,13 +143,30 @@ async function guardarWebhookRaw(sedeKey, evento, payload) {
   }
 }
 
+// Manejador unificado de webhooks (para ambas sedes)
+// PING: health check de Reservo - solo loguear, NO guardar (son frecuentes)
+// Otros eventos: guardar payload completo en webhooks_raw
+async function manejarWebhook(sedeKey, body) {
+  const evento = body && body.evento;
+  const uuid_evento = body && body.uuid_evento;
+
+  if (evento === "ping") {
+    console.log(`[webhook ${sedeKey}] PING (health check Reservo) ${new Date().toISOString()}`);
+    return;
+  }
+
+  console.log(`[webhook ${sedeKey}] ${evento || "?"} uuid_evento=${uuid_evento || "?"}`);
+  // Guardar el payload COMPLETO (con fuente, evento, datos, uuid_evento, procesado_a_las)
+  await guardarWebhookRaw(sedeKey, evento || "desconocido", body);
+}
+
 async function guardarCita(sedeKey, datos) {
-  console.log(`[webhook ${sedeKey}] cita id=${datos.id_cita || datos.id || datos.uuid || "?"}`);
-  await guardarWebhookRaw(sedeKey, "citas", datos);
+  // Reservado para v5.6 (mapeo Reservo -> tabla citas tras inspeccionar formato real)
+  console.log(`[v5.6 pendiente] cita sede=${sedeKey}`);
 }
 async function guardarVenta(sedeKey, datos) {
-  console.log(`[webhook ${sedeKey}] venta id=${datos.id_venta || datos.id || datos.uuid || "?"}`);
-  await guardarWebhookRaw(sedeKey, "ventas", datos);
+  // Reservado para v5.6 (mapeo Reservo -> tabla ventas)
+  console.log(`[v5.6 pendiente] venta sede=${sedeKey}`);
 }
 
 // ============================================
@@ -957,7 +983,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.4",
+    servidor: "Redvital Backend v5.5",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -974,24 +1000,84 @@ app.get("/api/status", async (req, res) => {
 // ============================================
 // WEBHOOKS
 // ============================================
+// ============================================
+// WEBHOOKS - responden 200 rápido y procesan en background
+// ============================================
 app.post("/webhook/sede1", async (req, res) => {
   ultimaActualizacion.sede1 = new Date().toISOString();
-  const evento = req.body.evento;
-  const datos = req.body.datos;
-  console.log("Webhook sede1:", evento);
-  if (evento === "citas" && datos) await guardarCita("sede1", datos);
-  else if (evento === "ventas" && datos) await guardarVenta("sede1", datos);
-  res.json({ ok: true });
+  // SIEMPRE responder 200 rápido (Reservo reintenta si no es 200)
+  res.status(200).json({ ok: true });
+  manejarWebhook("sede1", req.body).catch(err => console.error("Error sede1:", err.message));
 });
 
 app.post("/webhook/sede2", async (req, res) => {
   ultimaActualizacion.sede2 = new Date().toISOString();
-  const evento = req.body.evento;
-  const datos = req.body.datos;
-  console.log("Webhook sede2:", evento);
-  if (evento === "citas" && datos) await guardarCita("sede2", datos);
-  else if (evento === "ventas" && datos) await guardarVenta("sede2", datos);
-  res.json({ ok: true });
+  res.status(200).json({ ok: true });
+  manejarWebhook("sede2", req.body).catch(err => console.error("Error sede2:", err.message));
+});
+
+// ============================================
+// ADMIN: Listar webhooks registrados en Reservo
+// ============================================
+app.get("/api/admin/listar-webhooks", async (req, res) => {
+  const resultados = {};
+  for (const sedeKey of ["sede1", "sede2"]) {
+    const token = SEDES[sedeKey].token;
+    if (!token) {
+      resultados[sedeKey] = { error: `TOKEN_${sedeKey.toUpperCase()} no configurado en Render` };
+      continue;
+    }
+    try {
+      const r = await axios.get(`${RESERVO_API}/webhooks/`, {
+        headers: { Authorization: RESERVO_AUTH(token) },
+        timeout: 15000,
+        validateStatus: () => true
+      });
+      resultados[sedeKey] = { http_status: r.status, respuesta: r.data };
+    } catch (err) {
+      resultados[sedeKey] = { error: err.message, codigo: err.code };
+    }
+  }
+  res.json({
+    ok: true,
+    instrucciones: "Aqui se ven los webhooks registrados en Reservo con cada token. Verifica que la 'url' apunte a https://redvital-server.onrender.com/webhook/sede1 (o sede2).",
+    resultados
+  });
+});
+
+// ============================================
+// ADMIN: Activar (validar) los webhooks en Reservo
+// Una vez validados, Reservo empezara a enviar notificaciones reales
+// ============================================
+app.get("/api/admin/activar-webhooks", async (req, res) => {
+  const resultados = {};
+  for (const sedeKey of ["sede1", "sede2"]) {
+    const token = SEDES[sedeKey].token;
+    const uuid = WEBHOOK_UUIDS[sedeKey];
+    if (!token) {
+      resultados[sedeKey] = { error: `TOKEN_${sedeKey.toUpperCase()} no configurado` };
+      continue;
+    }
+    if (!uuid) {
+      resultados[sedeKey] = { error: `WEBHOOK_UUID_${sedeKey.toUpperCase()} no configurado` };
+      continue;
+    }
+    try {
+      const r = await axios.post(`${RESERVO_API}/webhooks/${uuid}/validar/`, {}, {
+        headers: { Authorization: RESERVO_AUTH(token) },
+        timeout: 30000,
+        validateStatus: () => true
+      });
+      resultados[sedeKey] = { uuid_webhook: uuid, http_status: r.status, respuesta: r.data };
+    } catch (err) {
+      resultados[sedeKey] = { error: err.message, codigo: err.code };
+    }
+  }
+  res.json({
+    ok: true,
+    mensaje: "Validacion solicitada. Si el http_status es 200, los webhooks quedaron activos y Reservo empezara a enviar eventos. Si es 400 o 401, ver el detalle de la respuesta.",
+    resultados
+  });
 });
 
 // ============================================
@@ -1107,7 +1193,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.4",
+    servidor: "Redvital Backend v5.5",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -1118,6 +1204,10 @@ app.get("/", (req, res) => {
         "/api/webhooks/recientes",
         "/api/webhooks/sample?evento=citas",
         "/api/webhooks/sample?evento=ventas"
+      ],
+      admin: [
+        "/api/admin/listar-webhooks",
+        "/api/admin/activar-webhooks"
       ],
       metricas: [
         "/api/metricas/all",
@@ -1152,6 +1242,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.4 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.5 corriendo en puerto " + PORT);
   await inicializarBD();
 });
