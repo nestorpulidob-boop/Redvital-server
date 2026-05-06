@@ -63,6 +63,9 @@ const ESTADOS = {
   LISTA_ESPERA: ["Lista de Espera"]
 };
 
+// Estados de venta validos (excluye Eliminada)
+const ESTADOS_VENTA_VALIDA = ["Realizada", "Modificada"];
+
 function inList(arr) {
   return "(" + arr.map(s => "'" + s.replace(/'/g, "''") + "'").join(",") + ")";
 }
@@ -72,7 +75,7 @@ const COSTO_FIJO_DIARIO = 733000;
 const META_DIARIA = 2770000;
 
 // ============================================
-// INICIALIZAR BD - solo indices, no recrea citas
+// INICIALIZAR BD - solo indices, no recrea tablas
 // ============================================
 async function inicializarBD() {
   try {
@@ -82,33 +85,13 @@ async function inicializarBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_profesional ON citas(profesional)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_id_paciente ON citas(id_paciente)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_tratamiento ON citas(tratamiento)`);
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ventas (
-        id_venta BIGINT PRIMARY KEY,
-        fecha DATE,
-        sucursal TEXT,
-        id_cita BIGINT,
-        rut TEXT,
-        receptor TEXT,
-        monto NUMERIC,
-        estado TEXT,
-        items JSONB,
-        pagos JSONB,
-        actualizado_en TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON ventas(fecha)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ventas_sucursal ON ventas(sucursal)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ventas_id_cita ON ventas(id_cita)`);
-
     console.log("Indices verificados correctamente");
   } catch (err) {
     console.error("Error inicializando BD:", err.message);
   }
 }
 
-// Webhooks: por ahora solo loguean (mapeo Reservo->BD pendiente para v5.2)
+// Webhooks: por ahora solo loguean (mapeo Reservo->BD pendiente para v5.3)
 async function guardarCita(sedeKey, datos) {
   console.log(`[webhook ${sedeKey}] cita:`, datos.uuid || datos.id || "?");
 }
@@ -137,7 +120,7 @@ function parseRango(req) {
 const FILTRO = `fecha BETWEEN $1::date AND $2::date AND ($3::text IS NULL OR sucursal = $3)`;
 
 // ============================================
-// METRICA 1: KPIs
+// METRICA 1: KPIs (con ingresos reales de ventas)
 // ============================================
 async function metricaKpis({ desde, hasta, sede, sucursal }) {
   const sql = `
@@ -152,8 +135,7 @@ async function metricaKpis({ desde, hasta, sede, sucursal }) {
       COUNT(DISTINCT id_paciente)::int AS pacientes_unicos,
       COUNT(DISTINCT profesional)::int AS profesionales_activos,
       COUNT(DISTINCT tratamiento) FILTER (WHERE tratamiento IS NOT NULL)::int AS especialidades_activas
-    FROM citas
-    WHERE ${FILTRO}
+    FROM citas WHERE ${FILTRO}
   `;
   const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   const r = rows[0];
@@ -163,16 +145,25 @@ async function metricaKpis({ desde, hasta, sede, sucursal }) {
   const pctAtencion = total > 0 ? +(100 * r.atendidas / total).toFixed(2) : 0;
   const ingresosEstimados = r.atendidas * TICKET_PROMEDIO;
 
-  let ingresosReales = 0, numVentas = 0;
+  // Ingresos reales: solo ventas no eliminadas
+  let ingresosReales = 0, numVentas = 0, ticketRealPromedio = 0;
   try {
     const v = await pool.query(
-      `SELECT COALESCE(SUM(monto),0)::float AS m, COUNT(*)::int AS n
-       FROM ventas WHERE fecha BETWEEN $1::date AND $2::date AND ($3::text IS NULL OR sucursal = $3)`,
+      `SELECT
+         COALESCE(SUM(valor_pagado),0)::float AS m,
+         COUNT(*)::int AS n
+       FROM ventas
+       WHERE fecha BETWEEN $1::date AND $2::date
+         AND ($3::text IS NULL OR sucursal = $3)
+         AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}`,
       [desde, hasta, sucursal]
     );
     ingresosReales = v.rows[0].m;
     numVentas = v.rows[0].n;
-  } catch (e) {}
+    ticketRealPromedio = numVentas > 0 ? Math.round(ingresosReales / numVentas) : 0;
+  } catch (e) {
+    console.error("Error al consultar ventas:", e.message);
+  }
 
   return {
     rango: { desde, hasta, sede },
@@ -190,6 +181,7 @@ async function metricaKpis({ desde, hasta, sede, sucursal }) {
     pct_suspension: pctSuspension,
     pct_atencion: pctAtencion,
     ticket_promedio: TICKET_PROMEDIO,
+    ticket_real_promedio: ticketRealPromedio,
     ingresos_estimados: ingresosEstimados,
     ingresos_reales: ingresosReales,
     num_ventas: numVentas
@@ -270,22 +262,46 @@ async function metricaPacientesSuspension({ desde, hasta, sucursal }) {
 }
 
 // ============================================
-// METRICA 5: TOP PROFESIONALES
+// METRICA 5: TOP PROFESIONALES (con ingresos REALES de ventas)
 // ============================================
 async function metricaTopProfesionales({ desde, hasta, sucursal }) {
+  // Une citas con ventas via profesional (best effort, no hay id_cita en ventas)
   const sql = `
+    WITH ventas_prof AS (
+      SELECT
+        profesional_atencion AS profesional,
+        SUM(valor_pagado)::bigint AS ingresos_reales,
+        COUNT(*)::int AS num_ventas
+      FROM ventas
+      WHERE fecha BETWEEN $1::date AND $2::date
+        AND ($3::text IS NULL OR sucursal = $3)
+        AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+      GROUP BY profesional_atencion
+    ),
+    citas_prof AS (
+      SELECT
+        profesional,
+        COUNT(*)::int AS total_citas,
+        COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+        COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+        COUNT(DISTINCT id_paciente)::int AS pacientes_unicos,
+        COUNT(DISTINCT tratamiento) FILTER (WHERE tratamiento IS NOT NULL)::int AS tratamientos_distintos
+      FROM citas WHERE ${FILTRO} AND profesional IS NOT NULL
+      GROUP BY profesional
+    )
     SELECT
-      profesional,
-      COUNT(*)::int AS total_citas,
-      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
-      COUNT(DISTINCT id_paciente)::int AS pacientes_unicos,
-      COUNT(DISTINCT tratamiento) FILTER (WHERE tratamiento IS NOT NULL)::int AS tratamientos_distintos,
-      (COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)}) * ${TICKET_PROMEDIO})::bigint AS ingresos_estimados
-    FROM citas
-    WHERE ${FILTRO} AND profesional IS NOT NULL
-    GROUP BY profesional
-    ORDER BY atendidas DESC, total_citas DESC
+      cp.profesional,
+      cp.total_citas,
+      cp.atendidas,
+      cp.no_show,
+      cp.pacientes_unicos,
+      cp.tratamientos_distintos,
+      (cp.atendidas * ${TICKET_PROMEDIO})::bigint AS ingresos_estimados,
+      COALESCE(vp.ingresos_reales, 0)::bigint AS ingresos_reales,
+      COALESCE(vp.num_ventas, 0)::int AS num_ventas
+    FROM citas_prof cp
+    LEFT JOIN ventas_prof vp ON vp.profesional = cp.profesional
+    ORDER BY cp.atendidas DESC, cp.total_citas DESC
     LIMIT 30
   `;
   const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
@@ -433,10 +449,10 @@ async function metricaPacientesEnRiesgo(req) {
 }
 
 // ============================================
-// METRICA 10: POR SEDE
+// METRICA 10: POR SEDE (con ingresos reales)
 // ============================================
 async function metricaPorSede({ desde, hasta }) {
-  const sql = `
+  const sqlCitas = `
     SELECT
       sucursal,
       COUNT(*)::int AS total_citas,
@@ -452,12 +468,37 @@ async function metricaPorSede({ desde, hasta }) {
     WHERE fecha BETWEEN $1::date AND $2::date AND sucursal IS NOT NULL
     GROUP BY sucursal ORDER BY total_citas DESC
   `;
-  const { rows } = await pool.query(sql, [desde, hasta]);
-  return rows.map(r => {
+  const { rows: citas } = await pool.query(sqlCitas, [desde, hasta]);
+
+  // Ingresos reales por sucursal
+  const sqlVentas = `
+    SELECT
+      sucursal,
+      COALESCE(SUM(valor_pagado),0)::bigint AS ingresos_reales,
+      COUNT(*)::int AS num_ventas
+    FROM ventas
+    WHERE fecha BETWEEN $1::date AND $2::date
+      AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+    GROUP BY sucursal
+  `;
+  let ventasMap = {};
+  try {
+    const { rows: vRows } = await pool.query(sqlVentas, [desde, hasta]);
+    ventasMap = Object.fromEntries(vRows.map(v => [v.sucursal, v]));
+  } catch (e) {}
+
+  return citas.map(r => {
     let sedeKey = null;
     if (r.sucursal === SEDES.sede1.sucursal) sedeKey = "sede1";
     else if (r.sucursal === SEDES.sede2.sucursal) sedeKey = "sede2";
-    return { sede: sedeKey, box: sedeKey ? SEDES[sedeKey].box : null, ...r };
+    const v = ventasMap[r.sucursal] || {};
+    return {
+      sede: sedeKey,
+      box: sedeKey ? SEDES[sedeKey].box : null,
+      ingresos_reales: v.ingresos_reales || 0,
+      num_ventas: v.num_ventas || 0,
+      ...r
+    };
   });
 }
 
@@ -493,18 +534,39 @@ async function metricaDemografia({ sucursal }) {
 }
 
 // ============================================
-// METRICA 12: PREVISION
+// METRICA 12: PREVISION (con ingresos reales)
 // ============================================
 async function metricaPrevision({ desde, hasta, sucursal }) {
   const sql = `
+    WITH citas_prev AS (
+      SELECT
+        COALESCE(NULLIF(prevision, ''), 'sin_dato') AS prevision,
+        COUNT(*)::int AS total_citas,
+        COUNT(DISTINCT id_paciente)::int AS pacientes,
+        COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+        COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show
+      FROM citas WHERE ${FILTRO}
+      GROUP BY prevision
+    ),
+    ventas_prev AS (
+      SELECT
+        COALESCE(NULLIF(prevision, ''), 'sin_dato') AS prevision,
+        SUM(valor_pagado)::bigint AS ingresos_reales,
+        COUNT(*)::int AS num_ventas
+      FROM ventas
+      WHERE fecha BETWEEN $1::date AND $2::date
+        AND ($3::text IS NULL OR sucursal = $3)
+        AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+      GROUP BY prevision
+    )
     SELECT
-      COALESCE(NULLIF(prevision, ''), 'sin_dato') AS prevision,
-      COUNT(*)::int AS total_citas,
-      COUNT(DISTINCT id_paciente)::int AS pacientes,
-      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show
-    FROM citas WHERE ${FILTRO}
-    GROUP BY prevision ORDER BY total_citas DESC LIMIT 30
+      cp.prevision,
+      cp.total_citas, cp.pacientes, cp.atendidas, cp.no_show,
+      COALESCE(vp.ingresos_reales, 0)::bigint AS ingresos_reales,
+      COALESCE(vp.num_ventas, 0)::int AS num_ventas
+    FROM citas_prev cp
+    LEFT JOIN ventas_prev vp USING (prevision)
+    ORDER BY cp.total_citas DESC LIMIT 30
   `;
   const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   return rows;
@@ -534,19 +596,40 @@ async function metricaOrigenReservas({ desde, hasta, sucursal }) {
 }
 
 // ============================================
-// METRICA 14: SERIE TEMPORAL
+// METRICA 14: SERIE TEMPORAL (con ingresos reales)
 // ============================================
 async function metricaSerieTemporal({ desde, hasta, sucursal }) {
   const sql = `
+    WITH citas_dia AS (
+      SELECT
+        fecha::date AS dia,
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+        COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+        COUNT(DISTINCT id_paciente)::int AS pacientes
+      FROM citas WHERE ${FILTRO}
+      GROUP BY fecha
+    ),
+    ventas_dia AS (
+      SELECT
+        fecha::date AS dia,
+        SUM(valor_pagado)::bigint AS ingresos_reales,
+        COUNT(*)::int AS num_ventas
+      FROM ventas
+      WHERE fecha BETWEEN $1::date AND $2::date
+        AND ($3::text IS NULL OR sucursal = $3)
+        AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+      GROUP BY fecha
+    )
     SELECT
-      fecha::text AS dia,
-      COUNT(*)::int AS total,
-      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
-      COUNT(DISTINCT id_paciente)::int AS pacientes,
-      (COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)}) * ${TICKET_PROMEDIO})::bigint AS ingresos_estimados
-    FROM citas WHERE ${FILTRO}
-    GROUP BY fecha ORDER BY fecha
+      cd.dia::text AS dia,
+      cd.total, cd.atendidas, cd.no_show, cd.pacientes,
+      (cd.atendidas * ${TICKET_PROMEDIO})::bigint AS ingresos_estimados,
+      COALESCE(vd.ingresos_reales, 0)::bigint AS ingresos_reales,
+      COALESCE(vd.num_ventas, 0)::int AS num_ventas
+    FROM citas_dia cd
+    LEFT JOIN ventas_dia vd USING (dia)
+    ORDER BY cd.dia
   `;
   const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   return rows;
@@ -630,18 +713,23 @@ app.get("/api/metricas/all", async (req, res) => {
 // ============================================
 app.get("/api/status", async (req, res) => {
   let bdConectada = false;
-  let totalCitas = 0;
+  let totalCitas = 0, totalVentas = 0;
   try {
-    const r = await pool.query("SELECT COUNT(*)::int AS n FROM citas");
+    const c = await pool.query("SELECT COUNT(*)::int AS n FROM citas");
     bdConectada = true;
-    totalCitas = r.rows[0].n;
+    totalCitas = c.rows[0].n;
+    try {
+      const v = await pool.query("SELECT COUNT(*)::int AS n FROM ventas");
+      totalVentas = v.rows[0].n;
+    } catch (e) {}
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.1",
+    servidor: "Redvital Backend v5.2",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
+    total_ventas_bd: totalVentas,
     sedes: {
       sede1: { conectada: ultimaActualizacion.sede1 !== null, ultimaActualizacion: ultimaActualizacion.sede1 },
       sede2: { conectada: ultimaActualizacion.sede2 !== null, ultimaActualizacion: ultimaActualizacion.sede2 }
@@ -650,7 +738,7 @@ app.get("/api/status", async (req, res) => {
 });
 
 // ============================================
-// WEBHOOKS (responden 200 - mapeo pendiente v5.2)
+// WEBHOOKS
 // ============================================
 app.post("/webhook/sede1", async (req, res) => {
   ultimaActualizacion.sede1 = new Date().toISOString();
@@ -673,7 +761,7 @@ app.post("/webhook/sede2", async (req, res) => {
 });
 
 // ============================================
-// DASHBOARD (adaptado)
+// DASHBOARD (con ingresos reales)
 // ============================================
 app.get("/api/dashboard", async (req, res) => {
   try {
@@ -686,6 +774,17 @@ app.get("/api/dashboard", async (req, res) => {
       [hoy, sucursal]
     );
 
+    let ingresosReales = 0;
+    try {
+      const v = await pool.query(
+        `SELECT COALESCE(SUM(valor_pagado),0)::float AS m FROM ventas
+         WHERE fecha = $1::date AND ($2::text IS NULL OR sucursal = $2)
+           AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}`,
+        [hoy, sucursal]
+      );
+      ingresosReales = v.rows[0].m;
+    } catch (e) {}
+
     const totalCitas = citas.rows.length;
     const atendidas = citas.rows.filter(c => ESTADOS.ATENDIDA.includes(c.estado_cita)).length;
     const confirmadas = citas.rows.filter(c => ESTADOS.CONFIRMADA.includes(c.estado_cita)).length;
@@ -696,7 +795,8 @@ app.get("/api/dashboard", async (req, res) => {
     const sede2Citas = citas.rows.filter(c => c.sucursal === SEDES.sede2.sucursal).length;
 
     const ingresosEstimados = atendidas * TICKET_PROMEDIO;
-    const pctCumplimiento = Math.round((ingresosEstimados / META_DIARIA) * 100);
+    const ingresosUsar = ingresosReales > 0 ? ingresosReales : ingresosEstimados;
+    const pctCumplimiento = Math.round((ingresosUsar / META_DIARIA) * 100);
     let semaforo = "rojo";
     if (pctCumplimiento >= 100) semaforo = "verde";
     else if (pctCumplimiento >= 60) semaforo = "amarillo";
@@ -708,6 +808,7 @@ app.get("/api/dashboard", async (req, res) => {
       actualizadoEn: new Date().toISOString(),
       sede,
       metricas: {
+        ingresosReales,
         ingresosEstimados,
         citasTotal: totalCitas,
         atendidas, confirmadas, canceladas, suspendidas, noShow,
@@ -716,7 +817,7 @@ app.get("/api/dashboard", async (req, res) => {
           costoFijoDiario: COSTO_FIJO_DIARIO,
           metaDiaria: META_DIARIA,
           pctCumplimiento, semaforo,
-          faltaParaMeta: Math.max(0, META_DIARIA - ingresosEstimados)
+          faltaParaMeta: Math.max(0, META_DIARIA - ingresosUsar)
         }
       },
       sedes: {
@@ -740,11 +841,18 @@ app.get("/api/stats", async (req, res) => {
     const porEstado = await pool.query(`SELECT estado_cita, COUNT(*)::int AS n FROM citas GROUP BY estado_cita ORDER BY n DESC`);
     const porSucursal = await pool.query(`SELECT sucursal, COUNT(*)::int AS n FROM citas GROUP BY sucursal ORDER BY n DESC`);
     const rango = await pool.query(`SELECT MIN(fecha)::text AS desde, MAX(fecha)::text AS hasta FROM citas`);
-    let totalVentas = 0, montoTotal = 0;
+    let ventasInfo = { total_ventas: 0, monto_total: 0, por_mes: [] };
     try {
-      const v = await pool.query("SELECT COUNT(*)::int AS n, COALESCE(SUM(monto),0)::float AS m FROM ventas");
-      totalVentas = v.rows[0].n;
-      montoTotal = v.rows[0].m;
+      const v = await pool.query(
+        `SELECT COUNT(*)::int AS n, COALESCE(SUM(valor_pagado),0)::float AS m
+         FROM ventas WHERE estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}`
+      );
+      const vMes = await pool.query(
+        `SELECT EXTRACT(MONTH FROM fecha)::int AS mes, COUNT(*)::int AS n, SUM(valor_pagado)::bigint AS facturado
+         FROM ventas WHERE estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+         GROUP BY mes ORDER BY mes`
+      );
+      ventasInfo = { total_ventas: v.rows[0].n, monto_total: v.rows[0].m, por_mes: vMes.rows };
     } catch (e) {}
     res.json({
       ok: true,
@@ -752,8 +860,7 @@ app.get("/api/stats", async (req, res) => {
       rango_fechas: rango.rows[0],
       por_estado: porEstado.rows,
       por_sucursal: porSucursal.rows,
-      total_ventas: totalVentas,
-      monto_total: montoTotal
+      ...ventasInfo
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -766,8 +873,8 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.1",
-    schema: "historico (id_cita PK, 31 columnas reales)",
+    servidor: "Redvital Backend v5.2",
+    schema: "historico (citas: 31 cols, ventas: 36 cols con ingresos reales)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -804,6 +911,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.1 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.2 corriendo en puerto " + PORT);
   await inicializarBD();
 });
