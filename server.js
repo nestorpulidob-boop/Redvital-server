@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
+const crypto = require("crypto");
 const { Pool } = require("pg");
 
 const app = express();
@@ -176,6 +177,16 @@ async function guardarWebhookRaw(sedeKey, evento, uuid_evento, payload) {
 // =================================================
 // MAPEO Reservo -> tabla citas (v5.7)
 // =================================================
+
+// Genera un id BIGINT deterministico desde el uuid (para satisfacer PK NOT NULL)
+// Range: 10^17 a 1.72*10^17 - NO choca con ids reales de Reservo (~10^8)
+function uuidToBigint(uuid) {
+  if (!uuid) return null;
+  const hash = crypto.createHash('sha256').update(String(uuid)).digest('hex');
+  // 14 hex chars = 56 bits + offset 10^17
+  return (BigInt('0x' + hash.substring(0, 14)) + BigInt('100000000000000000')).toString();
+}
+
 function mapearCitaReservo(payload) {
   const datos = payload && payload.datos;
   if (!datos || !datos.uuid) return null;
@@ -205,6 +216,7 @@ function mapearCitaReservo(payload) {
   const telefonos = [cliente.telefono_1, cliente.telefono_2].filter(Boolean).join(' / ') || null;
 
   return {
+    id_cita: uuidToBigint(datos.uuid),
     uuid_cita: datos.uuid,
     fecha: fecha,
     agenda: agenda.descripcion || null,
@@ -266,6 +278,7 @@ function mapearVentaReservo(payload) {
   const estado = datos.estado || {};
 
   return {
+    id_venta: uuidToBigint(datos.uuid),
     uuid_venta: datos.uuid,
     sucursal: sucursal.nombre || null,
     fecha: datos.fecha || null,
@@ -294,7 +307,8 @@ async function guardarCitaReservo(payload) {
   if (!fila) throw new Error("payload de cita sin uuid o datos");
   const cols = Object.keys(fila);
   const placeholders = cols.map((_, i) => `$${i+1}`).join(', ');
-  const updateClause = cols.filter(c => c !== 'uuid_cita').map(c => `${c} = EXCLUDED.${c}`).join(', ');
+  // No actualizar id_cita ni uuid_cita en UPDATE (son immutable)
+  const updateClause = cols.filter(c => c !== 'uuid_cita' && c !== 'id_cita').map(c => `${c} = EXCLUDED.${c}`).join(', ');
   const sql = `INSERT INTO citas (${cols.join(', ')}) VALUES (${placeholders})
                ON CONFLICT (uuid_cita) DO UPDATE SET ${updateClause}
                RETURNING id_cita, uuid_cita`;
@@ -309,7 +323,7 @@ async function guardarVentaReservo(payload) {
   if (!fila) throw new Error("payload de venta sin uuid o datos");
   const cols = Object.keys(fila);
   const placeholders = cols.map((_, i) => `$${i+1}`).join(', ');
-  const updateClause = cols.filter(c => c !== 'uuid_venta').map(c => `${c} = EXCLUDED.${c}`).join(', ');
+  const updateClause = cols.filter(c => c !== 'uuid_venta' && c !== 'id_venta').map(c => `${c} = EXCLUDED.${c}`).join(', ');
   const sql = `INSERT INTO ventas (${cols.join(', ')}) VALUES (${placeholders})
                ON CONFLICT (uuid_venta) DO UPDATE SET ${updateClause}
                RETURNING id_venta, uuid_venta`;
@@ -1183,7 +1197,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.7.1",
+    servidor: "Redvital Backend v5.7.2",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -1450,7 +1464,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.7.1",
+    servidor: "Redvital Backend v5.7.2",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -1500,6 +1514,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.7.1 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.7.2 corriendo en puerto " + PORT);
   await inicializarBD();
 });
