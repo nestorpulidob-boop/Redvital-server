@@ -103,12 +103,41 @@ const COSTO_FIJO_MENSUAL = 20637600;
 //   - Personal/secretarias: 4.691.000
 //   - Variables (agua/luz/internet): 1.000.000
 
-// % que se queda Redvital despues de pagar al profesional
-const PCT_REDVITAL_CONSULTA = 0.30;  // profesional se lleva 70%
-const PCT_REDVITAL_EXAMEN = 0.50;    // 50/50 para examenes (RX, ecografia, endoscopia, etc.)
+// % que se queda Redvital (fijo, global) - 47% del bruto despues de pagar a TODOS
+const PCT_REDVITAL_GLOBAL = 0.47;
 
-// Heuristica para identificar examenes vs consultas (matchea contra productos_venta + profesional_atencion)
-const EXAMENES_REGEX = `(RADIOGRAF|ECOGRAF|ENDOSCO|COLONOSCOP|ESPIROMETR|HOLTER|ECOCARDIOG|EXAMEN|LABORATORIO|RX |RAYOS|TOMOGRAF|RESONANC|MAMOGRAF|DENSITOMETR|TEST DE|AUDIOMETR|ELECTROCARDIO|EEG|MONITOREO|SONOC|BIOPSI)`;
+// Heuristica para clasificar productos en categorias (servicios)
+// Cada categoria es {nombre, regex} - se evalua en orden, primer match gana
+const CATEGORIAS_SERVICIO = [
+  { nombre: 'Endoscopia',       regex: /(ENDOSCO|COLONOSCOP|GASTROSCOP)/i },
+  { nombre: 'Ecografia',        regex: /(ECOGRAF|ECO ABDOM|ECO MAMA|ECO PELV|ECOTOMOGR|SONOC)/i },
+  { nombre: 'Rayos X',          regex: /(RADIOGRAF|RX |RAYOS X|RAYOS-X)/i },
+  { nombre: 'Ecocardiograma',   regex: /(ECOCARDIOG)/i },
+  { nombre: 'Holter',           regex: /(HOLTER)/i },
+  { nombre: 'Electrocardiograma', regex: /(ELECTROCARDIO|EKG|ECG)/i },
+  { nombre: 'Espirometria',     regex: /(ESPIROMETR)/i },
+  { nombre: 'Tomografia',       regex: /(TOMOGRAF)/i },
+  { nombre: 'Resonancia',       regex: /(RESONANC|RNM)/i },
+  { nombre: 'Mamografia',       regex: /(MAMOGRAF)/i },
+  { nombre: 'Densitometria',    regex: /(DENSITOMETR)/i },
+  { nombre: 'Audiometria',      regex: /(AUDIOMETR)/i },
+  { nombre: 'EEG',              regex: /(\bEEG\b|ELECTROENCE)/i },
+  { nombre: 'Laboratorio',      regex: /(LABORATORIO|EXAMEN DE SANGRE|HEMOGRAMA|GLICEMIA|UREMIA)/i },
+  { nombre: 'Biopsia',          regex: /(BIOPSI)/i },
+  { nombre: 'Test medicos',     regex: /(TEST DE|MONITOREO|EXAMEN)/i },
+  { nombre: 'Consulta',         regex: /(CONSULTA|CONTROL|EVALUACION)/i }
+];
+// Para SQL: regex unica para detectar "examenes" (todo lo que NO sea Consulta)
+const EXAMENES_REGEX = `(RADIOGRAF|ECOGRAF|ENDOSCO|COLONOSCOP|GASTROSCOP|ESPIROMETR|HOLTER|ECOCARDIOG|EXAMEN|LABORATORIO|RX |RAYOS|TOMOGRAF|RESONANC|MAMOGRAF|DENSITOMETR|TEST DE|AUDIOMETR|ELECTROCARDIO|EEG|MONITOREO|SONOC|BIOPSI)`;
+
+// Helper JS para clasificar un texto en una categoria
+function clasificarCategoria(texto) {
+  if (!texto) return 'Sin categoria';
+  for (const cat of CATEGORIAS_SERVICIO) {
+    if (cat.regex.test(texto)) return cat.nombre;
+  }
+  return 'Otros';
+}
 
 // ============================================
 // INICIALIZAR BD - solo indices, no recrea tablas
@@ -921,15 +950,26 @@ async function metricaSerieTemporal({ desde, hasta, sucursal }) {
 
 // ============================================
 // METRICA 15: COMPARATIVA MENSUAL CON UTILIDAD NETA
-// Por cada mes calcula: ingresos, costo profesionales (70%/50%), costo fijo, utilidad neta
+// Mes Redvital = del dia 25 de un mes al 25 del mes siguiente (ambos inclusive)
+// Ej: "Mayo Redvital" = 25 abril -> 25 mayo
+// Margen Redvital = 47% del bruto (despues de pagar a TODOS los profesionales)
 // ============================================
 async function metricaComparativaMensual({ desde, hasta, sucursal }) {
   const sql = `
     WITH ventas_clasificadas AS (
       SELECT
-        DATE_TRUNC('month', fecha)::date AS mes,
+        -- Asignar a "mes Redvital": si dia >= 25, pertenece al mes siguiente; sino al actual
+        -- Ej: 26 abril -> mes Redvital "mayo" (representado como primer dia: 2026-05-01)
+        --     24 abril -> mes Redvital "abril" (2026-04-01)
+        CASE
+          WHEN EXTRACT(DAY FROM fecha) >= 25
+          THEN DATE_TRUNC('month', fecha + INTERVAL '7 days')::date
+          ELSE DATE_TRUNC('month', fecha)::date
+        END AS mes_redvital,
         valor_pagado,
-        -- Clasificar como examen si el producto o profesional matchea
+        productos_venta,
+        profesional_atencion,
+        -- Clasificar consulta vs examen (para info, ya no se usa para margen)
         CASE
           WHEN UPPER(COALESCE(productos_venta,'')) ~ '${EXAMENES_REGEX}'
             OR UPPER(COALESCE(profesional_atencion,'')) ~ '${EXAMENES_REGEX}'
@@ -944,7 +984,11 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
     ),
     citas_mes AS (
       SELECT
-        DATE_TRUNC('month', fecha)::date AS mes,
+        CASE
+          WHEN EXTRACT(DAY FROM fecha) >= 25
+          THEN DATE_TRUNC('month', fecha + INTERVAL '7 days')::date
+          ELSE DATE_TRUNC('month', fecha)::date
+        END AS mes_redvital,
         COUNT(*)::int AS total_citas,
         COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
         COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
@@ -952,11 +996,11 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
       FROM citas
       WHERE fecha BETWEEN $1::date AND $2::date
         AND ($3::text IS NULL OR sucursal = $3)
-      GROUP BY mes
+      GROUP BY mes_redvital
     ),
     ventas_mes AS (
       SELECT
-        mes,
+        mes_redvital,
         COUNT(*)::int AS num_ventas,
         SUM(valor_pagado)::bigint AS ingresos_total,
         SUM(valor_pagado) FILTER (WHERE tipo = 'consulta')::bigint AS ingresos_consultas,
@@ -964,54 +1008,56 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
         COUNT(*) FILTER (WHERE tipo = 'consulta')::int AS num_consultas,
         COUNT(*) FILTER (WHERE tipo = 'examen')::int AS num_examenes
       FROM ventas_clasificadas
-      GROUP BY mes
+      GROUP BY mes_redvital
     )
     SELECT
-      vm.mes::text AS mes,
-      EXTRACT(YEAR FROM vm.mes)::int AS anio,
-      EXTRACT(MONTH FROM vm.mes)::int AS num_mes,
+      vm.mes_redvital::text AS mes,
+      EXTRACT(YEAR FROM vm.mes_redvital)::int AS anio,
+      EXTRACT(MONTH FROM vm.mes_redvital)::int AS num_mes,
       cm.total_citas, cm.atendidas, cm.no_show, cm.pacientes_unicos,
       vm.num_ventas, vm.ingresos_total,
       COALESCE(vm.ingresos_consultas, 0)::bigint AS ingresos_consultas,
       COALESCE(vm.ingresos_examenes, 0)::bigint AS ingresos_examenes,
       COALESCE(vm.num_consultas, 0)::int AS num_consultas,
-      COALESCE(vm.num_examenes, 0)::int AS num_examenes,
-      -- Calculo de margen para Redvital (despues de pagar profesional)
-      ROUND(COALESCE(vm.ingresos_consultas,0) * ${PCT_REDVITAL_CONSULTA})::bigint AS margen_consultas,
-      ROUND(COALESCE(vm.ingresos_examenes,0) * ${PCT_REDVITAL_EXAMEN})::bigint AS margen_examenes,
-      ROUND(COALESCE(vm.ingresos_consultas,0) * ${1-PCT_REDVITAL_CONSULTA})::bigint AS pago_profesionales_consultas,
-      ROUND(COALESCE(vm.ingresos_examenes,0) * ${1-PCT_REDVITAL_EXAMEN})::bigint AS pago_profesionales_examenes
+      COALESCE(vm.num_examenes, 0)::int AS num_examenes
     FROM ventas_mes vm
-    LEFT JOIN citas_mes cm USING (mes)
-    ORDER BY vm.mes
+    LEFT JOIN citas_mes cm USING (mes_redvital)
+    ORDER BY vm.mes_redvital
   `;
   const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
 
-  // Calcular utilidad neta por mes (en JS para mayor claridad)
+  // Calcular utilidad neta por mes (margen unico 47% global)
   return rows.map(r => {
-    const margenBruto = Number(r.margen_consultas) + Number(r.margen_examenes);
-    const pagoProfesionales = Number(r.pago_profesionales_consultas) + Number(r.pago_profesionales_examenes);
+    const ingresoTotal = Number(r.ingresos_total) || 0;
+    const margenBruto = Math.round(ingresoTotal * PCT_REDVITAL_GLOBAL);
+    const pagoProfesionales = ingresoTotal - margenBruto;
     const utilidadNeta = margenBruto - COSTO_FIJO_MENSUAL;
-    const margenPct = r.ingresos_total > 0 ? +(100 * utilidadNeta / r.ingresos_total).toFixed(1) : 0;
+    const margenPct = ingresoTotal > 0 ? +(100 * utilidadNeta / ingresoTotal).toFixed(1) : 0;
     const nombresMes = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
+    // Calcular fechas reales del periodo Redvital: dia 25 mes anterior -> dia 25 de este mes
+    const fechaMes = new Date(r.mes); // primer dia del mes "destino"
+    const inicio = new Date(fechaMes.getFullYear(), fechaMes.getMonth() - 1, 25);
+    const fin = new Date(fechaMes.getFullYear(), fechaMes.getMonth(), 25);
     return {
       mes: r.mes,
       anio: r.anio,
       num_mes: r.num_mes,
       nombre_mes: `${nombresMes[r.num_mes-1]} ${r.anio}`,
+      periodo_inicio: inicio.toISOString().split('T')[0],
+      periodo_fin: fin.toISOString().split('T')[0],
+      periodo_label: `25 ${nombresMes[(r.num_mes-2+12)%12]} → 25 ${nombresMes[r.num_mes-1]}`,
       total_citas: r.total_citas,
       atendidas: r.atendidas,
       no_show: r.no_show,
       pacientes_unicos: r.pacientes_unicos,
       num_ventas: r.num_ventas,
-      ingresos_total: Number(r.ingresos_total),
+      ingresos_total: ingresoTotal,
       ingresos_consultas: Number(r.ingresos_consultas),
       ingresos_examenes: Number(r.ingresos_examenes),
       num_consultas: r.num_consultas,
       num_examenes: r.num_examenes,
-      margen_consultas: Number(r.margen_consultas),
-      margen_examenes: Number(r.margen_examenes),
       margen_bruto: margenBruto,
+      pct_margen: PCT_REDVITAL_GLOBAL,
       pago_profesionales: pagoProfesionales,
       costo_fijo: COSTO_FIJO_MENSUAL,
       utilidad_neta: utilidadNeta,
@@ -1019,6 +1065,53 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
       estado: utilidadNeta > 0 ? 'rentable' : (utilidadNeta < 0 ? 'deficit' : 'equilibrio')
     };
   });
+}
+
+// ============================================
+// METRICA 16: VENTAS POR CATEGORIA DE SERVICIO
+// Agrupa por categoria detectada de productos_venta
+// ============================================
+async function metricaCategorias({ desde, hasta, sucursal }) {
+  const sql = `
+    SELECT productos_venta, profesional_atencion,
+           valor_pagado, sucursal
+    FROM ventas
+    WHERE fecha BETWEEN $1::date AND $2::date
+      AND ($3::text IS NULL OR sucursal = $3)
+      AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+  `;
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
+
+  // Clasificar en JS y agrupar por categoria + profesional
+  const acumulador = {};
+  for (const row of rows) {
+    const texto = `${row.productos_venta || ''} ${row.profesional_atencion || ''}`;
+    const cat = clasificarCategoria(texto);
+    const prof = row.profesional_atencion || 'Sin profesional';
+    const valor = Number(row.valor_pagado) || 0;
+
+    if (!acumulador[cat]) {
+      acumulador[cat] = { categoria: cat, num_ventas: 0, ingresos: 0, profesionales: {} };
+    }
+    acumulador[cat].num_ventas++;
+    acumulador[cat].ingresos += valor;
+    if (!acumulador[cat].profesionales[prof]) {
+      acumulador[cat].profesionales[prof] = { profesional: prof, num_ventas: 0, ingresos: 0 };
+    }
+    acumulador[cat].profesionales[prof].num_ventas++;
+    acumulador[cat].profesionales[prof].ingresos += valor;
+  }
+  // Convertir a array y ordenar
+  const lista = Object.values(acumulador).map(c => ({
+    categoria: c.categoria,
+    num_ventas: c.num_ventas,
+    ingresos: c.ingresos,
+    profesionales: Object.values(c.profesionales)
+      .sort((a, b) => b.ingresos - a.ingresos)
+  })).sort((a, b) => b.ingresos - a.ingresos);
+
+  const total = lista.reduce((s, c) => s + c.ingresos, 0);
+  return { total_ingresos: total, categorias: lista };
 }
 
 
@@ -1049,6 +1142,7 @@ app.get("/api/metricas/prevision", wrap(metricaPrevision));
 app.get("/api/metricas/origen-reservas", wrap(metricaOrigenReservas));
 app.get("/api/metricas/serie-temporal", wrap(metricaSerieTemporal));
 app.get("/api/metricas/comparativa-mensual", wrap(metricaComparativaMensual));
+app.get("/api/metricas/categorias", wrap(metricaCategorias));
 
 // ============================================
 // ENDPOINT MAESTRO
@@ -1071,7 +1165,8 @@ app.get("/api/metricas/all", async (req, res) => {
       ["prevision", metricaPrevision(filtros)],
       ["origen_reservas", metricaOrigenReservas(filtros)],
       ["serie_temporal", metricaSerieTemporal(filtros)],
-      ["comparativa_mensual", metricaComparativaMensual(filtros)]
+      ["comparativa_mensual", metricaComparativaMensual(filtros)],
+      ["categorias", metricaCategorias(filtros)]
     ];
     const resultados = await Promise.allSettled(tareas.map(t => t[1]));
     const metricas = {};
@@ -1197,7 +1292,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.7.2",
+    servidor: "Redvital Backend v5.8",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -1464,7 +1559,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.7.2",
+    servidor: "Redvital Backend v5.8",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -1497,7 +1592,8 @@ app.get("/", (req, res) => {
         "/api/metricas/prevision",
         "/api/metricas/origen-reservas",
         "/api/metricas/serie-temporal",
-        "/api/metricas/comparativa-mensual"
+        "/api/metricas/comparativa-mensual",
+        "/api/metricas/categorias"
       ]
     },
     parametros: {
@@ -1514,6 +1610,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.7.2 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.8 corriendo en puerto " + PORT);
   await inicializarBD();
 });
