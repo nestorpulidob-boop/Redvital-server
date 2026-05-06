@@ -85,18 +85,48 @@ async function inicializarBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_profesional ON citas(profesional)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_id_paciente ON citas(id_paciente)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_tratamiento ON citas(tratamiento)`);
-    console.log("Indices verificados correctamente");
+
+    // Tabla para capturar webhooks crudos (debug + procesamiento posterior)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS webhooks_raw (
+        id BIGSERIAL PRIMARY KEY,
+        recibido_en TIMESTAMPTZ DEFAULT NOW(),
+        sede TEXT,
+        evento TEXT,
+        payload JSONB,
+        procesado BOOLEAN DEFAULT FALSE,
+        error TEXT
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_wh_recibido ON webhooks_raw(recibido_en DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_wh_evento ON webhooks_raw(evento)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_wh_procesado ON webhooks_raw(procesado)`);
+
+    console.log("Indices y tabla webhooks_raw verificados correctamente");
   } catch (err) {
     console.error("Error inicializando BD:", err.message);
   }
 }
 
-// Webhooks: por ahora solo loguean (mapeo Reservo->BD pendiente para v5.3)
+// Guardar webhook crudo en BD (no procesa, solo captura)
+async function guardarWebhookRaw(sedeKey, evento, payload) {
+  try {
+    await pool.query(
+      `INSERT INTO webhooks_raw (sede, evento, payload) VALUES ($1, $2, $3)`,
+      [sedeKey, evento, JSON.stringify(payload || {})]
+    );
+  } catch (err) {
+    console.error(`Error guardando webhook crudo (${sedeKey}/${evento}):`, err.message);
+  }
+}
+
 async function guardarCita(sedeKey, datos) {
-  console.log(`[webhook ${sedeKey}] cita:`, datos.uuid || datos.id || "?");
+  console.log(`[webhook ${sedeKey}] cita id=${datos.id_cita || datos.id || datos.uuid || "?"}`);
+  await guardarWebhookRaw(sedeKey, "citas", datos);
 }
 async function guardarVenta(sedeKey, datos) {
-  console.log(`[webhook ${sedeKey}] venta:`, datos.uuid || datos.id || "?");
+  console.log(`[webhook ${sedeKey}] venta id=${datos.id_venta || datos.id || datos.uuid || "?"}`);
+  await guardarWebhookRaw(sedeKey, "ventas", datos);
 }
 
 // ============================================
@@ -711,9 +741,90 @@ app.get("/api/metricas/all", async (req, res) => {
 // ============================================
 // STATUS
 // ============================================
+app.get("/api/webhooks/recientes", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const evento = req.query.evento;
+    const sede = req.query.sede;
+    const params = [];
+    let where = "1=1";
+    if (evento) { params.push(evento); where += ` AND evento = $${params.length}`; }
+    if (sede) { params.push(sede); where += ` AND sede = $${params.length}`; }
+    params.push(limit);
+    const sql = `
+      SELECT id, recibido_en, sede, evento, procesado, error,
+             jsonb_object_keys(payload) AS dummy_keys
+      FROM webhooks_raw
+      WHERE ${where}
+      ORDER BY recibido_en DESC
+      LIMIT $${params.length}
+    `;
+    // Versión sin keys, más simple
+    const sql2 = `
+      SELECT id, recibido_en, sede, evento, procesado, error,
+             (SELECT array_agg(k) FROM jsonb_object_keys(payload) k) AS keys_top,
+             payload
+      FROM webhooks_raw
+      WHERE ${where}
+      ORDER BY recibido_en DESC
+      LIMIT $${params.length}
+    `;
+    const { rows } = await pool.query(sql2, params);
+    res.json({
+      ok: true,
+      total: rows.length,
+      webhooks: rows
+    });
+  } catch (err) {
+    console.error("Error en /api/webhooks/recientes:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/webhooks/sample", async (req, res) => {
+  try {
+    const evento = req.query.evento || "citas";
+    const { rows } = await pool.query(
+      `SELECT id, recibido_en, sede, evento, payload
+       FROM webhooks_raw
+       WHERE evento = $1
+       ORDER BY recibido_en DESC LIMIT 1`,
+      [evento]
+    );
+    if (rows.length === 0) {
+      return res.json({ ok: true, mensaje: `No hay webhooks de tipo "${evento}" todavia. Espera a que pasen citas reales en la clinica.` });
+    }
+    res.json({ ok: true, sample: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/webhooks/resumen", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT
+        evento,
+        sede,
+        COUNT(*)::int AS cantidad,
+        MIN(recibido_en)::text AS primero,
+        MAX(recibido_en)::text AS ultimo,
+        COUNT(*) FILTER (WHERE procesado) AS procesados,
+        COUNT(*) FILTER (WHERE error IS NOT NULL) AS con_error
+      FROM webhooks_raw
+      GROUP BY evento, sede
+      ORDER BY evento, sede
+    `);
+    res.json({ ok: true, resumen: r.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.get("/api/status", async (req, res) => {
   let bdConectada = false;
-  let totalCitas = 0, totalVentas = 0;
+  let totalCitas = 0, totalVentas = 0, totalWebhooks = 0;
+  let ultimoWebhook = null;
   try {
     const c = await pool.query("SELECT COUNT(*)::int AS n FROM citas");
     bdConectada = true;
@@ -722,14 +833,21 @@ app.get("/api/status", async (req, res) => {
       const v = await pool.query("SELECT COUNT(*)::int AS n FROM ventas");
       totalVentas = v.rows[0].n;
     } catch (e) {}
+    try {
+      const w = await pool.query(`SELECT COUNT(*)::int AS n, MAX(recibido_en)::text AS ult FROM webhooks_raw`);
+      totalWebhooks = w.rows[0].n;
+      ultimoWebhook = w.rows[0].ult;
+    } catch (e) {}
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.2",
+    servidor: "Redvital Backend v5.3",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
     total_ventas_bd: totalVentas,
+    total_webhooks_recibidos: totalWebhooks,
+    ultimo_webhook: ultimoWebhook,
     sedes: {
       sede1: { conectada: ultimaActualizacion.sede1 !== null, ultimaActualizacion: ultimaActualizacion.sede1 },
       sede2: { conectada: ultimaActualizacion.sede2 !== null, ultimaActualizacion: ultimaActualizacion.sede2 }
@@ -873,12 +991,18 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.2",
-    schema: "historico (citas: 31 cols, ventas: 36 cols con ingresos reales)",
+    servidor: "Redvital Backend v5.3",
+    schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw para captura)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
       webhooks: ["/webhook/sede1", "/webhook/sede2"],
+      debug_webhooks: [
+        "/api/webhooks/resumen",
+        "/api/webhooks/recientes",
+        "/api/webhooks/sample?evento=citas",
+        "/api/webhooks/sample?evento=ventas"
+      ],
       metricas: [
         "/api/metricas/all",
         "/api/metricas/kpis",
@@ -911,6 +1035,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.2 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.3 corriendo en puerto " + PORT);
   await inicializarBD();
 });
