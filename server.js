@@ -137,49 +137,233 @@ async function inicializarBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_wh_evento ON webhooks_raw(evento)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_wh_procesado ON webhooks_raw(procesado)`);
 
-    console.log("Indices y tabla webhooks_raw verificados correctamente");
+    // v5.7: agregar columnas uuid para mapeo de webhooks Reservo
+    await pool.query(`ALTER TABLE citas ADD COLUMN IF NOT EXISTS uuid_cita TEXT`);
+    await pool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS uuid_venta TEXT`);
+    await pool.query(`ALTER TABLE webhooks_raw ADD COLUMN IF NOT EXISTS uuid_evento TEXT`);
+    // Indices unicos parciales (solo cuando uuid no es NULL, para que coexistan registros historicos sin uuid)
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_citas_uuid ON citas(uuid_cita) WHERE uuid_cita IS NOT NULL`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_ventas_uuid ON ventas(uuid_venta) WHERE uuid_venta IS NOT NULL`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_wh_uuid_evento ON webhooks_raw(uuid_evento) WHERE uuid_evento IS NOT NULL`);
+
+    console.log("Indices, tabla webhooks_raw y columnas uuid verificados correctamente");
   } catch (err) {
     console.error("Error inicializando BD:", err.message);
   }
 }
 
-// Guardar webhook crudo en BD (no procesa, solo captura)
-async function guardarWebhookRaw(sedeKey, evento, payload) {
+// Guardar webhook crudo en BD con dedupe por uuid_evento (Reservo puede mandar duplicados)
+async function guardarWebhookRaw(sedeKey, evento, uuid_evento, payload) {
   try {
-    await pool.query(
-      `INSERT INTO webhooks_raw (sede, evento, payload) VALUES ($1, $2, $3)`,
-      [sedeKey, evento, JSON.stringify(payload || {})]
+    const r = await pool.query(
+      `INSERT INTO webhooks_raw (sede, evento, uuid_evento, payload)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (uuid_evento) DO NOTHING
+       RETURNING id`,
+      [sedeKey, evento, uuid_evento || null, JSON.stringify(payload || {})]
     );
+    return r.rows[0] ? r.rows[0].id : null; // null si fue duplicado
   } catch (err) {
-    console.error(`Error guardando webhook crudo (${sedeKey}/${evento}):`, err.message);
+    console.error(`Error guardando webhook crudo:`, err.message);
+    return null;
   }
 }
 
-// Manejador unificado de webhooks (para ambas sedes)
-// PING: health check de Reservo - solo loguear, NO guardar (son frecuentes)
-// Otros eventos: guardar payload completo en webhooks_raw
+// =================================================
+// MAPEO Reservo -> tabla citas (v5.7)
+// =================================================
+function mapearCitaReservo(payload) {
+  const datos = payload && payload.datos;
+  if (!datos || !datos.uuid) return null;
+
+  const cliente = datos.cliente || {};
+  const profesional = datos.profesional || {};
+  const sucursal = datos.sucursal || {};
+  const estado = datos.estado || {};
+  const estadoPago = datos.estado_pago || {};
+  const agenda = datos.agenda || {};
+  const tratamiento = (datos.tratamientos && datos.tratamientos[0]) || {};
+
+  // Extraer fecha y horas del campo "inicio" (formato: 2026-05-06T19:00:00Z)
+  const inicio = datos.inicio ? new Date(datos.inicio) : null;
+  const fin = datos.fin ? new Date(datos.fin) : null;
+  // Convertir a hora local Chile (America/Santiago = UTC-4 generalmente)
+  // Para simplificar, restamos 4 horas (Chile horario invierno) - puede haber +/- 1 segun DST
+  const inicioCL = inicio ? new Date(inicio.getTime() - 4 * 3600000) : null;
+  const finCL = fin ? new Date(fin.getTime() - 4 * 3600000) : null;
+
+  const fecha = inicioCL ? inicioCL.toISOString().split('T')[0] : null;
+  const horaInicio = inicioCL ? inicioCL.toISOString().split('T')[1].substring(0, 8) : null;
+  const horaFin = finCL ? finCL.toISOString().split('T')[1].substring(0, 8) : null;
+
+  const partes = [cliente.nombre, cliente.apellido_paterno, cliente.apellido_materno].filter(Boolean);
+  const paciente = partes.join(' ').trim() || null;
+  const telefonos = [cliente.telefono_1, cliente.telefono_2].filter(Boolean).join(' / ') || null;
+
+  return {
+    uuid_cita: datos.uuid,
+    fecha: fecha,
+    agenda: agenda.descripcion || null,
+    profesional: profesional.nombre || null,
+    hora_inicio: horaInicio,
+    hora_fin: horaFin,
+    tratamiento: tratamiento.nombre || null,
+    codigo: tratamiento.codigo || null,
+    rut: cliente.identificador || null,
+    paciente: paciente,
+    telefonos: telefonos,
+    mail: cliente.mail || null,
+    estado_cita: estado.descripcion || null,
+    estado_pago: estadoPago.descripcion || null,
+    comentario: datos.comentario || null,
+    prevision: cliente.prevision ? cliente.prevision.nombre : null,
+    online: datos.online ? 'Si' : 'No',
+    sucursal: sucursal.nombre || null,
+    fecha_creacion_utc: datos.fecha_creacion ? datos.fecha_creacion.replace('T', ' ').replace('Z', '') : null,
+    sexo: cliente.sexo || null,
+    fecha_nacimiento: cliente.fecha_nacimiento || null,
+    origen: datos.origen_creacion ? datos.origen_creacion.descripcion : null
+  };
+}
+
+// =================================================
+// MAPEO Reservo -> tabla ventas (v5.7)
+// =================================================
+function mapearVentaReservo(payload) {
+  const datos = payload && payload.datos;
+  if (!datos || !datos.uuid) return null;
+
+  const items = datos.items || [];
+  const productos = items.map(it => it.item ? it.item.nombre : '').filter(Boolean).join(' + ');
+
+  // Profesional: buscar en meta_data del primer item
+  const itemConProf = items.find(it => it.meta_data && it.meta_data.profesional_comision);
+  const profesionalAtencion = itemConProf ? itemConProf.meta_data.profesional_comision.nombre : null;
+
+  const receptor = datos.receptor || {};
+  const partesNom = [receptor.nombre, receptor.apellido_paterno, receptor.apellido_materno].filter(Boolean);
+  const nombreDemandante = partesNom.join(' ').trim() || null;
+
+  // Distribuir pagos por tipo (codigos: Efec, Tcre, Tdeb, Trans, Cheque, etc)
+  let efectivo = 0, tarjetaCredito = 0, tarjetaDebito = 0, transferencia = 0, cheque = 0;
+  (datos.pagos || []).forEach(p => {
+    const tipo = p.meta_data && p.meta_data.tipo_pago ? (p.meta_data.tipo_pago.codigo || '') : '';
+    const monto = parseFloat(p.monto) || 0;
+    const tipoLow = tipo.toLowerCase();
+    if (tipoLow.startsWith('efec')) efectivo += monto;
+    else if (tipoLow.startsWith('tcre')) tarjetaCredito += monto;
+    else if (tipoLow.startsWith('tdeb')) tarjetaDebito += monto;
+    else if (tipoLow.startsWith('trans')) transferencia += monto;
+    else if (tipoLow.startsWith('cheque')) cheque += monto;
+  });
+
+  const doc = (datos.documentos && datos.documentos[0]) || null;
+  const sucursal = datos.sucursal || {};
+  const estado = datos.estado || {};
+
+  return {
+    uuid_venta: datos.uuid,
+    sucursal: sucursal.nombre || null,
+    fecha: datos.fecha || null,
+    fecha_caja: datos.fecha_ingreso ? datos.fecha_ingreso.replace('T', ' ').replace('Z', '') : null,
+    productos_venta: productos || null,
+    estado_venta: estado.descripcion || null,
+    boletas: doc ? doc.folio : null,
+    tipo_documentos: doc && doc.tipo ? doc.tipo.descripcion : null,
+    profesional_atencion: profesionalAtencion,
+    rut_demandante: receptor.identificador || null,
+    nombre_demandante: nombreDemandante,
+    valor_pagado: parseFloat(datos.monto) || 0,
+    precio_venta: parseFloat(datos.monto) || 0,
+    valor_sin_descuento: parseFloat(datos.monto) || 0,
+    efectivo: efectivo,
+    tarjeta_credito: tarjetaCredito,
+    tarjeta_debito: tarjetaDebito,
+    transferencia: transferencia,
+    cheque: cheque
+  };
+}
+
+// UPSERT cita por uuid_cita
+async function guardarCitaReservo(payload) {
+  const fila = mapearCitaReservo(payload);
+  if (!fila) throw new Error("payload de cita sin uuid o datos");
+  const cols = Object.keys(fila);
+  const placeholders = cols.map((_, i) => `$${i+1}`).join(', ');
+  const updateClause = cols.filter(c => c !== 'uuid_cita').map(c => `${c} = EXCLUDED.${c}`).join(', ');
+  const sql = `INSERT INTO citas (${cols.join(', ')}) VALUES (${placeholders})
+               ON CONFLICT (uuid_cita) DO UPDATE SET ${updateClause}
+               RETURNING id_cita, uuid_cita`;
+  const valores = cols.map(c => fila[c]);
+  const { rows } = await pool.query(sql, valores);
+  return rows[0];
+}
+
+// UPSERT venta por uuid_venta
+async function guardarVentaReservo(payload) {
+  const fila = mapearVentaReservo(payload);
+  if (!fila) throw new Error("payload de venta sin uuid o datos");
+  const cols = Object.keys(fila);
+  const placeholders = cols.map((_, i) => `$${i+1}`).join(', ');
+  const updateClause = cols.filter(c => c !== 'uuid_venta').map(c => `${c} = EXCLUDED.${c}`).join(', ');
+  const sql = `INSERT INTO ventas (${cols.join(', ')}) VALUES (${placeholders})
+               ON CONFLICT (uuid_venta) DO UPDATE SET ${updateClause}
+               RETURNING id_venta, uuid_venta`;
+  const valores = cols.map(c => fila[c]);
+  const { rows } = await pool.query(sql, valores);
+  return rows[0];
+}
+
+// Manejador unificado: guarda raw + procesa segun evento
 async function manejarWebhook(sedeKey, body) {
   const evento = body && body.evento;
   const uuid_evento = body && body.uuid_evento;
 
   if (evento === "ping") {
-    console.log(`[webhook ${sedeKey}] PING (health check Reservo) ${new Date().toISOString()}`);
+    console.log(`[webhook] PING (health check) ${new Date().toISOString()}`);
     return;
   }
 
   console.log(`[webhook ${sedeKey}] ${evento || "?"} uuid_evento=${uuid_evento || "?"}`);
-  // Guardar el payload COMPLETO (con fuente, evento, datos, uuid_evento, procesado_a_las)
-  await guardarWebhookRaw(sedeKey, evento || "desconocido", body);
+
+  // 1. Guardar payload completo (con dedupe por uuid_evento)
+  const rawId = await guardarWebhookRaw(sedeKey, evento, uuid_evento, body);
+  if (!rawId) {
+    console.log(`[webhook ${sedeKey}] duplicado uuid_evento=${uuid_evento}, omitido`);
+    return;
+  }
+
+  // 2. Procesar segun tipo de evento
+  let procesado = false;
+  let errorMsg = null;
+  try {
+    if (evento === "citas") {
+      const r = await guardarCitaReservo(body);
+      console.log(`[webhook ${sedeKey}] cita upsert OK uuid=${r && r.uuid_cita}`);
+      procesado = true;
+    } else if (evento === "ventas") {
+      const r = await guardarVentaReservo(body);
+      console.log(`[webhook ${sedeKey}] venta upsert OK uuid=${r && r.uuid_venta}`);
+      procesado = true;
+    } else {
+      // pacientes y otros: solo guardar raw, no procesar
+      procesado = true; // marcar como procesado (intencionalmente ignorado)
+    }
+  } catch (err) {
+    errorMsg = err.message;
+    console.error(`[webhook ${sedeKey}] Error procesando ${evento}:`, err.message);
+  }
+
+  // 3. Marcar resultado en webhooks_raw
+  await pool.query(
+    `UPDATE webhooks_raw SET procesado = $1, error = $2 WHERE id = $3`,
+    [procesado, errorMsg, rawId]
+  ).catch(e => console.error("Error actualizando webhooks_raw:", e.message));
 }
 
-async function guardarCita(sedeKey, datos) {
-  // Reservado para v5.6 (mapeo Reservo -> tabla citas tras inspeccionar formato real)
-  console.log(`[v5.6 pendiente] cita sede=${sedeKey}`);
-}
-async function guardarVenta(sedeKey, datos) {
-  // Reservado para v5.6 (mapeo Reservo -> tabla ventas)
-  console.log(`[v5.6 pendiente] venta sede=${sedeKey}`);
-}
+// Wrappers legacy (no se usan pero quedan por compatibilidad)
+async function guardarCita(sedeKey, datos) { console.log(`[legacy] guardarCita ${sedeKey}`); }
+async function guardarVenta(sedeKey, datos) { console.log(`[legacy] guardarVenta ${sedeKey}`); }
 
 // ============================================
 // HELPERS
@@ -995,7 +1179,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.6",
+    servidor: "Redvital Backend v5.7",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -1078,6 +1262,39 @@ app.get("/api/admin/listar-webhooks", async (req, res) => {
     ok: true,
     instrucciones: "Aqui se ven los webhooks registrados en Reservo con cada token. Verifica que la 'url' apunte a https://redvital-server.onrender.com/webhook/sede1 (o sede2).",
     resultados
+  });
+});
+
+// ============================================
+// ADMIN: Reprocesar webhooks pendientes (los que llegaron pero no se mapearon)
+// ============================================
+app.get("/api/admin/reprocesar-webhooks", async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, sede, evento, payload, uuid_evento FROM webhooks_raw
+     WHERE procesado = FALSE AND evento IN ('citas','ventas')
+     ORDER BY id DESC LIMIT 500`
+  );
+  let ok_citas = 0, ok_ventas = 0, fail = 0;
+  const errores = [];
+  for (const r of rows) {
+    try {
+      const body = typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload;
+      if (r.evento === 'citas') { await guardarCitaReservo(body); ok_citas++; }
+      else if (r.evento === 'ventas') { await guardarVentaReservo(body); ok_ventas++; }
+      await pool.query(`UPDATE webhooks_raw SET procesado = TRUE, error = NULL WHERE id = $1`, [r.id]);
+    } catch (err) {
+      await pool.query(`UPDATE webhooks_raw SET error = $1 WHERE id = $2`, [err.message, r.id]);
+      errores.push({ id: r.id, evento: r.evento, error: err.message });
+      fail++;
+    }
+  }
+  res.json({
+    ok: true,
+    total_pendientes: rows.length,
+    procesados_citas: ok_citas,
+    procesados_ventas: ok_ventas,
+    con_error: fail,
+    errores: errores.slice(0, 10)
   });
 });
 
@@ -1229,7 +1446,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.6",
+    servidor: "Redvital Backend v5.7",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -1243,7 +1460,8 @@ app.get("/", (req, res) => {
       ],
       admin: [
         "/api/admin/listar-webhooks",
-        "/api/admin/activar-webhooks"
+        "/api/admin/activar-webhooks",
+        "/api/admin/reprocesar-webhooks"
       ],
       metricas: [
         "/api/metricas/all",
@@ -1278,6 +1496,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.6 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.7 corriendo en puerto " + PORT);
   await inicializarBD();
 });
