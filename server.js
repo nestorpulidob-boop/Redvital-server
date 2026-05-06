@@ -141,10 +141,14 @@ async function inicializarBD() {
     await pool.query(`ALTER TABLE citas ADD COLUMN IF NOT EXISTS uuid_cita TEXT`);
     await pool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS uuid_venta TEXT`);
     await pool.query(`ALTER TABLE webhooks_raw ADD COLUMN IF NOT EXISTS uuid_evento TEXT`);
-    // Indices unicos parciales (solo cuando uuid no es NULL, para que coexistan registros historicos sin uuid)
-    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_citas_uuid ON citas(uuid_cita) WHERE uuid_cita IS NOT NULL`);
-    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_ventas_uuid ON ventas(uuid_venta) WHERE uuid_venta IS NOT NULL`);
-    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_wh_uuid_evento ON webhooks_raw(uuid_evento) WHERE uuid_evento IS NOT NULL`);
+    // v5.7.1: drop indices parciales viejos (no funcionan con ON CONFLICT) y recrear completos
+    // PostgreSQL permite multiples NULL en UNIQUE indexes - los trata como distintos
+    await pool.query(`DROP INDEX IF EXISTS idx_citas_uuid`);
+    await pool.query(`DROP INDEX IF EXISTS idx_ventas_uuid`);
+    await pool.query(`DROP INDEX IF EXISTS idx_wh_uuid_evento`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_citas_uuid ON citas(uuid_cita)`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_ventas_uuid ON ventas(uuid_venta)`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_wh_uuid_evento ON webhooks_raw(uuid_evento)`);
 
     console.log("Indices, tabla webhooks_raw y columnas uuid verificados correctamente");
   } catch (err) {
@@ -1179,7 +1183,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.7",
+    servidor: "Redvital Backend v5.7.1",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -1446,7 +1450,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.7",
+    servidor: "Redvital Backend v5.7.1",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -1496,6 +1500,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.7 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.7.1 corriendo en puerto " + PORT);
   await inicializarBD();
 });
