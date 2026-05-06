@@ -28,15 +28,23 @@ pool.on("error", (err) => {
 const SEDES = {
   sede1: {
     nombre: "RedVital Sede Maturana",
+    sucursal: "RedVital Sede Maturana",
     token: process.env.TOKEN_SEDE1,
     box: 7
   },
   sede2: {
     nombre: "Centro Medico Redvital",
+    sucursal: "Centro Medico Redvital",
     token: process.env.TOKEN_SEDE2,
     box: 5
   }
 };
+
+function sucursalFromSede(sede) {
+  if (sede === "sede1") return "RedVital Sede Maturana";
+  if (sede === "sede2") return "Centro Medico Redvital";
+  return null;
+}
 
 const ultimaActualizacion = {
   sede1: null,
@@ -46,209 +54,71 @@ const ultimaActualizacion = {
 // ============================================
 // CONFIGURACION DE NEGOCIO
 // ============================================
-// Codigos de estado en Reservo (verificar contra tu BD real)
-const ESTADO = {
-  ATENDIDA: "A",
-  CONFIRMADA: "C",
-  NO_SHOW: "NS",
-  CANCELADA: "X",
-  SUSPENDIDA: "S"
+const ESTADOS = {
+  ATENDIDA: ["Atendido", "Llegó"],
+  CONFIRMADA: ["Confirmado", "No Confirmado"],
+  NO_SHOW: ["No llegó"],
+  CANCELADA: ["Eliminado"],
+  SUSPENDIDA: ["Suspendió"],
+  LISTA_ESPERA: ["Lista de Espera"]
 };
 
-// Ticket promedio acordado: $30.000 CLP (para ingresos estimados cuando no hay venta vinculada)
-const TICKET_PROMEDIO = 30000;
+function inList(arr) {
+  return "(" + arr.map(s => "'" + s.replace(/'/g, "''") + "'").join(",") + ")";
+}
 
-// Costo fijo y meta diaria (heredado de /api/dashboard)
+const TICKET_PROMEDIO = 30000;
 const COSTO_FIJO_DIARIO = 733000;
 const META_DIARIA = 2770000;
 
 // ============================================
-// INICIALIZAR BASE DE DATOS
+// INICIALIZAR BD - solo indices, no recrea citas
 // ============================================
 async function inicializarBD() {
   try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS citas (
-        uuid TEXT PRIMARY KEY,
-        sede TEXT NOT NULL,
-        sucursal_uuid TEXT,
-        sucursal_nombre TEXT,
-        agenda_uuid TEXT,
-        agenda_descripcion TEXT,
-        profesional_uuid TEXT,
-        profesional_nombre TEXT,
-        especialidad TEXT,
-        cliente_uuid TEXT,
-        cliente_nombre TEXT,
-        cliente_apellido TEXT,
-        cliente_rut TEXT,
-        cliente_telefono TEXT,
-        cliente_email TEXT,
-        inicio TIMESTAMPTZ,
-        fin TIMESTAMPTZ,
-        estado_codigo TEXT,
-        estado_descripcion TEXT,
-        estado_pago TEXT,
-        tratamientos JSONB,
-        datos_completos JSONB,
-        fecha_creacion TIMESTAMPTZ,
-        actualizado_en TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_fecha ON citas(fecha)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_sucursal ON citas(sucursal)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_estado ON citas(estado_cita)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_profesional ON citas(profesional)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_id_paciente ON citas(id_paciente)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_tratamiento ON citas(tratamiento)`);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS ventas (
-        uuid TEXT PRIMARY KEY,
-        sede TEXT NOT NULL,
-        sucursal_uuid TEXT,
-        sucursal_nombre TEXT,
-        cita_uuid TEXT,
-        receptor_uuid TEXT,
-        receptor_nombre TEXT,
-        receptor_rut TEXT,
-        monto NUMERIC,
-        estado_codigo TEXT,
-        estado_descripcion TEXT,
+        id_venta BIGINT PRIMARY KEY,
         fecha DATE,
-        fecha_ingreso TIMESTAMPTZ,
+        sucursal TEXT,
+        id_cita BIGINT,
+        rut TEXT,
+        receptor TEXT,
+        monto NUMERIC,
+        estado TEXT,
         items JSONB,
         pagos JSONB,
-        datos_completos JSONB,
         actualizado_en TIMESTAMPTZ DEFAULT NOW()
       )
     `);
-
-    // Indices base (los 5 originales)
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_inicio ON citas(inicio)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_sede ON citas(sede)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_especialidad ON citas(especialidad)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ventas_fecha ON ventas(fecha)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ventas_sede ON ventas(sede)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ventas_sucursal ON ventas(sucursal)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ventas_id_cita ON ventas(id_cita)`);
 
-    // Indices nuevos para acelerar queries de metricas
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_cliente ON citas(cliente_uuid)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_profesional ON citas(profesional_uuid)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_estado ON citas(estado_codigo)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ventas_cita ON ventas(cita_uuid)`);
-
-    console.log("Base de datos inicializada correctamente");
+    console.log("Indices verificados correctamente");
   } catch (err) {
     console.error("Error inicializando BD:", err.message);
   }
 }
 
-// ============================================
-// GUARDAR CITA EN BD
-// ============================================
+// Webhooks: por ahora solo loguean (mapeo Reservo->BD pendiente para v5.2)
 async function guardarCita(sedeKey, datos) {
-  try {
-    const tratamientos = datos.tratamientos || [];
-    const especialidad = tratamientos.length > 0 ? tratamientos[0].nombre : (datos.agenda ? datos.agenda.descripcion : null);
-
-    await pool.query(`
-      INSERT INTO citas (
-        uuid, sede, sucursal_uuid, sucursal_nombre,
-        agenda_uuid, agenda_descripcion,
-        profesional_uuid, profesional_nombre, especialidad,
-        cliente_uuid, cliente_nombre, cliente_apellido, cliente_rut,
-        cliente_telefono, cliente_email,
-        inicio, fin, estado_codigo, estado_descripcion, estado_pago,
-        tratamientos, datos_completos, fecha_creacion, actualizado_en
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-        $16, $17, $18, $19, $20, $21, $22, $23, NOW()
-      )
-      ON CONFLICT (uuid) DO UPDATE SET
-        estado_codigo = EXCLUDED.estado_codigo,
-        estado_descripcion = EXCLUDED.estado_descripcion,
-        estado_pago = EXCLUDED.estado_pago,
-        inicio = EXCLUDED.inicio,
-        fin = EXCLUDED.fin,
-        datos_completos = EXCLUDED.datos_completos,
-        actualizado_en = NOW()
-    `, [
-      datos.uuid,
-      sedeKey,
-      datos.sucursal ? datos.sucursal.uuid : null,
-      datos.sucursal ? datos.sucursal.nombre : null,
-      datos.agenda ? datos.agenda.uuid : null,
-      datos.agenda ? datos.agenda.descripcion : null,
-      datos.profesional ? datos.profesional.uuid : null,
-      datos.profesional ? datos.profesional.nombre : null,
-      especialidad,
-      datos.cliente ? datos.cliente.uuid : null,
-      datos.cliente ? datos.cliente.nombre : null,
-      datos.cliente ? datos.cliente.apellido_paterno : null,
-      datos.cliente ? datos.cliente.identificador : null,
-      datos.cliente ? datos.cliente.telefono_1 : null,
-      datos.cliente ? datos.cliente.mail : null,
-      datos.inicio,
-      datos.fin,
-      datos.estado ? datos.estado.codigo : null,
-      datos.estado ? datos.estado.descripcion : null,
-      datos.estado_pago ? datos.estado_pago.codigo : null,
-      JSON.stringify(tratamientos),
-      JSON.stringify(datos),
-      datos.fecha_creacion
-    ]);
-  } catch (err) {
-    console.error("Error guardando cita:", err.message);
-  }
+  console.log(`[webhook ${sedeKey}] cita:`, datos.uuid || datos.id || "?");
 }
-
-// ============================================
-// GUARDAR VENTA EN BD
-// ============================================
 async function guardarVenta(sedeKey, datos) {
-  try {
-    const items = datos.items || [];
-    const citaUuid = items.length > 0 && items[0].meta_data ? items[0].meta_data.uuid_cita : null;
-
-    await pool.query(`
-      INSERT INTO ventas (
-        uuid, sede, sucursal_uuid, sucursal_nombre, cita_uuid,
-        receptor_uuid, receptor_nombre, receptor_rut,
-        monto, estado_codigo, estado_descripcion,
-        fecha, fecha_ingreso, items, pagos, datos_completos, actualizado_en
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW()
-      )
-      ON CONFLICT (uuid) DO UPDATE SET
-        monto = EXCLUDED.monto,
-        estado_codigo = EXCLUDED.estado_codigo,
-        datos_completos = EXCLUDED.datos_completos,
-        actualizado_en = NOW()
-    `, [
-      datos.uuid,
-      sedeKey,
-      datos.sucursal ? datos.sucursal.uuid : null,
-      datos.sucursal ? datos.sucursal.nombre : null,
-      citaUuid,
-      datos.receptor ? datos.receptor.uuid : null,
-      datos.receptor ? (datos.receptor.nombre + " " + (datos.receptor.apellido_paterno || "")) : null,
-      datos.receptor ? datos.receptor.identificador : null,
-      parseFloat(datos.monto || 0),
-      datos.estado ? datos.estado.codigo : null,
-      datos.estado ? datos.estado.descripcion : null,
-      datos.fecha,
-      datos.fecha_ingreso,
-      JSON.stringify(items),
-      JSON.stringify(datos.pagos || []),
-      JSON.stringify(datos)
-    ]);
-  } catch (err) {
-    console.error("Error guardando venta:", err.message);
-  }
+  console.log(`[webhook ${sedeKey}] venta:`, datos.uuid || datos.id || "?");
 }
 
 // ============================================
-// HELPERS COMUNES PARA METRICAS
+// HELPERS
 // ============================================
-
-/**
- * Parsea filtros de query string: ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD&sede=sede1|sede2|ambas
- * Default: ultimos 90 dias, ambas sedes.
- */
 function parseRango(req) {
   const hoy = new Date();
   const hace90 = new Date(hoy.getTime() - 90 * 86400000);
@@ -261,38 +131,31 @@ function parseRango(req) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(desde) || !/^\d{4}-\d{2}-\d{2}$/.test(hasta)) {
     throw new Error("Formato de fecha invalido. Usar YYYY-MM-DD");
   }
-  return { desde, hasta, sede };
+  return { desde, hasta, sede, sucursal: sucursalFromSede(sede) };
 }
 
-/**
- * Construye fragmento WHERE de fecha+sede compatible con indices.
- * Convierte fechas locales (Chile) a TIMESTAMPTZ para usar idx_citas_inicio.
- */
-const FILTRO_RANGO = `
-  inicio >= ($1::date AT TIME ZONE 'America/Santiago')
-  AND inicio < (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Santiago')
-  AND ($3 = 'ambas' OR sede = $3)
-`;
+const FILTRO = `fecha BETWEEN $1::date AND $2::date AND ($3::text IS NULL OR sucursal = $3)`;
 
 // ============================================
-// METRICA 1: KPIs GENERALES
+// METRICA 1: KPIs
 // ============================================
-async function metricaKpis({ desde, hasta, sede }) {
+async function metricaKpis({ desde, hasta, sede, sucursal }) {
   const sql = `
     SELECT
       COUNT(*)::int AS total_citas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}')::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.CONFIRMADA}')::int AS confirmadas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}')::int AS no_show,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.SUSPENDIDA}')::int AS suspendidas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.CANCELADA}')::int AS canceladas,
-      COUNT(DISTINCT cliente_uuid)::int AS pacientes_unicos,
-      COUNT(DISTINCT profesional_uuid)::int AS profesionales_activos,
-      COUNT(DISTINCT especialidad)::int AS especialidades_activas
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.CONFIRMADA)})::int AS confirmadas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.SUSPENDIDA)})::int AS suspendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.CANCELADA)})::int AS canceladas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.LISTA_ESPERA)})::int AS lista_espera,
+      COUNT(DISTINCT id_paciente)::int AS pacientes_unicos,
+      COUNT(DISTINCT profesional)::int AS profesionales_activos,
+      COUNT(DISTINCT tratamiento) FILTER (WHERE tratamiento IS NOT NULL)::int AS especialidades_activas
     FROM citas
-    WHERE ${FILTRO_RANGO}
+    WHERE ${FILTRO}
   `;
-  const { rows } = await pool.query(sql, [desde, hasta, sede]);
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   const r = rows[0];
   const total = r.total_citas || 0;
   const pctNoShow = total > 0 ? +(100 * r.no_show / total).toFixed(2) : 0;
@@ -300,15 +163,16 @@ async function metricaKpis({ desde, hasta, sede }) {
   const pctAtencion = total > 0 ? +(100 * r.atendidas / total).toFixed(2) : 0;
   const ingresosEstimados = r.atendidas * TICKET_PROMEDIO;
 
-  // Ingresos reales desde ventas
-  const sqlVentas = `
-    SELECT COALESCE(SUM(monto), 0)::float AS ingresos_reales,
-           COUNT(*)::int AS num_ventas
-    FROM ventas
-    WHERE fecha BETWEEN $1::date AND $2::date
-      AND ($3 = 'ambas' OR sede = $3)
-  `;
-  const ventas = await pool.query(sqlVentas, [desde, hasta, sede]);
+  let ingresosReales = 0, numVentas = 0;
+  try {
+    const v = await pool.query(
+      `SELECT COALESCE(SUM(monto),0)::float AS m, COUNT(*)::int AS n
+       FROM ventas WHERE fecha BETWEEN $1::date AND $2::date AND ($3::text IS NULL OR sucursal = $3)`,
+      [desde, hasta, sucursal]
+    );
+    ingresosReales = v.rows[0].m;
+    numVentas = v.rows[0].n;
+  } catch (e) {}
 
   return {
     rango: { desde, hasta, sede },
@@ -318,6 +182,7 @@ async function metricaKpis({ desde, hasta, sede }) {
     no_show: r.no_show,
     suspendidas: r.suspendidas,
     canceladas: r.canceladas,
+    lista_espera: r.lista_espera,
     pacientes_unicos: r.pacientes_unicos,
     profesionales_activos: r.profesionales_activos,
     especialidades_activas: r.especialidades_activas,
@@ -326,152 +191,142 @@ async function metricaKpis({ desde, hasta, sede }) {
     pct_atencion: pctAtencion,
     ticket_promedio: TICKET_PROMEDIO,
     ingresos_estimados: ingresosEstimados,
-    ingresos_reales: ventas.rows[0].ingresos_reales,
-    num_ventas: ventas.rows[0].num_ventas
+    ingresos_reales: ingresosReales,
+    num_ventas: numVentas
   };
 }
 
 // ============================================
 // METRICA 2: NO-SHOW POR PROFESIONAL
 // ============================================
-async function metricaNoShowProfesional({ desde, hasta, sede }) {
+async function metricaNoShowProfesional({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
-      profesional_uuid,
-      profesional_nombre,
+      profesional,
       COUNT(*)::int AS total,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}')::int AS no_show,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}')::int AS atendidas,
-      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}') / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.SUSPENDIDA)})::int AS suspendidas,
+      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)}) / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show
     FROM citas
-    WHERE ${FILTRO_RANGO}
-      AND profesional_uuid IS NOT NULL
-    GROUP BY profesional_uuid, profesional_nombre
+    WHERE ${FILTRO} AND profesional IS NOT NULL
+    GROUP BY profesional
     HAVING COUNT(*) >= 10
     ORDER BY pct_no_show DESC NULLS LAST, total DESC
     LIMIT 30
   `;
-  const { rows } = await pool.query(sql, [desde, hasta, sede]);
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   return rows;
 }
 
 // ============================================
 // METRICA 3: PACIENTES CON MAS NO-SHOW
 // ============================================
-async function metricaPacientesNoShow({ desde, hasta, sede }) {
+async function metricaPacientesNoShow({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
-      cliente_uuid,
-      TRIM(CONCAT(MAX(cliente_nombre), ' ', COALESCE(MAX(cliente_apellido), ''))) AS paciente,
-      MAX(cliente_telefono) AS telefono,
-      MAX(cliente_email) AS email,
-      MAX(cliente_rut) AS rut,
+      id_paciente,
+      MAX(paciente) AS paciente,
+      MAX(telefonos) AS telefonos,
+      MAX(mail) AS mail,
+      MAX(rut) AS rut,
       COUNT(*)::int AS total_citas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}')::int AS no_shows,
-      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}') / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_shows,
+      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)}) / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show
     FROM citas
-    WHERE ${FILTRO_RANGO}
-      AND cliente_uuid IS NOT NULL
-    GROUP BY cliente_uuid
-    HAVING COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}') >= 2
+    WHERE ${FILTRO} AND id_paciente IS NOT NULL
+    GROUP BY id_paciente
+    HAVING COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)}) >= 2
     ORDER BY no_shows DESC, pct_no_show DESC
     LIMIT 100
   `;
-  const { rows } = await pool.query(sql, [desde, hasta, sede]);
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   return rows;
 }
 
 // ============================================
 // METRICA 4: PACIENTES CON MAS SUSPENSIONES
 // ============================================
-async function metricaPacientesSuspension({ desde, hasta, sede }) {
+async function metricaPacientesSuspension({ desde, hasta, sucursal }) {
+  const susp = ESTADOS.SUSPENDIDA.concat(ESTADOS.CANCELADA);
   const sql = `
     SELECT
-      cliente_uuid,
-      TRIM(CONCAT(MAX(cliente_nombre), ' ', COALESCE(MAX(cliente_apellido), ''))) AS paciente,
-      MAX(cliente_telefono) AS telefono,
-      MAX(cliente_email) AS email,
+      id_paciente,
+      MAX(paciente) AS paciente,
+      MAX(telefonos) AS telefonos,
+      MAX(mail) AS mail,
       COUNT(*)::int AS total_citas,
-      COUNT(*) FILTER (WHERE estado_codigo IN ('${ESTADO.SUSPENDIDA}', '${ESTADO.CANCELADA}'))::int AS suspensiones,
-      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_codigo IN ('${ESTADO.SUSPENDIDA}', '${ESTADO.CANCELADA}')) / NULLIF(COUNT(*), 0), 2)::float AS pct_suspension
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(susp)})::int AS suspensiones,
+      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(susp)}) / NULLIF(COUNT(*), 0), 2)::float AS pct_suspension
     FROM citas
-    WHERE ${FILTRO_RANGO}
-      AND cliente_uuid IS NOT NULL
-    GROUP BY cliente_uuid
-    HAVING COUNT(*) FILTER (WHERE estado_codigo IN ('${ESTADO.SUSPENDIDA}', '${ESTADO.CANCELADA}')) >= 2
+    WHERE ${FILTRO} AND id_paciente IS NOT NULL
+    GROUP BY id_paciente
+    HAVING COUNT(*) FILTER (WHERE estado_cita IN ${inList(susp)}) >= 2
     ORDER BY suspensiones DESC, pct_suspension DESC
     LIMIT 100
   `;
-  const { rows } = await pool.query(sql, [desde, hasta, sede]);
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   return rows;
 }
 
 // ============================================
-// METRICA 5: TOP PROFESIONALES (volumen + ingresos)
+// METRICA 5: TOP PROFESIONALES
 // ============================================
-async function metricaTopProfesionales({ desde, hasta, sede }) {
+async function metricaTopProfesionales({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
-      profesional_uuid,
-      profesional_nombre,
+      profesional,
       COUNT(*)::int AS total_citas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}')::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}')::int AS no_show,
-      COUNT(DISTINCT cliente_uuid)::int AS pacientes_unicos,
-      COUNT(DISTINCT especialidad)::int AS especialidades,
-      (COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}') * ${TICKET_PROMEDIO})::bigint AS ingresos_estimados
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+      COUNT(DISTINCT id_paciente)::int AS pacientes_unicos,
+      COUNT(DISTINCT tratamiento) FILTER (WHERE tratamiento IS NOT NULL)::int AS tratamientos_distintos,
+      (COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)}) * ${TICKET_PROMEDIO})::bigint AS ingresos_estimados
     FROM citas
-    WHERE ${FILTRO_RANGO}
-      AND profesional_uuid IS NOT NULL
-    GROUP BY profesional_uuid, profesional_nombre
+    WHERE ${FILTRO} AND profesional IS NOT NULL
+    GROUP BY profesional
     ORDER BY atendidas DESC, total_citas DESC
     LIMIT 30
   `;
-  const { rows } = await pool.query(sql, [desde, hasta, sede]);
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   return rows;
 }
 
 // ============================================
 // METRICA 6: EVOLUCION POR ESPECIALIDAD
 // ============================================
-async function metricaEspecialidades({ desde, hasta, sede }) {
-  // Calcular el rango anterior con la misma duracion
+async function metricaEspecialidades({ desde, hasta, sucursal }) {
   const dias = Math.max(1, Math.round((new Date(hasta) - new Date(desde)) / 86400000) + 1);
-  const desdeAnterior = new Date(new Date(desde).getTime() - dias * 86400000).toISOString().split("T")[0];
-  const hastaAnterior = new Date(new Date(desde).getTime() - 86400000).toISOString().split("T")[0];
+  const desdeAnt = new Date(new Date(desde).getTime() - dias * 86400000).toISOString().split("T")[0];
+  const hastaAnt = new Date(new Date(desde).getTime() - 86400000).toISOString().split("T")[0];
 
-  const sqlActual = `
+  const actualSql = `
     SELECT
-      especialidad,
+      COALESCE(NULLIF(tratamiento, ''), NULLIF(agenda, ''), 'sin_dato') AS especialidad,
       COUNT(*)::int AS citas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}')::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}')::int AS no_show,
-      COUNT(DISTINCT cliente_uuid)::int AS pacientes
-    FROM citas
-    WHERE ${FILTRO_RANGO}
-      AND especialidad IS NOT NULL
-    GROUP BY especialidad
-    ORDER BY citas DESC
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+      COUNT(DISTINCT id_paciente)::int AS pacientes
+    FROM citas WHERE ${FILTRO}
+    GROUP BY especialidad ORDER BY citas DESC
   `;
-  const { rows: actual } = await pool.query(sqlActual, [desde, hasta, sede]);
+  const { rows: actual } = await pool.query(actualSql, [desde, hasta, sucursal]);
 
-  const sqlAnterior = `
+  const antSql = `
     SELECT
-      especialidad,
+      COALESCE(NULLIF(tratamiento, ''), NULLIF(agenda, ''), 'sin_dato') AS especialidad,
       COUNT(*)::int AS citas
-    FROM citas
-    WHERE ${FILTRO_RANGO}
-      AND especialidad IS NOT NULL
+    FROM citas WHERE ${FILTRO}
     GROUP BY especialidad
   `;
-  const { rows: anterior } = await pool.query(sqlAnterior, [desdeAnterior, hastaAnterior, sede]);
-  const mapAnterior = Object.fromEntries(anterior.map(r => [r.especialidad, r.citas]));
+  const { rows: anterior } = await pool.query(antSql, [desdeAnt, hastaAnt, sucursal]);
+  const mapAnt = Object.fromEntries(anterior.map(r => [r.especialidad, r.citas]));
 
   return {
     rango_actual: { desde, hasta },
-    rango_anterior: { desde: desdeAnterior, hasta: hastaAnterior },
+    rango_anterior: { desde: desdeAnt, hasta: hastaAnt },
     especialidades: actual.map(r => {
-      const ant = mapAnterior[r.especialidad] || 0;
+      const ant = mapAnt[r.especialidad] || 0;
       const variacion = ant > 0 ? +(100 * (r.citas - ant) / ant).toFixed(1) : (r.citas > 0 ? null : 0);
       return {
         especialidad: r.especialidad,
@@ -489,169 +344,133 @@ async function metricaEspecialidades({ desde, hasta, sede }) {
 }
 
 // ============================================
-// METRICA 7: OCUPACION POR HORA DEL DIA
+// METRICA 7: OCUPACION POR HORA
 // ============================================
-async function metricaOcupacionHora({ desde, hasta, sede }) {
+async function metricaOcupacionHora({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
-      EXTRACT(HOUR FROM inicio AT TIME ZONE 'America/Santiago')::int AS hora,
+      EXTRACT(HOUR FROM hora_inicio)::int AS hora,
       COUNT(*)::int AS total,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}')::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}')::int AS no_show,
-      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}') / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)}) / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show
     FROM citas
-    WHERE ${FILTRO_RANGO}
-    GROUP BY hora
-    ORDER BY hora
+    WHERE ${FILTRO} AND hora_inicio IS NOT NULL
+    GROUP BY hora ORDER BY hora
   `;
-  const { rows } = await pool.query(sql, [desde, hasta, sede]);
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   return rows;
 }
 
 // ============================================
-// METRICA 8: OCUPACION POR DIA DE LA SEMANA
+// METRICA 8: OCUPACION POR DIA SEMANA
 // ============================================
-async function metricaOcupacionDiaSemana({ desde, hasta, sede }) {
+async function metricaOcupacionDiaSemana({ desde, hasta, sucursal }) {
   const nombres = ["Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado"];
   const sql = `
     SELECT
-      EXTRACT(DOW FROM inicio AT TIME ZONE 'America/Santiago')::int AS dow,
+      EXTRACT(DOW FROM fecha)::int AS dow,
       COUNT(*)::int AS total,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}')::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}')::int AS no_show,
-      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}') / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show
-    FROM citas
-    WHERE ${FILTRO_RANGO}
-    GROUP BY dow
-    ORDER BY dow
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)}) / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show
+    FROM citas WHERE ${FILTRO}
+    GROUP BY dow ORDER BY dow
   `;
-  const { rows } = await pool.query(sql, [desde, hasta, sede]);
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   return rows.map(r => ({ ...r, dia: nombres[r.dow] }));
 }
 
 // ============================================
 // METRICA 9: PACIENTES EN RIESGO
-// (al menos 1 cita atendida, ultima cita > N dias atras, sin citas futuras)
 // ============================================
 async function metricaPacientesEnRiesgo(req) {
   const diasUmbral = parseInt(req.query.dias) || 90;
   const sede = req.query.sede || "ambas";
-  if (!["ambas", "sede1", "sede2"].includes(sede)) {
-    throw new Error("Parametro sede invalido");
-  }
+  if (!["ambas", "sede1", "sede2"].includes(sede)) throw new Error("Parametro sede invalido");
+  const sucursal = sucursalFromSede(sede);
 
+  const noVuelven = ESTADOS.CANCELADA.concat(ESTADOS.SUSPENDIDA, ESTADOS.NO_SHOW);
   const sql = `
     WITH datos_paciente AS (
-      SELECT DISTINCT ON (cliente_uuid)
-        cliente_uuid,
-        cliente_nombre,
-        cliente_apellido,
-        cliente_telefono,
-        cliente_email,
-        cliente_rut,
-        sede AS sede_principal
+      SELECT DISTINCT ON (id_paciente)
+        id_paciente, paciente, telefonos, mail, rut, sucursal AS sucursal_principal
       FROM citas
-      WHERE cliente_uuid IS NOT NULL
-        AND ($1 = 'ambas' OR sede = $1)
-      ORDER BY cliente_uuid, inicio DESC
+      WHERE id_paciente IS NOT NULL AND ($1::text IS NULL OR sucursal = $1)
+      ORDER BY id_paciente, fecha DESC
     ),
     historia AS (
       SELECT
-        cliente_uuid,
-        MAX(inicio) AS ultima_cita,
-        COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}')::int AS atendidas_total,
+        id_paciente,
+        MAX(fecha) AS ultima_cita,
+        COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas_total,
         COUNT(*)::int AS total_citas
       FROM citas
-      WHERE cliente_uuid IS NOT NULL
-        AND ($1 = 'ambas' OR sede = $1)
-      GROUP BY cliente_uuid
+      WHERE id_paciente IS NOT NULL AND ($1::text IS NULL OR sucursal = $1)
+      GROUP BY id_paciente
     ),
     con_futuro AS (
-      SELECT DISTINCT cliente_uuid
-      FROM citas
-      WHERE inicio > NOW()
-        AND estado_codigo IN ('${ESTADO.CONFIRMADA}', '${ESTADO.ATENDIDA}')
-        AND cliente_uuid IS NOT NULL
+      SELECT DISTINCT id_paciente FROM citas
+      WHERE fecha > CURRENT_DATE
+        AND estado_cita NOT IN ${inList(noVuelven)}
+        AND id_paciente IS NOT NULL
     )
     SELECT
-      h.cliente_uuid,
-      TRIM(CONCAT(dp.cliente_nombre, ' ', COALESCE(dp.cliente_apellido, ''))) AS paciente,
-      dp.cliente_telefono AS telefono,
-      dp.cliente_email AS email,
-      dp.cliente_rut AS rut,
-      dp.sede_principal,
-      h.ultima_cita,
-      h.atendidas_total,
-      h.total_citas,
-      EXTRACT(DAY FROM NOW() - h.ultima_cita)::int AS dias_sin_volver
+      h.id_paciente, dp.paciente, dp.telefonos, dp.mail, dp.rut, dp.sucursal_principal,
+      h.ultima_cita::text AS ultima_cita,
+      h.atendidas_total, h.total_citas,
+      (CURRENT_DATE - h.ultima_cita)::int AS dias_sin_volver
     FROM historia h
-    JOIN datos_paciente dp USING (cliente_uuid)
+    JOIN datos_paciente dp USING (id_paciente)
     WHERE h.atendidas_total >= 1
-      AND h.ultima_cita < NOW() - ($2 || ' days')::interval
-      AND h.cliente_uuid NOT IN (SELECT cliente_uuid FROM con_futuro)
+      AND h.ultima_cita < CURRENT_DATE - ($2::int * INTERVAL '1 day')
+      AND h.id_paciente NOT IN (SELECT id_paciente FROM con_futuro)
     ORDER BY h.ultima_cita ASC
     LIMIT 300
   `;
-  const { rows } = await pool.query(sql, [sede, diasUmbral.toString()]);
+  const { rows } = await pool.query(sql, [sucursal, diasUmbral]);
   return { dias_umbral: diasUmbral, sede, total: rows.length, pacientes: rows };
 }
 
 // ============================================
-// METRICA 10: COMPARATIVA POR SEDE
+// METRICA 10: POR SEDE
 // ============================================
 async function metricaPorSede({ desde, hasta }) {
   const sql = `
     SELECT
-      sede,
+      sucursal,
       COUNT(*)::int AS total_citas,
-      COUNT(DISTINCT cliente_uuid)::int AS pacientes_unicos,
-      COUNT(DISTINCT profesional_uuid)::int AS profesionales,
-      COUNT(DISTINCT especialidad)::int AS especialidades,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}')::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}')::int AS no_show,
-      COUNT(*) FILTER (WHERE estado_codigo IN ('${ESTADO.SUSPENDIDA}','${ESTADO.CANCELADA}'))::int AS suspensiones,
-      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}') / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show,
-      (COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}') * ${TICKET_PROMEDIO})::bigint AS ingresos_estimados
+      COUNT(DISTINCT id_paciente)::int AS pacientes_unicos,
+      COUNT(DISTINCT profesional)::int AS profesionales,
+      COUNT(DISTINCT tratamiento) FILTER (WHERE tratamiento IS NOT NULL)::int AS especialidades,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.SUSPENDIDA.concat(ESTADOS.CANCELADA))})::int AS suspensiones,
+      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)}) / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show,
+      (COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)}) * ${TICKET_PROMEDIO})::bigint AS ingresos_estimados
     FROM citas
-    WHERE inicio >= ($1::date AT TIME ZONE 'America/Santiago')
-      AND inicio < (($2::date + INTERVAL '1 day') AT TIME ZONE 'America/Santiago')
-    GROUP BY sede
-    ORDER BY total_citas DESC
+    WHERE fecha BETWEEN $1::date AND $2::date AND sucursal IS NOT NULL
+    GROUP BY sucursal ORDER BY total_citas DESC
   `;
   const { rows } = await pool.query(sql, [desde, hasta]);
-  return rows.map(r => ({
-    ...r,
-    nombre: SEDES[r.sede] ? SEDES[r.sede].nombre : r.sede,
-    box: SEDES[r.sede] ? SEDES[r.sede].box : null
-  }));
+  return rows.map(r => {
+    let sedeKey = null;
+    if (r.sucursal === SEDES.sede1.sucursal) sedeKey = "sede1";
+    else if (r.sucursal === SEDES.sede2.sucursal) sedeKey = "sede2";
+    return { sede: sedeKey, box: sedeKey ? SEDES[sedeKey].box : null, ...r };
+  });
 }
 
 // ============================================
-// METRICA 11: DEMOGRAFIA (edad + sexo)
-// Extrae datos del JSONB datos_completos.cliente
+// METRICA 11: DEMOGRAFIA
 // ============================================
-async function metricaDemografia({ sede }) {
+async function metricaDemografia({ sucursal }) {
   const sql = `
-    WITH demo AS (
-      SELECT DISTINCT ON (cliente_uuid)
-        cliente_uuid,
-        NULLIF(datos_completos->'cliente'->>'fecha_nacimiento', '') AS fnac_str,
-        NULLIF(datos_completos->'cliente'->>'sexo', '') AS sexo
+    WITH paciente_demo AS (
+      SELECT DISTINCT ON (id_paciente) id_paciente, sexo, edad
       FROM citas
-      WHERE cliente_uuid IS NOT NULL
-        AND ($1 = 'ambas' OR sede = $1)
-      ORDER BY cliente_uuid, inicio DESC
-    ),
-    demo_calc AS (
-      SELECT
-        cliente_uuid,
-        sexo,
-        CASE
-          WHEN fnac_str ~ '^\\d{4}-\\d{2}-\\d{2}'
-            THEN EXTRACT(YEAR FROM AGE(NOW(), fnac_str::date))::int
-          ELSE NULL
-        END AS edad
-      FROM demo
+      WHERE id_paciente IS NOT NULL AND ($1::text IS NULL OR sucursal = $1)
+      ORDER BY id_paciente, fecha DESC
     )
     SELECT
       CASE
@@ -662,101 +481,81 @@ async function metricaDemografia({ sede }) {
         WHEN edad < 60 THEN '45-59'
         ELSE '60+'
       END AS rango_edad,
-      CASE
-        WHEN sexo IS NULL THEN 'sin_dato'
-        WHEN UPPER(sexo) IN ('M', 'MASCULINO', 'HOMBRE') THEN 'M'
-        WHEN UPPER(sexo) IN ('F', 'FEMENINO', 'MUJER') THEN 'F'
-        ELSE 'otro'
-      END AS sexo_norm,
+      COALESCE(NULLIF(sexo, ''), 'sin_dato') AS sexo,
       COUNT(*)::int AS cantidad
-    FROM demo_calc
-    GROUP BY rango_edad, sexo_norm
-    ORDER BY rango_edad, sexo_norm
+    FROM paciente_demo
+    GROUP BY rango_edad, sexo
+    ORDER BY rango_edad, sexo
   `;
-  const { rows } = await pool.query(sql, [sede]);
-  // Resumen plano
+  const { rows } = await pool.query(sql, [sucursal]);
   const total = rows.reduce((s, r) => s + r.cantidad, 0);
   return { total_pacientes: total, distribucion: rows };
 }
 
 // ============================================
-// METRICA 12: PREVISION (Fonasa, Isapre, Particular...)
+// METRICA 12: PREVISION
 // ============================================
-async function metricaPrevision({ desde, hasta, sede }) {
+async function metricaPrevision({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
-      COALESCE(
-        NULLIF(datos_completos->'cliente'->>'prevision', ''),
-        NULLIF(datos_completos->'cliente'->'prevision'->>'descripcion', ''),
-        NULLIF(datos_completos->'cliente'->'prevision'->>'nombre', ''),
-        'sin_dato'
-      ) AS prevision,
+      COALESCE(NULLIF(prevision, ''), 'sin_dato') AS prevision,
       COUNT(*)::int AS total_citas,
-      COUNT(DISTINCT cliente_uuid)::int AS pacientes,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}')::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}')::int AS no_show
-    FROM citas
-    WHERE ${FILTRO_RANGO}
-    GROUP BY prevision
-    ORDER BY total_citas DESC
-    LIMIT 30
+      COUNT(DISTINCT id_paciente)::int AS pacientes,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show
+    FROM citas WHERE ${FILTRO}
+    GROUP BY prevision ORDER BY total_citas DESC LIMIT 30
   `;
-  const { rows } = await pool.query(sql, [desde, hasta, sede]);
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   return rows;
 }
 
 // ============================================
-// METRICA 13: ORIGEN DE RESERVAS (online vs manual)
+// METRICA 13: ORIGEN RESERVAS
 // ============================================
-async function metricaOrigenReservas({ desde, hasta, sede }) {
+async function metricaOrigenReservas({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
-      COALESCE(
-        NULLIF(datos_completos->'origen'->>'descripcion', ''),
-        NULLIF(datos_completos->'origen'->>'codigo', ''),
-        NULLIF(datos_completos->>'origen', ''),
-        NULLIF(datos_completos->>'canal', ''),
-        'sin_dato'
-      ) AS origen,
+      CASE
+        WHEN origen LIKE 'Agenda Online%' THEN 'Online'
+        WHEN origen = 'Agenda' THEN 'Manual'
+        WHEN origen IS NULL OR origen = '' THEN 'sin_dato'
+        ELSE origen
+      END AS origen_tipo,
       COUNT(*)::int AS total,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}')::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}')::int AS no_show,
-      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}') / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show
-    FROM citas
-    WHERE ${FILTRO_RANGO}
-    GROUP BY origen
-    ORDER BY total DESC
-    LIMIT 20
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)}) / NULLIF(COUNT(*), 0), 2)::float AS pct_no_show
+    FROM citas WHERE ${FILTRO}
+    GROUP BY origen_tipo ORDER BY total DESC
   `;
-  const { rows } = await pool.query(sql, [desde, hasta, sede]);
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   return rows;
 }
 
 // ============================================
-// METRICA 14: SERIE TEMPORAL (citas e ingresos por dia)
+// METRICA 14: SERIE TEMPORAL
 // ============================================
-async function metricaSerieTemporal({ desde, hasta, sede }) {
+async function metricaSerieTemporal({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
-      DATE(inicio AT TIME ZONE 'America/Santiago') AS dia,
+      fecha::text AS dia,
       COUNT(*)::int AS total,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}')::int AS atendidas,
-      COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.NO_SHOW}')::int AS no_show,
-      COUNT(DISTINCT cliente_uuid)::int AS pacientes,
-      (COUNT(*) FILTER (WHERE estado_codigo = '${ESTADO.ATENDIDA}') * ${TICKET_PROMEDIO})::bigint AS ingresos_estimados
-    FROM citas
-    WHERE ${FILTRO_RANGO}
-    GROUP BY dia
-    ORDER BY dia
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+      COUNT(DISTINCT id_paciente)::int AS pacientes,
+      (COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)}) * ${TICKET_PROMEDIO})::bigint AS ingresos_estimados
+    FROM citas WHERE ${FILTRO}
+    GROUP BY fecha ORDER BY fecha
   `;
-  const { rows } = await pool.query(sql, [desde, hasta, sede]);
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
   return rows;
 }
 
 // ============================================
-// ENDPOINTS DE METRICAS (wrappers)
+// WRAPPERS
 // ============================================
-function endpointWrapper(fn, useReq) {
+function wrap(fn, useReq) {
   return async (req, res) => {
     try {
       const data = useReq ? await fn(req) : await fn(parseRango(req));
@@ -768,29 +567,27 @@ function endpointWrapper(fn, useReq) {
   };
 }
 
-app.get("/api/metricas/kpis", endpointWrapper(metricaKpis));
-app.get("/api/metricas/no-show-profesional", endpointWrapper(metricaNoShowProfesional));
-app.get("/api/metricas/pacientes-no-show", endpointWrapper(metricaPacientesNoShow));
-app.get("/api/metricas/pacientes-suspension", endpointWrapper(metricaPacientesSuspension));
-app.get("/api/metricas/top-profesionales", endpointWrapper(metricaTopProfesionales));
-app.get("/api/metricas/especialidades", endpointWrapper(metricaEspecialidades));
-app.get("/api/metricas/ocupacion-hora", endpointWrapper(metricaOcupacionHora));
-app.get("/api/metricas/ocupacion-dia-semana", endpointWrapper(metricaOcupacionDiaSemana));
-app.get("/api/metricas/pacientes-en-riesgo", endpointWrapper(metricaPacientesEnRiesgo, true));
-app.get("/api/metricas/por-sede", endpointWrapper(metricaPorSede));
-app.get("/api/metricas/demografia", endpointWrapper(async (filtros) => metricaDemografia(filtros)));
-app.get("/api/metricas/prevision", endpointWrapper(metricaPrevision));
-app.get("/api/metricas/origen-reservas", endpointWrapper(metricaOrigenReservas));
-app.get("/api/metricas/serie-temporal", endpointWrapper(metricaSerieTemporal));
+app.get("/api/metricas/kpis", wrap(metricaKpis));
+app.get("/api/metricas/no-show-profesional", wrap(metricaNoShowProfesional));
+app.get("/api/metricas/pacientes-no-show", wrap(metricaPacientesNoShow));
+app.get("/api/metricas/pacientes-suspension", wrap(metricaPacientesSuspension));
+app.get("/api/metricas/top-profesionales", wrap(metricaTopProfesionales));
+app.get("/api/metricas/especialidades", wrap(metricaEspecialidades));
+app.get("/api/metricas/ocupacion-hora", wrap(metricaOcupacionHora));
+app.get("/api/metricas/ocupacion-dia-semana", wrap(metricaOcupacionDiaSemana));
+app.get("/api/metricas/pacientes-en-riesgo", wrap(metricaPacientesEnRiesgo, true));
+app.get("/api/metricas/por-sede", wrap(metricaPorSede));
+app.get("/api/metricas/demografia", wrap(metricaDemografia));
+app.get("/api/metricas/prevision", wrap(metricaPrevision));
+app.get("/api/metricas/origen-reservas", wrap(metricaOrigenReservas));
+app.get("/api/metricas/serie-temporal", wrap(metricaSerieTemporal));
 
 // ============================================
-// ENDPOINT MAESTRO: TODAS LAS METRICAS EN PARALELO
-// Usa Promise.allSettled para que un fallo no tire el resto
+// ENDPOINT MAESTRO
 // ============================================
 app.get("/api/metricas/all", async (req, res) => {
   try {
     const filtros = parseRango(req);
-
     const tareas = [
       ["kpis", metricaKpis(filtros)],
       ["no_show_profesional", metricaNoShowProfesional(filtros)],
@@ -807,21 +604,14 @@ app.get("/api/metricas/all", async (req, res) => {
       ["origen_reservas", metricaOrigenReservas(filtros)],
       ["serie_temporal", metricaSerieTemporal(filtros)]
     ];
-
     const resultados = await Promise.allSettled(tareas.map(t => t[1]));
-
     const metricas = {};
     const errores = {};
     resultados.forEach((r, i) => {
       const nombre = tareas[i][0];
-      if (r.status === "fulfilled") {
-        metricas[nombre] = r.value;
-      } else {
-        metricas[nombre] = null;
-        errores[nombre] = r.reason ? r.reason.message : "error desconocido";
-      }
+      if (r.status === "fulfilled") metricas[nombre] = r.value;
+      else { metricas[nombre] = null; errores[nombre] = r.reason ? r.reason.message : "error"; }
     });
-
     res.json({
       ok: true,
       generado_en: new Date().toISOString(),
@@ -836,154 +626,104 @@ app.get("/api/metricas/all", async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT STATUS
+// STATUS
 // ============================================
 app.get("/api/status", async (req, res) => {
   let bdConectada = false;
+  let totalCitas = 0;
   try {
-    await pool.query("SELECT 1");
+    const r = await pool.query("SELECT COUNT(*)::int AS n FROM citas");
     bdConectada = true;
-  } catch (e) {
-    bdConectada = false;
-  }
-
+    totalCitas = r.rows[0].n;
+  } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.0",
+    servidor: "Redvital Backend v5.1",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
+    total_citas_bd: totalCitas,
     sedes: {
-      sede1: {
-        conectada: ultimaActualizacion.sede1 !== null,
-        ultimaActualizacion: ultimaActualizacion.sede1
-      },
-      sede2: {
-        conectada: ultimaActualizacion.sede2 !== null,
-        ultimaActualizacion: ultimaActualizacion.sede2
-      }
+      sede1: { conectada: ultimaActualizacion.sede1 !== null, ultimaActualizacion: ultimaActualizacion.sede1 },
+      sede2: { conectada: ultimaActualizacion.sede2 !== null, ultimaActualizacion: ultimaActualizacion.sede2 }
     }
   });
 });
 
 // ============================================
-// WEBHOOK SEDE 1
+// WEBHOOKS (responden 200 - mapeo pendiente v5.2)
 // ============================================
 app.post("/webhook/sede1", async (req, res) => {
   ultimaActualizacion.sede1 = new Date().toISOString();
   const evento = req.body.evento;
   const datos = req.body.datos;
-
   console.log("Webhook sede1:", evento);
-
-  if (evento === "citas" && datos) {
-    await guardarCita("sede1", datos);
-  } else if (evento === "ventas" && datos) {
-    await guardarVenta("sede1", datos);
-  }
-
+  if (evento === "citas" && datos) await guardarCita("sede1", datos);
+  else if (evento === "ventas" && datos) await guardarVenta("sede1", datos);
   res.json({ ok: true });
 });
 
-// ============================================
-// WEBHOOK SEDE 2
-// ============================================
 app.post("/webhook/sede2", async (req, res) => {
   ultimaActualizacion.sede2 = new Date().toISOString();
   const evento = req.body.evento;
   const datos = req.body.datos;
-
   console.log("Webhook sede2:", evento);
-
-  if (evento === "citas" && datos) {
-    await guardarCita("sede2", datos);
-  } else if (evento === "ventas" && datos) {
-    await guardarVenta("sede2", datos);
-  }
-
+  if (evento === "citas" && datos) await guardarCita("sede2", datos);
+  else if (evento === "ventas" && datos) await guardarVenta("sede2", datos);
   res.json({ ok: true });
 });
 
 // ============================================
-// ENDPOINT DASHBOARD (mantener para compatibilidad)
+// DASHBOARD (adaptado)
 // ============================================
 app.get("/api/dashboard", async (req, res) => {
   try {
     const sede = req.query.sede || "ambas";
+    const sucursal = sucursalFromSede(sede);
     const hoy = new Date().toISOString().split("T")[0];
 
-    let filtroSede = "";
-    const params = [hoy];
-
-    if (sede !== "ambas") {
-      filtroSede = " AND sede = $2";
-      params.push(sede);
-    }
-
-    const citasHoy = await pool.query(
-      `SELECT * FROM citas WHERE DATE(inicio AT TIME ZONE 'America/Santiago') = $1 ${filtroSede}`,
-      params
+    const citas = await pool.query(
+      `SELECT * FROM citas WHERE fecha = $1::date AND ($2::text IS NULL OR sucursal = $2) ORDER BY hora_inicio`,
+      [hoy, sucursal]
     );
 
-    const ventasHoy = await pool.query(
-      `SELECT * FROM ventas WHERE fecha = $1 ${filtroSede}`,
-      params
-    );
+    const totalCitas = citas.rows.length;
+    const atendidas = citas.rows.filter(c => ESTADOS.ATENDIDA.includes(c.estado_cita)).length;
+    const confirmadas = citas.rows.filter(c => ESTADOS.CONFIRMADA.includes(c.estado_cita)).length;
+    const noShow = citas.rows.filter(c => ESTADOS.NO_SHOW.includes(c.estado_cita)).length;
+    const canceladas = citas.rows.filter(c => ESTADOS.CANCELADA.includes(c.estado_cita)).length;
+    const suspendidas = citas.rows.filter(c => ESTADOS.SUSPENDIDA.includes(c.estado_cita)).length;
+    const sede1Citas = citas.rows.filter(c => c.sucursal === SEDES.sede1.sucursal).length;
+    const sede2Citas = citas.rows.filter(c => c.sucursal === SEDES.sede2.sucursal).length;
 
-    const totalIngresos = ventasHoy.rows.reduce((sum, v) => sum + parseFloat(v.monto || 0), 0);
-    const citasConfirmadas = citasHoy.rows.filter(c => c.estado_codigo === ESTADO.CONFIRMADA || c.estado_codigo === ESTADO.ATENDIDA).length;
-    const citasCanceladas = citasHoy.rows.filter(c => c.estado_codigo === ESTADO.CANCELADA).length;
-    const citasNoShow = citasHoy.rows.filter(c => c.estado_codigo === ESTADO.NO_SHOW).length;
-
-    const sede1Citas = citasHoy.rows.filter(c => c.sede === "sede1").length;
-    const sede2Citas = citasHoy.rows.filter(c => c.sede === "sede2").length;
-    const sede1Ingresos = ventasHoy.rows.filter(v => v.sede === "sede1").reduce((s, v) => s + parseFloat(v.monto || 0), 0);
-    const sede2Ingresos = ventasHoy.rows.filter(v => v.sede === "sede2").reduce((s, v) => s + parseFloat(v.monto || 0), 0);
-
-    const pctCumplimiento = Math.round((totalIngresos / META_DIARIA) * 100);
+    const ingresosEstimados = atendidas * TICKET_PROMEDIO;
+    const pctCumplimiento = Math.round((ingresosEstimados / META_DIARIA) * 100);
     let semaforo = "rojo";
     if (pctCumplimiento >= 100) semaforo = "verde";
     else if (pctCumplimiento >= 60) semaforo = "amarillo";
 
-    const totalBox = 12;
-    const ocupacionPct = Math.round((citasHoy.rows.length / (totalBox * 8)) * 100);
+    const ocupacionPct = Math.round((totalCitas / (12 * 8)) * 100);
 
     res.json({
       ok: true,
       actualizadoEn: new Date().toISOString(),
-      sede: sede,
+      sede,
       metricas: {
-        totalIngresos: totalIngresos,
-        citasTotal: citasHoy.rows.length,
-        citasConfirmadas: citasConfirmadas,
-        citasCanceladas: citasCanceladas,
-        citasNoShow: citasNoShow,
-        ocupacionPct: ocupacionPct,
+        ingresosEstimados,
+        citasTotal: totalCitas,
+        atendidas, confirmadas, canceladas, suspendidas, noShow,
+        ocupacionPct,
         meta: {
           costoFijoDiario: COSTO_FIJO_DIARIO,
           metaDiaria: META_DIARIA,
-          pctCumplimiento: pctCumplimiento,
-          semaforo: semaforo,
-          faltaParaMeta: Math.max(0, META_DIARIA - totalIngresos)
+          pctCumplimiento, semaforo,
+          faltaParaMeta: Math.max(0, META_DIARIA - ingresosEstimados)
         }
       },
       sedes: {
-        sede1: {
-          nombre: SEDES.sede1.nombre,
-          box: SEDES.sede1.box,
-          citas: sede1Citas,
-          ingresos: sede1Ingresos,
-          ultimaActualizacion: ultimaActualizacion.sede1
-        },
-        sede2: {
-          nombre: SEDES.sede2.nombre,
-          box: SEDES.sede2.box,
-          citas: sede2Citas,
-          ingresos: sede2Ingresos,
-          ultimaActualizacion: ultimaActualizacion.sede2
-        }
+        sede1: { nombre: SEDES.sede1.nombre, box: SEDES.sede1.box, citas: sede1Citas, ultimaActualizacion: ultimaActualizacion.sede1 },
+        sede2: { nombre: SEDES.sede2.nombre, box: SEDES.sede2.box, citas: sede2Citas, ultimaActualizacion: ultimaActualizacion.sede2 }
       },
-      citas: citasHoy.rows.slice(0, 50),
-      ventas: ventasHoy.rows.slice(0, 50)
+      citas: citas.rows.slice(0, 50)
     });
   } catch (err) {
     console.error("Error en dashboard:", err.message);
@@ -992,124 +732,28 @@ app.get("/api/dashboard", async (req, res) => {
 });
 
 // ============================================
-// ENDPOINT STATS
+// STATS
 // ============================================
 app.get("/api/stats", async (req, res) => {
   try {
-    const totalCitas = await pool.query("SELECT COUNT(*) FROM citas");
-    const totalVentas = await pool.query("SELECT COUNT(*), SUM(monto) FROM ventas");
-
+    const total = await pool.query("SELECT COUNT(*)::int AS n FROM citas");
+    const porEstado = await pool.query(`SELECT estado_cita, COUNT(*)::int AS n FROM citas GROUP BY estado_cita ORDER BY n DESC`);
+    const porSucursal = await pool.query(`SELECT sucursal, COUNT(*)::int AS n FROM citas GROUP BY sucursal ORDER BY n DESC`);
+    const rango = await pool.query(`SELECT MIN(fecha)::text AS desde, MAX(fecha)::text AS hasta FROM citas`);
+    let totalVentas = 0, montoTotal = 0;
+    try {
+      const v = await pool.query("SELECT COUNT(*)::int AS n, COALESCE(SUM(monto),0)::float AS m FROM ventas");
+      totalVentas = v.rows[0].n;
+      montoTotal = v.rows[0].m;
+    } catch (e) {}
     res.json({
       ok: true,
-      total_citas: parseInt(totalCitas.rows[0].count),
-      total_ventas: parseInt(totalVentas.rows[0].count),
-      monto_total: parseFloat(totalVentas.rows[0].sum || 0)
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ============================================
-// COMPARATIVA POR ESPECIALIDAD (legacy, mantener)
-// ============================================
-app.get("/api/comparativa/especialidad", async (req, res) => {
-  try {
-    const periodo = req.query.periodo || "semana";
-    let dias = 7;
-    if (periodo === "mes") dias = 30;
-    if (periodo === "trimestre") dias = 90;
-
-    const resultado = await pool.query(`
-      SELECT
-        especialidad,
-        COUNT(*) as citas_actual,
-        (SELECT COUNT(*) FROM citas c2
-         WHERE c2.especialidad = c1.especialidad
-         AND c2.inicio >= NOW() - INTERVAL '${dias * 2} days'
-         AND c2.inicio < NOW() - INTERVAL '${dias} days') as citas_anterior
-      FROM citas c1
-      WHERE inicio >= NOW() - INTERVAL '${dias} days'
-      AND especialidad IS NOT NULL
-      GROUP BY especialidad
-      ORDER BY citas_actual DESC
-    `);
-
-    const conVariacion = resultado.rows.map(r => {
-      const actual = parseInt(r.citas_actual);
-      const anterior = parseInt(r.citas_anterior);
-      const variacion = anterior > 0 ? Math.round(((actual - anterior) / anterior) * 100) : 0;
-      return {
-        especialidad: r.especialidad,
-        citas_actual: actual,
-        citas_anterior: anterior,
-        variacion_pct: variacion,
-        alerta: variacion <= -20
-      };
-    });
-
-    res.json({
-      ok: true,
-      periodo: periodo,
-      dias: dias,
-      especialidades: conVariacion
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ============================================
-// CARGAR HISTORICO DESDE RESERVO
-// ============================================
-app.get("/api/cargar-historico", async (req, res) => {
-  try {
-    const desde = req.query.desde || "2026-02-01";
-    let totalCitas = 0;
-    let totalVentas = 0;
-
-    for (const sedeKey of Object.keys(SEDES)) {
-      const token = SEDES[sedeKey].token;
-      if (!token) continue;
-
-      try {
-        const respCitas = await axios.get("https://reservo.cl/APIcustom/v2/cita/listar", {
-          headers: { Authorization: "Bearer " + token },
-          params: { fecha_inicio: desde, limit: 1000 }
-        });
-
-        if (respCitas.data && respCitas.data.data) {
-          for (const cita of respCitas.data.data) {
-            await guardarCita(sedeKey, cita);
-            totalCitas++;
-          }
-        }
-      } catch (e) {
-        console.error("Error citas " + sedeKey + ":", e.message);
-      }
-
-      try {
-        const respVentas = await axios.get("https://reservo.cl/APIcustom/v2/venta/listar", {
-          headers: { Authorization: "Bearer " + token },
-          params: { fecha_inicio: desde, limit: 1000 }
-        });
-
-        if (respVentas.data && respVentas.data.data) {
-          for (const venta of respVentas.data.data) {
-            await guardarVenta(sedeKey, venta);
-            totalVentas++;
-          }
-        }
-      } catch (e) {
-        console.error("Error ventas " + sedeKey + ":", e.message);
-      }
-    }
-
-    res.json({
-      ok: true,
-      desde: desde,
-      citas_cargadas: totalCitas,
-      ventas_cargadas: totalVentas
+      total_citas: total.rows[0].n,
+      rango_fechas: rango.rows[0],
+      por_estado: porEstado.rows,
+      por_sucursal: porSucursal.rows,
+      total_ventas: totalVentas,
+      monto_total: montoTotal
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -1122,10 +766,11 @@ app.get("/api/cargar-historico", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.0",
+    servidor: "Redvital Backend v5.1",
+    schema: "historico (id_cita PK, 31 columnas reales)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
-      operativo: ["/api/dashboard", "/api/comparativa/especialidad", "/api/cargar-historico"],
+      operativo: ["/api/dashboard"],
       webhooks: ["/webhook/sede1", "/webhook/sede2"],
       metricas: [
         "/api/metricas/all",
@@ -1145,7 +790,7 @@ app.get("/", (req, res) => {
         "/api/metricas/serie-temporal"
       ]
     },
-    parametros_metricas: {
+    parametros: {
       desde: "YYYY-MM-DD (default: hace 90 dias)",
       hasta: "YYYY-MM-DD (default: hoy)",
       sede: "ambas | sede1 | sede2 (default: ambas)",
@@ -1155,10 +800,10 @@ app.get("/", (req, res) => {
 });
 
 // ============================================
-// INICIAR SERVIDOR
+// START
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.0 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.1 corriendo en puerto " + PORT);
   await inicializarBD();
 });
