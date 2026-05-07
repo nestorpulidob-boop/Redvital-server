@@ -1088,9 +1088,9 @@ const INFRAESTRUCTURA = {
     horario_lunes_viernes: { inicio: 8, fin: 20 }, // 12 horas
     horario_sabado: { inicio: 8, fin: 13 }         // 5 horas
   },
-  // Maturana - 6 boxes, lun-vie hasta 19h (NO trabaja sabados)
+  // Maturana - 2 boxes, lun-vie hasta 19h (NO trabaja sabados)
   'RedVital Sede Maturana': {
-    boxes: 6,
+    boxes: 2,
     cupos_por_hora: 4,
     horario_lunes_viernes: { inicio: 8, fin: 19 }, // 11 horas
     horario_sabado: null                            // cerrado
@@ -1659,7 +1659,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.10",
+    servidor: "Redvital Backend v5.11",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -1926,7 +1926,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.10",
+    servidor: "Redvital Backend v5.11",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -1977,6 +1977,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.10 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.11 corriendo en puerto " + PORT);
   await inicializarBD();
 });
