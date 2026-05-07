@@ -592,11 +592,213 @@ async function metricaPacientesSuspension({ desde, hasta, sucursal }) {
 // METRICA 5: TOP PROFESIONALES (con ingresos REALES de ventas)
 // ============================================
 // ============================================
-// METRICA 21: PROFESIONAL × ESPECIALIDAD (datos financieros reales)
+// METRICA 22: ALERTAS INTELIGENTES (motor de recomendaciones)
+// Detecta automaticamente: caidas, oportunidades, NS alto, ticket alto ocioso
+// ============================================
+async function metricaAlertas({ desde, hasta, sucursal }) {
+  const alertas = [];
+
+  // Calcular periodo anterior del mismo tamaño
+  const d1 = new Date(desde);
+  const d2 = new Date(hasta);
+  const diasPeriodo = Math.round((d2 - d1) / 86400000) + 1;
+  const desdeAnterior = new Date(d1);
+  desdeAnterior.setDate(desdeAnterior.getDate() - diasPeriodo);
+  const hastaAnterior = new Date(d1);
+  hastaAnterior.setDate(hastaAnterior.getDate() - 1);
+  const desdeA = desdeAnterior.toISOString().split('T')[0];
+  const hastaA = hastaAnterior.toISOString().split('T')[0];
+
+  // ====== ALERTA 1 y 2: CAIDA / CRECIMIENTO POR ESPECIALIDAD ======
+  const sqlEspec = `
+    WITH actual AS (
+      SELECT tratamiento, COUNT(*)::int AS n
+      FROM citas
+      WHERE fecha BETWEEN $1::date AND $2::date
+        AND ($3::text IS NULL OR sucursal = $3)
+        AND tratamiento IS NOT NULL
+      GROUP BY tratamiento
+    ),
+    anterior AS (
+      SELECT tratamiento, COUNT(*)::int AS n
+      FROM citas
+      WHERE fecha BETWEEN $4::date AND $5::date
+        AND ($3::text IS NULL OR sucursal = $3)
+        AND tratamiento IS NOT NULL
+      GROUP BY tratamiento
+    )
+    SELECT
+      a.tratamiento,
+      a.n AS n_actual,
+      COALESCE(p.n, 0) AS n_anterior,
+      CASE WHEN p.n > 0 THEN ROUND(100.0 * (a.n - p.n) / p.n, 1)::float ELSE NULL END AS variacion_pct
+    FROM actual a
+    LEFT JOIN anterior p ON p.tratamiento = a.tratamiento
+    WHERE a.n >= 5  -- minimo 5 citas para no alertar sobre ruido
+    ORDER BY n_actual DESC
+  `;
+  const { rows: especialidades } = await pool.query(sqlEspec, [desde, hasta, sucursal, desdeA, hastaA]);
+
+  for (const esp of especialidades) {
+    const v = esp.variacion_pct;
+    if (v === null || v === undefined) continue;
+    const ticketEstim = TICKET_PROMEDIO;
+    const perdidaPotencial = Math.abs(esp.n_anterior - esp.n_actual) * ticketEstim;
+
+    if (v <= -20 && esp.n_anterior >= 10) {
+      alertas.push({
+        tipo: 'caida_fuerte',
+        prioridad: 1,
+        icono: '🚨',
+        titulo: `${esp.tratamiento} cayó ${Math.abs(v)}%`,
+        diagnostico: `Pasó de ${esp.n_anterior} a ${esp.n_actual} citas. Perdiste ~$${(perdidaPotencial/1000000).toFixed(1)}M en ingresos potenciales.`,
+        sugerencia: `URGENTE: pautar Meta Ads ($60-80k) específico para esta especialidad. Audiencia 35-65 años, 15km de tus sedes. Mensaje: "${esp.tratamiento} disponible esta semana en Redvital".`,
+        retorno_estimado: perdidaPotencial,
+        accion: 'pautar_meta_ads'
+      });
+    } else if (v <= -10 && v > -20 && esp.n_anterior >= 10) {
+      alertas.push({
+        tipo: 'caida_moderada',
+        prioridad: 2,
+        icono: '⚠️',
+        titulo: `${esp.tratamiento} bajó ${Math.abs(v)}%`,
+        diagnostico: `${esp.n_actual} citas vs ${esp.n_anterior} anterior. Tendencia preocupante.`,
+        sugerencia: `Reforzar contenido orgánico en Instagram/Facebook esta semana. Si no mejora en 15 días, pautar $40-60k en Meta Ads.`,
+        retorno_estimado: perdidaPotencial,
+        accion: 'reforzar_organico'
+      });
+    } else if (v >= 25 && esp.n_actual >= 10) {
+      alertas.push({
+        tipo: 'oportunidad',
+        prioridad: 3,
+        icono: '💎',
+        titulo: `${esp.tratamiento} creció +${v}% — momento para escalar`,
+        diagnostico: `Pasó de ${esp.n_anterior} a ${esp.n_actual} citas. Hay demanda real activa.`,
+        sugerencia: `Aprovechá la inercia: pautar $40k en Meta Ads para CAPITALIZAR la tendencia. Es más barato pautar cuando ya hay demanda.`,
+        retorno_estimado: esp.n_actual * ticketEstim * 0.3,
+        accion: 'pautar_meta_ads'
+      });
+    }
+  }
+
+  // ====== ALERTA 3: NS ALTO POR CANAL ======
+  const sqlCanal = `
+    SELECT
+      CASE
+        WHEN origen LIKE 'Agenda Online%' THEN 'Online (web/app)'
+        WHEN origen = 'Backoffice Reservo' THEN 'Telefono/Mostrador'
+        WHEN origen IS NULL OR origen = '' THEN 'Sin registro'
+        ELSE origen
+      END AS canal,
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS ns,
+      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)}) / NULLIF(COUNT(*), 0), 1)::float AS pct_ns
+    FROM citas
+    WHERE fecha BETWEEN $1::date AND $2::date
+      AND ($3::text IS NULL OR sucursal = $3)
+    GROUP BY canal
+    HAVING COUNT(*) >= 30
+  `;
+  const { rows: canales } = await pool.query(sqlCanal, [desde, hasta, sucursal]);
+  for (const c of canales) {
+    if (c.pct_ns >= 12) {
+      const perdida = c.ns * TICKET_PROMEDIO;
+      alertas.push({
+        tipo: 'ns_alto_canal',
+        prioridad: 1,
+        icono: '📉',
+        titulo: `Canal "${c.canal}" tiene ${c.pct_ns}% de no-show`,
+        diagnostico: `${c.ns} de ${c.total} pacientes faltaron. Perdiste $${(perdida/1000000).toFixed(1)}M en ese canal.`,
+        sugerencia: c.canal.includes('Online')
+          ? `Activar confirmaciones WhatsApp 24h antes para citas online (mayor compromiso). Esperás bajar NS de ${c.pct_ns}% a ~7%.`
+          : `Llamada de confirmación 24h antes a citas de este canal.`,
+        retorno_estimado: perdida * 0.5,
+        accion: 'activar_confirmaciones'
+      });
+    }
+  }
+
+  // ====== ALERTA 4: CAPACIDAD OCIOSA SIGNIFICATIVA ======
+  const cap = await metricaCapacidad({ desde, hasta, sucursal });
+  if (cap.total.pct_uso_real < 30 && cap.total.cupos_capacidad > 100) {
+    alertas.push({
+      tipo: 'capacidad_ociosa',
+      prioridad: 2,
+      icono: '🪑',
+      titulo: `Solo ${cap.total.pct_uso_real}% de uso real de infraestructura`,
+      diagnostico: `${cap.total.cupos_vacios} cupos vacíos en el período. Lucro cesante: $${(cap.total.lucro_cesante_vacios/1000000).toFixed(1)}M.`,
+      sugerencia: `Llenar agenda es más rentable que captar nuevos. Reactivá a pacientes que vinieron 2-6 meses atrás con campaña WhatsApp recordatoria.`,
+      retorno_estimado: cap.total.lucro_cesante_vacios * 0.2,
+      accion: 'reactivar_pacientes'
+    });
+  }
+
+  // ====== ALERTA 5: TICKET ALTO CON BAJA PROGRAMACION ======
+  // Especialidades con valor alto pero pocas citas
+  const sqlValor = `
+    SELECT productos_venta, profesional_atencion,
+           COUNT(*)::int AS num,
+           AVG(valor_pagado)::bigint AS ticket_promedio,
+           SUM(valor_pagado)::bigint AS ingresos
+    FROM ventas
+    WHERE fecha BETWEEN $1::date AND $2::date
+      AND ($3::text IS NULL OR sucursal = $3)
+      AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+      AND valor_pagado >= 80000
+    GROUP BY productos_venta, profesional_atencion
+    HAVING COUNT(*) >= 3
+    ORDER BY ticket_promedio DESC
+    LIMIT 10
+  `;
+  const { rows: ticketAlto } = await pool.query(sqlValor, [desde, hasta, sucursal]);
+  if (ticketAlto.length > 0) {
+    const top = ticketAlto[0];
+    alertas.push({
+      tipo: 'ticket_alto_ocioso',
+      prioridad: 3,
+      icono: '💎',
+      titulo: `${top.productos_venta} factura $${(Number(top.ticket_promedio)/1000).toFixed(0)}k por procedimiento`,
+      diagnostico: `Solo ${top.num} procedimientos en el período. Ticket alto = mucho margen por paciente nuevo.`,
+      sugerencia: `Pautá Meta Ads específico para "${top.productos_venta}" con $50-80k. Cada paciente nuevo te deja ~$${Math.round(Number(top.ticket_promedio) * 0.47 / 1000)}k de margen.`,
+      retorno_estimado: Number(top.ticket_promedio) * 0.47 * 5,
+      accion: 'pautar_meta_ads'
+    });
+  }
+
+  // ====== ALERTA 6: SEDE SUBUTILIZADA ======
+  for (const sede of cap.por_sede) {
+    if (sede.pct_uso_real < 20 && sede.cupos_capacidad > 100) {
+      alertas.push({
+        tipo: 'sede_subutilizada',
+        prioridad: 2,
+        icono: '🏥',
+        titulo: `${sede.sucursal} solo al ${sede.pct_uso_real}% de uso`,
+        diagnostico: `${sede.cupos_vacios} cupos vacíos = $${(sede.lucro_cesante_vacios/1000000).toFixed(1)}M sin facturar.`,
+        sugerencia: `Política de derivación: cuando otra sede esté llena, secretaria debe ofrecer ${sede.sucursal} primero.`,
+        retorno_estimado: sede.lucro_cesante_vacios * 0.15,
+        accion: 'derivar_pacientes'
+      });
+    }
+  }
+
+  // Ordenar por prioridad (1 = mas urgente)
+  alertas.sort((a, b) => a.prioridad - b.prioridad);
+
+  return {
+    total: alertas.length,
+    criticas: alertas.filter(a => a.prioridad === 1).length,
+    importantes: alertas.filter(a => a.prioridad === 2).length,
+    oportunidades: alertas.filter(a => a.prioridad === 3).length,
+    alertas
+  };
+}
+
+
 // Para cada profesional muestra: consultas, ingresos totales, ticket promedio
 // y desglose por especialidad/categoria
 // ============================================
 async function metricaProfesionalDetalle({ desde, hasta, sucursal }) {
+  // METRICA 21: PROFESIONAL × ESPECIALIDAD (datos financieros reales)
   const sql = `
     WITH consultas_realizadas AS (
       SELECT
@@ -1541,6 +1743,7 @@ app.get("/api/metricas/categorias", wrap(metricaCategorias));
 app.get("/api/metricas/marketing", wrap(metricaMarketing));
 app.get("/api/metricas/capacidad", wrap(metricaCapacidad));
 app.get("/api/metricas/profesional-detalle", wrap(metricaProfesionalDetalle));
+app.get("/api/metricas/alertas", wrap(metricaAlertas));
 app.get("/api/metricas/origen-ampliado", wrap(metricaOrigenAmpliado));
 app.get("/api/metricas/pacientes-nuevos", wrap(metricaPacientesNuevos));
 
@@ -1613,7 +1816,8 @@ app.get("/api/metricas/all", async (req, res) => {
       ["categorias", metricaCategorias(filtros)],
       ["marketing", metricaMarketing(filtros)],
       ["capacidad", metricaCapacidad(filtros)],
-      ["profesional_detalle", metricaProfesionalDetalle(filtros)]
+      ["profesional_detalle", metricaProfesionalDetalle(filtros)],
+      ["alertas", metricaAlertas(filtros)]
     ];
     const resultados = await Promise.allSettled(tareas.map(t => t[1]));
     const metricas = {};
@@ -1739,7 +1943,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.13",
+    servidor: "Redvital Backend v5.14",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2006,7 +2210,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.13",
+    servidor: "Redvital Backend v5.14",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -2057,6 +2261,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.13 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.14 corriendo en puerto " + PORT);
   await inicializarBD();
 });
