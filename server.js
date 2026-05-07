@@ -1076,6 +1076,158 @@ async function listarCampaniasConCalculo({ desde, hasta }) {
 }
 
 
+// ============================================
+// CONFIGURACION DE INFRAESTRUCTURA (boxes + horarios)
+// Usado para calcular % uso de capacidad
+// ============================================
+const INFRAESTRUCTURA = {
+  // Centro Medico Redvital (Victoria) - 6 boxes, lun-sab hasta 13h
+  'Centro Medico Redvital': {
+    boxes: 6,
+    cupos_por_hora: 4, // cupo estandar 15 min
+    horario_lunes_viernes: { inicio: 8, fin: 20 }, // 12 horas
+    horario_sabado: { inicio: 8, fin: 13 }         // 5 horas
+  },
+  // Maturana - 6 boxes, lun-vie hasta 19h (NO trabaja sabados)
+  'RedVital Sede Maturana': {
+    boxes: 6,
+    cupos_por_hora: 4,
+    horario_lunes_viernes: { inicio: 8, fin: 19 }, // 11 horas
+    horario_sabado: null                            // cerrado
+  }
+};
+
+// Calcula capacidad teorica de una sede en un rango de fechas
+function calcularCapacidadSede(sucursal, desde, hasta) {
+  const cfg = INFRAESTRUCTURA[sucursal];
+  if (!cfg) return { sucursal, boxes: 0, cupos_capacidad: 0, dias_lv: 0, dias_sab: 0 };
+
+  const d1 = new Date(desde);
+  const d2 = new Date(hasta);
+  let diasLV = 0, diasSab = 0;
+  for (let d = new Date(d1); d <= d2; d.setDate(d.getDate() + 1)) {
+    const dow = d.getDay();
+    if (dow >= 1 && dow <= 5) diasLV++;
+    else if (dow === 6) diasSab++;
+  }
+
+  const horasLV = cfg.horario_lunes_viernes ? (cfg.horario_lunes_viernes.fin - cfg.horario_lunes_viernes.inicio) : 0;
+  const horasSab = cfg.horario_sabado ? (cfg.horario_sabado.fin - cfg.horario_sabado.inicio) : 0;
+  const cuposLV = cfg.boxes * horasLV * cfg.cupos_por_hora * diasLV;
+  const cuposSab = cfg.boxes * horasSab * cfg.cupos_por_hora * diasSab;
+
+  return {
+    sucursal,
+    boxes: cfg.boxes,
+    dias_lv: diasLV,
+    dias_sab: diasSab,
+    cupos_capacidad: cuposLV + cuposSab,
+    cupos_dia_lv: cfg.boxes * horasLV * cfg.cupos_por_hora,
+    cupos_dia_sab: cfg.boxes * horasSab * cfg.cupos_por_hora
+  };
+}
+
+// ============================================
+// METRICA 20: USO DE INFRAESTRUCTURA (capacidad vs uso real)
+// ============================================
+async function metricaCapacidad({ desde, hasta, sucursal }) {
+  const sedes = sucursal ? [sucursal] : Object.keys(INFRAESTRUCTURA);
+  const capacidades = sedes.map(s => calcularCapacidadSede(s, desde, hasta));
+
+  // Cupos programados (excluyendo Eliminado, que liberan cupo)
+  const sql = `
+    SELECT
+      sucursal,
+      COUNT(*)::int AS cupos_programados,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS cupos_atendidos,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS cupos_no_show,
+      COUNT(*) FILTER (WHERE estado_cita = 'Suspendió')::int AS cupos_suspendidos,
+      COUNT(*) FILTER (WHERE estado_cita IN ('Confirmado','No Confirmado','Lista de Espera'))::int AS cupos_pendientes
+    FROM citas
+    WHERE fecha BETWEEN $1::date AND $2::date
+      AND estado_cita != 'Eliminado'
+      AND ($3::text IS NULL OR sucursal = $3)
+    GROUP BY sucursal
+  `;
+  const { rows: usoRows } = await pool.query(sql, [desde, hasta, sucursal]);
+  const usoMap = {};
+  usoRows.forEach(r => { usoMap[r.sucursal] = r; });
+
+  const porSede = capacidades.map(cap => {
+    const uso = usoMap[cap.sucursal] || { cupos_programados: 0, cupos_atendidos: 0, cupos_no_show: 0, cupos_suspendidos: 0, cupos_pendientes: 0 };
+    const programados = Number(uso.cupos_programados) || 0;
+    const atendidos = Number(uso.cupos_atendidos) || 0;
+    const noShow = Number(uso.cupos_no_show) || 0;
+    const suspendidos = Number(uso.cupos_suspendidos) || 0;
+    const pendientes = Number(uso.cupos_pendientes) || 0;
+
+    const pctUsoInfra = cap.cupos_capacidad > 0 ? +(100 * programados / cap.cupos_capacidad).toFixed(1) : 0;
+    const pctUsoReal = cap.cupos_capacidad > 0 ? +(100 * atendidos / cap.cupos_capacidad).toFixed(1) : 0;
+    const pctNoShow = programados > 0 ? +(100 * noShow / programados).toFixed(1) : 0;
+    const cuposVacios = Math.max(0, cap.cupos_capacidad - programados);
+    const lucroCesanteVacios = cuposVacios * TICKET_PROMEDIO;
+    const lucroCesanteNS = noShow * TICKET_PROMEDIO;
+
+    return {
+      sucursal: cap.sucursal,
+      boxes: cap.boxes,
+      dias_lv: cap.dias_lv,
+      dias_sab: cap.dias_sab,
+      cupos_capacidad: cap.cupos_capacidad,
+      cupos_programados: programados,
+      cupos_atendidos: atendidos,
+      cupos_no_show: noShow,
+      cupos_suspendidos: suspendidos,
+      cupos_pendientes: pendientes,
+      cupos_vacios: cuposVacios,
+      pct_uso_infra: pctUsoInfra,
+      pct_uso_real: pctUsoReal,
+      pct_no_show: pctNoShow,
+      lucro_cesante_vacios: lucroCesanteVacios,
+      lucro_cesante_ns: lucroCesanteNS
+    };
+  });
+
+  const total = {
+    cupos_capacidad: porSede.reduce((s,r) => s + r.cupos_capacidad, 0),
+    cupos_programados: porSede.reduce((s,r) => s + r.cupos_programados, 0),
+    cupos_atendidos: porSede.reduce((s,r) => s + r.cupos_atendidos, 0),
+    cupos_no_show: porSede.reduce((s,r) => s + r.cupos_no_show, 0),
+    cupos_vacios: porSede.reduce((s,r) => s + r.cupos_vacios, 0),
+    lucro_cesante_vacios: porSede.reduce((s,r) => s + r.lucro_cesante_vacios, 0),
+    lucro_cesante_ns: porSede.reduce((s,r) => s + r.lucro_cesante_ns, 0)
+  };
+  total.pct_uso_infra = total.cupos_capacidad > 0 ? +(100 * total.cupos_programados / total.cupos_capacidad).toFixed(1) : 0;
+  total.pct_uso_real = total.cupos_capacidad > 0 ? +(100 * total.cupos_atendidos / total.cupos_capacidad).toFixed(1) : 0;
+
+  // Top profesionales por uso de cupos
+  const sqlProf = `
+    SELECT sucursal, profesional,
+           COUNT(*)::int AS cupos_programados,
+           COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS cupos_atendidos
+    FROM citas
+    WHERE fecha BETWEEN $1::date AND $2::date
+      AND estado_cita != 'Eliminado'
+      AND ($3::text IS NULL OR sucursal = $3)
+    GROUP BY sucursal, profesional
+    ORDER BY cupos_atendidos DESC
+    LIMIT 30
+  `;
+  const { rows: profesionales } = await pool.query(sqlProf, [desde, hasta, sucursal]);
+
+  return {
+    total,
+    por_sede: porSede,
+    profesionales: profesionales.map(p => ({
+      sucursal: p.sucursal,
+      profesional: p.profesional,
+      cupos_programados: Number(p.cupos_programados),
+      cupos_atendidos: Number(p.cupos_atendidos)
+    }))
+  };
+}
+
+
 async function metricaSerieTemporal({ desde, hasta, sucursal }) {
   const sql = `
     WITH citas_dia AS (
@@ -1309,6 +1461,7 @@ app.get("/api/metricas/serie-temporal", wrap(metricaSerieTemporal));
 app.get("/api/metricas/comparativa-mensual", wrap(metricaComparativaMensual));
 app.get("/api/metricas/categorias", wrap(metricaCategorias));
 app.get("/api/metricas/marketing", wrap(metricaMarketing));
+app.get("/api/metricas/capacidad", wrap(metricaCapacidad));
 app.get("/api/metricas/origen-ampliado", wrap(metricaOrigenAmpliado));
 app.get("/api/metricas/pacientes-nuevos", wrap(metricaPacientesNuevos));
 
@@ -1379,7 +1532,8 @@ app.get("/api/metricas/all", async (req, res) => {
       ["serie_temporal", metricaSerieTemporal(filtros)],
       ["comparativa_mensual", metricaComparativaMensual(filtros)],
       ["categorias", metricaCategorias(filtros)],
-      ["marketing", metricaMarketing(filtros)]
+      ["marketing", metricaMarketing(filtros)],
+      ["capacidad", metricaCapacidad(filtros)]
     ];
     const resultados = await Promise.allSettled(tareas.map(t => t[1]));
     const metricas = {};
@@ -1505,7 +1659,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.9",
+    servidor: "Redvital Backend v5.10",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -1772,7 +1926,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.9",
+    servidor: "Redvital Backend v5.10",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -1823,6 +1977,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.9 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.10 corriendo en puerto " + PORT);
   await inicializarBD();
 });
