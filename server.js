@@ -591,6 +591,84 @@ async function metricaPacientesSuspension({ desde, hasta, sucursal }) {
 // ============================================
 // METRICA 5: TOP PROFESIONALES (con ingresos REALES de ventas)
 // ============================================
+// ============================================
+// METRICA 21: PROFESIONAL × ESPECIALIDAD (datos financieros reales)
+// Para cada profesional muestra: consultas, ingresos totales, ticket promedio
+// y desglose por especialidad/categoria
+// ============================================
+async function metricaProfesionalDetalle({ desde, hasta, sucursal }) {
+  const sql = `
+    WITH consultas_realizadas AS (
+      SELECT
+        v.profesional_atencion AS profesional,
+        v.productos_venta,
+        v.valor_pagado,
+        v.sucursal,
+        v.fecha,
+        v.estado_venta
+      FROM ventas v
+      WHERE v.fecha BETWEEN $1::date AND $2::date
+        AND v.estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+        AND ($3::text IS NULL OR v.sucursal = $3)
+        AND v.profesional_atencion IS NOT NULL
+    )
+    SELECT
+      profesional,
+      productos_venta,
+      sucursal,
+      COUNT(*)::int AS num_consultas,
+      SUM(valor_pagado)::bigint AS ingresos_total,
+      ROUND(AVG(valor_pagado))::bigint AS ticket_promedio,
+      MIN(valor_pagado)::bigint AS ticket_min,
+      MAX(valor_pagado)::bigint AS ticket_max,
+      COUNT(DISTINCT valor_pagado)::int AS variaciones_precio
+    FROM consultas_realizadas
+    GROUP BY profesional, productos_venta, sucursal
+    ORDER BY ingresos_total DESC
+  `;
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
+
+  // Agrupar por profesional (consolidar especialidades)
+  const profesionales = {};
+  for (const row of rows) {
+    const prof = row.profesional;
+    if (!profesionales[prof]) {
+      profesionales[prof] = {
+        profesional: prof,
+        sucursal: row.sucursal,
+        num_consultas: 0,
+        ingresos_total: 0,
+        especialidades: []
+      };
+    }
+    profesionales[prof].num_consultas += Number(row.num_consultas);
+    profesionales[prof].ingresos_total += Number(row.ingresos_total);
+    profesionales[prof].especialidades.push({
+      producto: row.productos_venta || 'Sin especificar',
+      num_consultas: Number(row.num_consultas),
+      ingresos: Number(row.ingresos_total),
+      ticket_promedio: Number(row.ticket_promedio),
+      ticket_min: Number(row.ticket_min),
+      ticket_max: Number(row.ticket_max),
+      variaciones_precio: Number(row.variaciones_precio)
+    });
+  }
+
+  // Convertir a array, calcular ticket promedio global y ordenar
+  const lista = Object.values(profesionales).map(p => ({
+    ...p,
+    ticket_promedio: p.num_consultas > 0 ? Math.round(p.ingresos_total / p.num_consultas) : 0,
+    // Margen Redvital al 47%
+    margen_redvital: Math.round(p.ingresos_total * 0.47)
+  })).sort((a, b) => b.ingresos_total - a.ingresos_total);
+
+  return {
+    total_profesionales: lista.length,
+    profesionales: lista
+  };
+}
+
+
 async function metricaTopProfesionales({ desde, hasta, sucursal }) {
   // Une citas con ventas via profesional (best effort, no hay id_cita en ventas)
   const sql = `
@@ -1081,17 +1159,17 @@ async function listarCampaniasConCalculo({ desde, hasta }) {
 // Usado para calcular % uso de capacidad
 // ============================================
 const INFRAESTRUCTURA = {
-  // Centro Medico Redvital (Victoria) - 6 boxes, lun-sab hasta 13h
+  // Centro Medico Redvital (Victoria) - 6 boxes, lun-sab
   'Centro Medico Redvital': {
     boxes: 6,
-    cupos_por_hora: 4, // cupo estandar 15 min
+    cupos_por_hora: 3, // cupo estandar 20 min
     horario_lunes_viernes: { inicio: 8, fin: 20 }, // 12 horas
-    horario_sabado: { inicio: 8, fin: 13 }         // 5 horas
+    horario_sabado: { inicio: 9, fin: 13 }         // 4 horas (9-13)
   },
   // Maturana - 2 boxes, lun-vie hasta 19h (NO trabaja sabados)
   'RedVital Sede Maturana': {
     boxes: 2,
-    cupos_por_hora: 4,
+    cupos_por_hora: 3, // cupo estandar 20 min
     horario_lunes_viernes: { inicio: 8, fin: 19 }, // 11 horas
     horario_sabado: null                            // cerrado
   }
@@ -1462,6 +1540,7 @@ app.get("/api/metricas/comparativa-mensual", wrap(metricaComparativaMensual));
 app.get("/api/metricas/categorias", wrap(metricaCategorias));
 app.get("/api/metricas/marketing", wrap(metricaMarketing));
 app.get("/api/metricas/capacidad", wrap(metricaCapacidad));
+app.get("/api/metricas/profesional-detalle", wrap(metricaProfesionalDetalle));
 app.get("/api/metricas/origen-ampliado", wrap(metricaOrigenAmpliado));
 app.get("/api/metricas/pacientes-nuevos", wrap(metricaPacientesNuevos));
 
@@ -1533,7 +1612,8 @@ app.get("/api/metricas/all", async (req, res) => {
       ["comparativa_mensual", metricaComparativaMensual(filtros)],
       ["categorias", metricaCategorias(filtros)],
       ["marketing", metricaMarketing(filtros)],
-      ["capacidad", metricaCapacidad(filtros)]
+      ["capacidad", metricaCapacidad(filtros)],
+      ["profesional_detalle", metricaProfesionalDetalle(filtros)]
     ];
     const resultados = await Promise.allSettled(tareas.map(t => t[1]));
     const metricas = {};
@@ -1659,7 +1739,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.11",
+    servidor: "Redvital Backend v5.13",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -1926,7 +2006,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.11",
+    servidor: "Redvital Backend v5.13",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -1977,6 +2057,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.11 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.13 corriendo en puerto " + PORT);
   await inicializarBD();
 });
