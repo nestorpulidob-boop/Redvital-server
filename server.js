@@ -180,7 +180,21 @@ async function inicializarBD() {
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_ventas_uuid ON ventas(uuid_venta)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_wh_uuid_evento ON webhooks_raw(uuid_evento)`);
 
-    console.log("Indices, tabla webhooks_raw y columnas uuid verificados correctamente");
+    // v5.9: Tabla de campanias de marketing
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS campanias_marketing (
+        id BIGSERIAL PRIMARY KEY,
+        nombre TEXT NOT NULL,
+        plataforma TEXT NOT NULL,
+        fecha_inicio DATE NOT NULL,
+        fecha_fin DATE NOT NULL,
+        presupuesto BIGINT NOT NULL DEFAULT 0,
+        comentario TEXT,
+        creada_en TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    console.log("Indices, tabla webhooks_raw, columnas uuid y campanias_marketing verificados correctamente");
   } catch (err) {
     console.error("Error inicializando BD:", err.message);
   }
@@ -909,8 +923,159 @@ async function metricaOrigenReservas({ desde, hasta, sucursal }) {
 }
 
 // ============================================
-// METRICA 14: SERIE TEMPORAL (con ingresos reales)
+// METRICA 17: PACIENTES NUEVOS VS RECURRENTES (marketing)
+// Un paciente "nuevo" es aquel cuya primera cita en TODA la BD esta dentro del periodo
 // ============================================
+async function metricaPacientesNuevos({ desde, hasta, sucursal }) {
+  const sql = `
+    WITH primera_cita_por_paciente AS (
+      SELECT id_paciente, MIN(fecha) AS primera_fecha
+      FROM citas
+      WHERE id_paciente IS NOT NULL
+      GROUP BY id_paciente
+    ),
+    citas_periodo AS (
+      SELECT c.id_paciente, c.fecha, c.estado_cita, c.sucursal,
+             p.primera_fecha,
+             (p.primera_fecha BETWEEN $1::date AND $2::date) AS es_paciente_nuevo
+      FROM citas c
+      LEFT JOIN primera_cita_por_paciente p ON c.id_paciente = p.id_paciente
+      WHERE c.fecha BETWEEN $1::date AND $2::date
+        AND ($3::text IS NULL OR c.sucursal = $3)
+        AND c.id_paciente IS NOT NULL
+    )
+    SELECT
+      COUNT(DISTINCT id_paciente) FILTER (WHERE es_paciente_nuevo)::int AS pacientes_nuevos,
+      COUNT(DISTINCT id_paciente) FILTER (WHERE NOT es_paciente_nuevo)::int AS pacientes_recurrentes,
+      COUNT(DISTINCT id_paciente)::int AS pacientes_total,
+      COUNT(*) FILTER (WHERE es_paciente_nuevo)::int AS citas_nuevos,
+      COUNT(*) FILTER (WHERE NOT es_paciente_nuevo)::int AS citas_recurrentes
+    FROM citas_periodo
+  `;
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
+  const r = rows[0] || {};
+  const total = (r.pacientes_total || 0) || 1;
+  return {
+    pacientes_nuevos: r.pacientes_nuevos || 0,
+    pacientes_recurrentes: r.pacientes_recurrentes || 0,
+    pacientes_total: r.pacientes_total || 0,
+    pct_nuevos: +(100 * (r.pacientes_nuevos || 0) / total).toFixed(1),
+    pct_recurrentes: +(100 * (r.pacientes_recurrentes || 0) / total).toFixed(1),
+    citas_nuevos: r.citas_nuevos || 0,
+    citas_recurrentes: r.citas_recurrentes || 0,
+    citas_promedio_nuevos: r.pacientes_nuevos ? +((r.citas_nuevos || 0) / r.pacientes_nuevos).toFixed(2) : 0,
+    citas_promedio_recurrentes: r.pacientes_recurrentes ? +((r.citas_recurrentes || 0) / r.pacientes_recurrentes).toFixed(2) : 0
+  };
+}
+
+// ============================================
+// METRICA 18: ORIGEN AMPLIADO (con NS y conversion por canal)
+// ============================================
+async function metricaOrigenAmpliado({ desde, hasta, sucursal }) {
+  const sql = `
+    SELECT
+      CASE
+        WHEN origen LIKE 'Agenda Online%' THEN 'Online (web/app)'
+        WHEN origen = 'Backoffice Reservo' THEN 'Telefono/Mostrador'
+        WHEN origen = 'Agenda' THEN 'Telefono/Mostrador'
+        WHEN origen IS NULL OR origen = '' THEN 'Sin registro'
+        ELSE origen
+      END AS canal,
+      COUNT(*)::int AS total_citas,
+      COUNT(DISTINCT id_paciente)::int AS pacientes_unicos,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
+      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
+      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)}) / NULLIF(COUNT(*), 0), 1)::float AS pct_no_show,
+      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)}) / NULLIF(COUNT(*), 0), 1)::float AS pct_atendidas
+    FROM citas
+    WHERE fecha BETWEEN $1::date AND $2::date
+      AND ($3::text IS NULL OR sucursal = $3)
+    GROUP BY canal
+    ORDER BY total_citas DESC
+  `;
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
+  return rows;
+}
+
+// ============================================
+// METRICA 19: DASHBOARD MARKETING (combinado)
+// ============================================
+async function metricaMarketing({ desde, hasta, sucursal }) {
+  const [origen, pacientes, campanias] = await Promise.all([
+    metricaOrigenAmpliado({ desde, hasta, sucursal }),
+    metricaPacientesNuevos({ desde, hasta, sucursal }),
+    listarCampaniasConCalculo({ desde, hasta })
+  ]);
+  return { origen, pacientes, campanias };
+}
+
+// ============================================
+// CAMPANIAS DE MARKETING (registro y costo por paciente)
+// Tabla: campanias_marketing (id, nombre, plataforma, fecha_inicio, fecha_fin, presupuesto, comentario)
+// ============================================
+async function listarCampaniasConCalculo({ desde, hasta }) {
+  // Trae campanias que se solapan con el rango pedido y calcula CPP
+  const sql = `
+    SELECT
+      cm.id, cm.nombre, cm.plataforma, cm.fecha_inicio, cm.fecha_fin,
+      cm.presupuesto::bigint AS presupuesto, cm.comentario,
+      (
+        SELECT COUNT(DISTINCT c.id_paciente)::int
+        FROM citas c
+        WHERE c.id_paciente IN (
+          SELECT id_paciente FROM citas
+          WHERE fecha BETWEEN cm.fecha_inicio AND cm.fecha_fin
+            AND id_paciente IS NOT NULL
+          GROUP BY id_paciente
+          HAVING MIN(fecha) BETWEEN cm.fecha_inicio AND cm.fecha_fin
+        )
+      ) AS pacientes_nuevos_periodo,
+      (
+        SELECT COALESCE(SUM(v.valor_pagado), 0)::bigint
+        FROM ventas v
+        WHERE v.fecha BETWEEN cm.fecha_inicio AND cm.fecha_fin
+          AND v.estado_venta IN ('Realizada','Modificada')
+          AND v.id_paciente IN (
+            SELECT id_paciente FROM citas
+            WHERE fecha BETWEEN cm.fecha_inicio AND cm.fecha_fin
+              AND id_paciente IS NOT NULL
+            GROUP BY id_paciente
+            HAVING MIN(fecha) BETWEEN cm.fecha_inicio AND cm.fecha_fin
+          )
+      ) AS ingresos_de_nuevos
+    FROM campanias_marketing cm
+    WHERE cm.fecha_inicio <= $2::date AND cm.fecha_fin >= $1::date
+    ORDER BY cm.fecha_inicio DESC
+  `;
+  try {
+    const { rows } = await pool.query(sql, [desde, hasta]);
+    return rows.map(r => {
+      const cpp = r.pacientes_nuevos_periodo > 0
+        ? Math.round(Number(r.presupuesto) / r.pacientes_nuevos_periodo) : null;
+      const ingresos = Number(r.ingresos_de_nuevos) || 0;
+      const roi = r.presupuesto > 0
+        ? +((ingresos - Number(r.presupuesto)) / Number(r.presupuesto) * 100).toFixed(1) : null;
+      return {
+        id: r.id,
+        nombre: r.nombre,
+        plataforma: r.plataforma,
+        fecha_inicio: r.fecha_inicio,
+        fecha_fin: r.fecha_fin,
+        presupuesto: Number(r.presupuesto),
+        pacientes_nuevos: r.pacientes_nuevos_periodo,
+        costo_por_paciente: cpp,
+        ingresos_de_nuevos: ingresos,
+        roi_pct: roi,
+        comentario: r.comentario
+      };
+    });
+  } catch (e) {
+    // Si la tabla no existe aun
+    return [];
+  }
+}
+
+
 async function metricaSerieTemporal({ desde, hasta, sucursal }) {
   const sql = `
     WITH citas_dia AS (
@@ -1143,6 +1308,53 @@ app.get("/api/metricas/origen-reservas", wrap(metricaOrigenReservas));
 app.get("/api/metricas/serie-temporal", wrap(metricaSerieTemporal));
 app.get("/api/metricas/comparativa-mensual", wrap(metricaComparativaMensual));
 app.get("/api/metricas/categorias", wrap(metricaCategorias));
+app.get("/api/metricas/marketing", wrap(metricaMarketing));
+app.get("/api/metricas/origen-ampliado", wrap(metricaOrigenAmpliado));
+app.get("/api/metricas/pacientes-nuevos", wrap(metricaPacientesNuevos));
+
+// ============================================
+// CRUD: CAMPAÑAS DE MARKETING
+// ============================================
+app.get("/api/campanias", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, nombre, plataforma, fecha_inicio, fecha_fin,
+              presupuesto::bigint AS presupuesto, comentario
+       FROM campanias_marketing
+       ORDER BY fecha_inicio DESC`
+    );
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/campanias", async (req, res) => {
+  try {
+    const { nombre, plataforma, fecha_inicio, fecha_fin, presupuesto, comentario } = req.body || {};
+    if (!nombre || !plataforma || !fecha_inicio || !fecha_fin) {
+      return res.status(400).json({ ok: false, error: "Faltan datos: nombre, plataforma, fecha_inicio, fecha_fin" });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO campanias_marketing (nombre, plataforma, fecha_inicio, fecha_fin, presupuesto, comentario)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, nombre, plataforma, fecha_inicio, fecha_fin, presupuesto::bigint AS presupuesto, comentario`,
+      [nombre, plataforma, fecha_inicio, fecha_fin, presupuesto || 0, comentario || null]
+    );
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete("/api/campanias/:id", async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM campanias_marketing WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 // ============================================
 // ENDPOINT MAESTRO
@@ -1166,7 +1378,8 @@ app.get("/api/metricas/all", async (req, res) => {
       ["origen_reservas", metricaOrigenReservas(filtros)],
       ["serie_temporal", metricaSerieTemporal(filtros)],
       ["comparativa_mensual", metricaComparativaMensual(filtros)],
-      ["categorias", metricaCategorias(filtros)]
+      ["categorias", metricaCategorias(filtros)],
+      ["marketing", metricaMarketing(filtros)]
     ];
     const resultados = await Promise.allSettled(tareas.map(t => t[1]));
     const metricas = {};
@@ -1292,7 +1505,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.8",
+    servidor: "Redvital Backend v5.9",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -1559,7 +1772,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.8",
+    servidor: "Redvital Backend v5.9",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -1610,6 +1823,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.8 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.9 corriendo en puerto " + PORT);
   await inicializarBD();
 });
