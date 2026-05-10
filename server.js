@@ -781,6 +781,78 @@ async function metricaAlertas({ desde, hasta, sucursal }) {
     }
   }
 
+  // ====== ALERTA 7 (NUEVA v5.15): GAP CONTRA TARIFA OFICIAL ======
+  // Detecta profesionales que cobran consistentemente menos que su tarifa Fonasa
+  try {
+    const sqlGap = `
+      WITH ventas_consulta AS (
+        SELECT
+          v.profesional_atencion AS profesional,
+          v.valor_pagado,
+          COUNT(*) OVER (PARTITION BY v.profesional_atencion) AS total_ventas
+        FROM ventas v
+        WHERE v.fecha BETWEEN $1::date AND $2::date
+          AND v.estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+          AND ($3::text IS NULL OR v.sucursal = $3)
+          AND v.profesional_atencion IS NOT NULL
+      ),
+      profesionales_gap AS (
+        SELECT
+          vc.profesional,
+          COUNT(*)::int AS total_ventas,
+          MAX(vc.total_ventas)::int AS n_ventas,
+          (SELECT MIN(monto) FROM tarifas_oficiales t
+           WHERE t.profesional = vc.profesional AND t.categoria = 'Consulta') AS tarifa_minima,
+          COUNT(*) FILTER (
+            WHERE vc.valor_pagado < (
+              SELECT MIN(monto) FROM tarifas_oficiales t
+              WHERE t.profesional = vc.profesional AND t.categoria = 'Consulta'
+            )
+          )::int AS ventas_bajo_tarifa,
+          SUM(
+            (SELECT MIN(monto) FROM tarifas_oficiales t
+             WHERE t.profesional = vc.profesional AND t.categoria = 'Consulta')
+            - vc.valor_pagado
+          ) FILTER (
+            WHERE vc.valor_pagado < (
+              SELECT MIN(monto) FROM tarifas_oficiales t
+              WHERE t.profesional = vc.profesional AND t.categoria = 'Consulta'
+            )
+          )::bigint AS gap_total
+        FROM ventas_consulta vc
+        GROUP BY vc.profesional
+        HAVING (SELECT MIN(monto) FROM tarifas_oficiales t
+                WHERE t.profesional = vc.profesional AND t.categoria = 'Consulta') IS NOT NULL
+          AND COUNT(*) >= 5
+      )
+      SELECT * FROM profesionales_gap
+      WHERE ventas_bajo_tarifa >= 3
+        AND gap_total IS NOT NULL
+        AND gap_total > 5000
+      ORDER BY gap_total DESC
+      LIMIT 5
+    `;
+    const { rows: gaps } = await pool.query(sqlGap, [desde, hasta, sucursal]);
+
+    for (const g of gaps) {
+      const gapTotal = Number(g.gap_total || 0);
+      const pctBajo = g.total_ventas > 0 ? Math.round(100 * g.ventas_bajo_tarifa / g.total_ventas) : 0;
+      alertas.push({
+        tipo: 'gap_tarifa',
+        prioridad: 2,
+        icono: '💸',
+        titulo: `${g.profesional} cobra bajo tarifa oficial`,
+        diagnostico: `${g.ventas_bajo_tarifa} de ${g.total_ventas} consultas (${pctBajo}%) cobradas bajo la tarifa Fonasa de $${Number(g.tarifa_minima).toLocaleString('es-CL')}.`,
+        sugerencia: `GAP acumulado: $${gapTotal.toLocaleString('es-CL')}. Revisar con el profesional si son descuentos autorizados o errores de caja.`,
+        retorno_estimado: gapTotal,
+        accion: 'revisar_tarifas'
+      });
+    }
+  } catch (err) {
+    console.error('Error alerta gap_tarifa:', err.message);
+    // Si tabla tarifas_oficiales no existe, ignorar silenciosamente
+  }
+
   // Ordenar por prioridad (1 = mas urgente)
   alertas.sort((a, b) => a.prioridad - b.prioridad);
 
@@ -798,21 +870,45 @@ async function metricaAlertas({ desde, hasta, sucursal }) {
 // y desglose por especialidad/categoria
 // ============================================
 async function metricaProfesionalDetalle({ desde, hasta, sucursal }) {
-  // METRICA 21: PROFESIONAL × ESPECIALIDAD (datos financieros reales)
+  // METRICA 21 v5.15: PROFESIONAL × ESPECIALIDAD CON TARIFAS OFICIALES
+  // Compara cobrado real vs tarifa oficial (Fonasa/Particular)
+  // Calcula GAP y margen Redvital usando margen_redvital_pct de cada tarifa
   const sql = `
-    WITH consultas_realizadas AS (
+    WITH ventas_validas AS (
       SELECT
         v.profesional_atencion AS profesional,
         v.productos_venta,
         v.valor_pagado,
         v.sucursal,
-        v.fecha,
-        v.estado_venta
+        v.fecha
       FROM ventas v
       WHERE v.fecha BETWEEN $1::date AND $2::date
         AND v.estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
         AND ($3::text IS NULL OR v.sucursal = $3)
         AND v.profesional_atencion IS NOT NULL
+    ),
+    -- Asociar cada venta con su tarifa oficial mas cercana
+    ventas_tarifadas AS (
+      SELECT
+        vv.*,
+        -- Buscar tarifa Fonasa del profesional
+        (SELECT monto FROM tarifas_oficiales t
+         WHERE t.profesional = vv.profesional
+           AND t.modalidad = 'fonasa'
+           AND t.categoria = 'Consulta'
+         LIMIT 1) AS tarifa_fonasa,
+        -- Buscar tarifa Particular del profesional
+        (SELECT monto FROM tarifas_oficiales t
+         WHERE t.profesional = vv.profesional
+           AND t.modalidad = 'particular'
+           AND t.categoria = 'Consulta'
+         LIMIT 1) AS tarifa_particular,
+        -- Margen Redvital pct del profesional (28.5 para consultas, NULL si no es consulta)
+        (SELECT margen_redvital_pct FROM tarifas_oficiales t
+         WHERE t.profesional = vv.profesional
+           AND t.categoria = 'Consulta'
+         LIMIT 1) AS margen_pct
+      FROM ventas_validas vv
     )
     SELECT
       profesional,
@@ -823,14 +919,27 @@ async function metricaProfesionalDetalle({ desde, hasta, sucursal }) {
       ROUND(AVG(valor_pagado))::bigint AS ticket_promedio,
       MIN(valor_pagado)::bigint AS ticket_min,
       MAX(valor_pagado)::bigint AS ticket_max,
-      COUNT(DISTINCT valor_pagado)::int AS variaciones_precio
-    FROM consultas_realizadas
+      COUNT(DISTINCT valor_pagado)::int AS variaciones_precio,
+      MAX(tarifa_fonasa)::bigint AS tarifa_fonasa,
+      MAX(tarifa_particular)::bigint AS tarifa_particular,
+      MAX(margen_pct)::numeric AS margen_pct,
+      -- Contar ventas que matchean Fonasa exacto
+      COUNT(*) FILTER (WHERE valor_pagado = tarifa_fonasa)::int AS num_fonasa,
+      -- Contar ventas que matchean Particular exacto
+      COUNT(*) FILTER (WHERE valor_pagado = tarifa_particular)::int AS num_particular,
+      -- Contar ventas que NO coinciden con ninguna tarifa (gap)
+      COUNT(*) FILTER (
+        WHERE valor_pagado != tarifa_fonasa
+          AND valor_pagado != tarifa_particular
+          AND tarifa_fonasa IS NOT NULL
+      )::int AS num_fuera_tarifa
+    FROM ventas_tarifadas
     GROUP BY profesional, productos_venta, sucursal
     ORDER BY ingresos_total DESC
   `;
   const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
 
-  // Agrupar por profesional (consolidar especialidades)
+  // Agrupar por profesional (consolidar productos)
   const profesionales = {};
   for (const row of rows) {
     const prof = row.profesional;
@@ -840,11 +949,20 @@ async function metricaProfesionalDetalle({ desde, hasta, sucursal }) {
         sucursal: row.sucursal,
         num_consultas: 0,
         ingresos_total: 0,
+        num_fonasa: 0,
+        num_particular: 0,
+        num_fuera_tarifa: 0,
+        tarifa_fonasa: row.tarifa_fonasa ? Number(row.tarifa_fonasa) : null,
+        tarifa_particular: row.tarifa_particular ? Number(row.tarifa_particular) : null,
+        margen_pct: row.margen_pct ? Number(row.margen_pct) : 47,  // default 47 si no hay tarifa
         especialidades: []
       };
     }
     profesionales[prof].num_consultas += Number(row.num_consultas);
     profesionales[prof].ingresos_total += Number(row.ingresos_total);
+    profesionales[prof].num_fonasa += Number(row.num_fonasa || 0);
+    profesionales[prof].num_particular += Number(row.num_particular || 0);
+    profesionales[prof].num_fuera_tarifa += Number(row.num_fuera_tarifa || 0);
     profesionales[prof].especialidades.push({
       producto: row.productos_venta || 'Sin especificar',
       num_consultas: Number(row.num_consultas),
@@ -856,13 +974,38 @@ async function metricaProfesionalDetalle({ desde, hasta, sucursal }) {
     });
   }
 
-  // Convertir a array, calcular ticket promedio global y ordenar
-  const lista = Object.values(profesionales).map(p => ({
-    ...p,
-    ticket_promedio: p.num_consultas > 0 ? Math.round(p.ingresos_total / p.num_consultas) : 0,
-    // Margen Redvital al 47%
-    margen_redvital: Math.round(p.ingresos_total * 0.47)
-  })).sort((a, b) => b.ingresos_total - a.ingresos_total);
+  // Calcular metricas finales por profesional
+  const lista = Object.values(profesionales).map(p => {
+    const ticketPromedio = p.num_consultas > 0 ? Math.round(p.ingresos_total / p.num_consultas) : 0;
+    const margenPct = p.margen_pct || 28.5;
+
+    // Ingreso esperado segun mix de modalidades
+    const ingresoEsperado =
+      p.num_fonasa * (p.tarifa_fonasa || 0) +
+      p.num_particular * (p.tarifa_particular || 0) +
+      // Las "fuera de tarifa" las contamos contra el promedio entre fonasa y particular
+      p.num_fuera_tarifa * ((p.tarifa_fonasa || 0) + (p.tarifa_particular || 0)) / 2;
+
+    const gap = p.ingresos_total - ingresoEsperado;
+
+    return {
+      profesional: p.profesional,
+      sucursal: p.sucursal,
+      num_consultas: p.num_consultas,
+      ingresos_total: p.ingresos_total,
+      ticket_promedio: ticketPromedio,
+      tarifa_fonasa: p.tarifa_fonasa,
+      tarifa_particular: p.tarifa_particular,
+      num_fonasa: p.num_fonasa,
+      num_particular: p.num_particular,
+      num_fuera_tarifa: p.num_fuera_tarifa,
+      ingreso_esperado: Math.round(ingresoEsperado),
+      gap: Math.round(gap),
+      margen_pct: margenPct,
+      margen_redvital: Math.round(p.ingresos_total * margenPct / 100),
+      especialidades: p.especialidades
+    };
+  }).sort((a, b) => b.ingresos_total - a.ingresos_total);
 
   return {
     total_profesionales: lista.length,
@@ -1943,7 +2086,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.14",
+    servidor: "Redvital Backend v5.15",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2210,7 +2353,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.14",
+    servidor: "Redvital Backend v5.15",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -2261,6 +2404,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.14 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.15 corriendo en puerto " + PORT);
   await inicializarBD();
 });
