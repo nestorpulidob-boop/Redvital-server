@@ -1968,6 +1968,118 @@ async function metricaCategoriasComparativa({ desde, hasta, sucursal }) {
 }
 
 
+// ============================================
+// METRICA 21.b (NUEVA v5.16): PROFESIONAL CON COMPARACION MES ANTERIOR
+// Devuelve por profesional: actual + mes anterior (mismo punto) + mes anterior completo
+// ============================================
+async function metricaProfesionalComparativa({ desde, hasta, sucursal }) {
+  // Helper para obtener stats por profesional en un rango
+  async function obtenerProfesionales(d, h) {
+    const sql = `
+      SELECT profesional_atencion AS profesional,
+             COUNT(*)::int AS num_ventas,
+             SUM(valor_pagado)::bigint AS ingresos
+      FROM ventas
+      WHERE fecha BETWEEN $1::date AND $2::date
+        AND ($3::text IS NULL OR sucursal = $3)
+        AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+        AND profesional_atencion IS NOT NULL
+      GROUP BY profesional_atencion
+    `;
+    const { rows } = await pool.query(sql, [d, h, sucursal]);
+    const map = {};
+    for (const r of rows) {
+      map[r.profesional] = {
+        num_ventas: Number(r.num_ventas),
+        ingresos: Number(r.ingresos)
+      };
+    }
+    return map;
+  }
+
+  // Calcular rangos
+  const fechaDesde = new Date(desde);
+  const fechaHasta = new Date(hasta);
+  const diasActual = Math.round((fechaHasta - fechaDesde) / 86400000) + 1;
+
+  // "Mismo punto mes pasado" = mismo numero de dias del mes anterior
+  const desdeAnterior = new Date(fechaDesde);
+  desdeAnterior.setMonth(desdeAnterior.getMonth() - 1);
+  const hastaAnterior = new Date(fechaHasta);
+  hastaAnterior.setMonth(hastaAnterior.getMonth() - 1);
+
+  // "Mes anterior total" = del dia 26 (2 meses atras) al 25 (mes anterior)
+  const mesAnteriorTotalDesde = new Date(fechaDesde);
+  mesAnteriorTotalDesde.setMonth(mesAnteriorTotalDesde.getMonth() - 1);
+  const mesAnteriorTotalHasta = new Date(fechaDesde);
+  mesAnteriorTotalHasta.setDate(mesAnteriorTotalHasta.getDate() - 1);
+
+  const fmtDate = d => d.toISOString().split('T')[0];
+
+  const [actual, anteriorMP, anteriorTotal] = await Promise.all([
+    obtenerProfesionales(fmtDate(fechaDesde), fmtDate(fechaHasta)),
+    obtenerProfesionales(fmtDate(desdeAnterior), fmtDate(hastaAnterior)),
+    obtenerProfesionales(fmtDate(mesAnteriorTotalDesde), fmtDate(mesAnteriorTotalHasta))
+  ]);
+
+  // Unificar todos los profesionales presentes en cualquiera de los 3 periodos
+  const todosProfs = new Set([
+    ...Object.keys(actual),
+    ...Object.keys(anteriorMP),
+    ...Object.keys(anteriorTotal)
+  ]);
+
+  const lista = [];
+  for (const prof of todosProfs) {
+    const a = actual[prof] || { num_ventas: 0, ingresos: 0 };
+    const b = anteriorMP[prof] || { num_ventas: 0, ingresos: 0 };
+    const c = anteriorTotal[prof] || { num_ventas: 0, ingresos: 0 };
+
+    let variacionPct = null;
+    if (b.num_ventas > 0) {
+      variacionPct = +((a.num_ventas - b.num_ventas) * 100 / b.num_ventas).toFixed(1);
+    } else if (a.num_ventas > 0) {
+      variacionPct = 100;
+    }
+
+    let proyeccionFinMes = a.num_ventas;
+    let proyeccionIngresos = a.ingresos;
+    const totalDiasMes = 30;
+    if (diasActual > 0 && diasActual < totalDiasMes) {
+      proyeccionFinMes = Math.round(a.num_ventas * totalDiasMes / diasActual);
+      proyeccionIngresos = Math.round(a.ingresos * totalDiasMes / diasActual);
+    }
+
+    // Ticket promedio actual y anterior total
+    const ticketActual = a.num_ventas > 0 ? Math.round(a.ingresos / a.num_ventas) : 0;
+    const ticketAnteriorTotal = c.num_ventas > 0 ? Math.round(c.ingresos / c.num_ventas) : 0;
+
+    lista.push({
+      profesional: prof,
+      actual_num: a.num_ventas,
+      actual_ingresos: a.ingresos,
+      ticket_actual: ticketActual,
+      anterior_mismo_punto_num: b.num_ventas,
+      anterior_mismo_punto_ingresos: b.ingresos,
+      anterior_total_num: c.num_ventas,
+      anterior_total_ingresos: c.ingresos,
+      ticket_anterior_total: ticketAnteriorTotal,
+      variacion_pct: variacionPct,
+      proyeccion_fin_mes: proyeccionFinMes,
+      proyeccion_ingresos: proyeccionIngresos
+    });
+  }
+
+  // Ordenar por ingresos actual desc
+  lista.sort((a, b) => b.actual_ingresos - a.actual_ingresos);
+
+  return {
+    periodo_actual: { desde: fmtDate(fechaDesde), hasta: fmtDate(fechaHasta), dias: diasActual },
+    profesionales: lista
+  };
+}
+
+
 function wrap(fn, useReq) {
   return async (req, res) => {
     try {
@@ -2000,6 +2112,7 @@ app.get("/api/metricas/categorias-comparativa", wrap(metricaCategoriasComparativ
 app.get("/api/metricas/marketing", wrap(metricaMarketing));
 app.get("/api/metricas/capacidad", wrap(metricaCapacidad));
 app.get("/api/metricas/profesional-detalle", wrap(metricaProfesionalDetalle));
+app.get("/api/metricas/profesional-comparativa", wrap(metricaProfesionalComparativa));
 app.get("/api/metricas/alertas", wrap(metricaAlertas));
 app.get("/api/metricas/origen-ampliado", wrap(metricaOrigenAmpliado));
 app.get("/api/metricas/pacientes-nuevos", wrap(metricaPacientesNuevos));
@@ -2075,6 +2188,7 @@ app.get("/api/metricas/all", async (req, res) => {
       ["marketing", metricaMarketing(filtros)],
       ["capacidad", metricaCapacidad(filtros)],
       ["profesional_detalle", metricaProfesionalDetalle(filtros)],
+      ["profesional_comparativa", metricaProfesionalComparativa(filtros)],
       ["alertas", metricaAlertas(filtros)]
     ];
     const resultados = await Promise.allSettled(tareas.map(t => t[1]));
