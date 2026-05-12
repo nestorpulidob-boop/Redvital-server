@@ -1690,19 +1690,19 @@ async function metricaSerieTemporal({ desde, hasta, sucursal }) {
 
 // ============================================
 // METRICA 15: COMPARATIVA MENSUAL CON UTILIDAD NETA
-// Mes Redvital = del dia 25 de un mes al 25 del mes siguiente (ambos inclusive)
-// Ej: "Mayo Redvital" = 25 abril -> 25 mayo
+// Mes Redvital = del dia 26 de un mes al 25 del mes siguiente (ambos inclusive)
+// Ej: "Mayo Redvital" = 26 abril -> 25 mayo
 // Margen Redvital = 47% del bruto (despues de pagar a TODOS los profesionales)
 // ============================================
 async function metricaComparativaMensual({ desde, hasta, sucursal }) {
   const sql = `
     WITH ventas_clasificadas AS (
       SELECT
-        -- Asignar a "mes Redvital": si dia >= 25, pertenece al mes siguiente; sino al actual
+        -- Asignar a "mes Redvital": si dia >= 26, pertenece al mes siguiente; sino al actual
         -- Ej: 26 abril -> mes Redvital "mayo" (representado como primer dia: 2026-05-01)
-        --     24 abril -> mes Redvital "abril" (2026-04-01)
+        --     25 abril -> mes Redvital "abril" (2026-04-01)
         CASE
-          WHEN EXTRACT(DAY FROM fecha) >= 25
+          WHEN EXTRACT(DAY FROM fecha) >= 26
           THEN DATE_TRUNC('month', fecha + INTERVAL '7 days')::date
           ELSE DATE_TRUNC('month', fecha)::date
         END AS mes_redvital,
@@ -1725,7 +1725,7 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
     citas_mes AS (
       SELECT
         CASE
-          WHEN EXTRACT(DAY FROM fecha) >= 25
+          WHEN EXTRACT(DAY FROM fecha) >= 26
           THEN DATE_TRUNC('month', fecha + INTERVAL '7 days')::date
           ELSE DATE_TRUNC('month', fecha)::date
         END AS mes_redvital,
@@ -1774,9 +1774,9 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
     const utilidadNeta = margenBruto - COSTO_FIJO_MENSUAL;
     const margenPct = ingresoTotal > 0 ? +(100 * utilidadNeta / ingresoTotal).toFixed(1) : 0;
     const nombresMes = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
-    // Calcular fechas reales del periodo Redvital: dia 25 mes anterior -> dia 25 de este mes
+    // Calcular fechas reales del periodo Redvital: dia 26 mes anterior -> dia 25 de este mes
     const fechaMes = new Date(r.mes); // primer dia del mes "destino"
-    const inicio = new Date(fechaMes.getFullYear(), fechaMes.getMonth() - 1, 25);
+    const inicio = new Date(fechaMes.getFullYear(), fechaMes.getMonth() - 1, 26);
     const fin = new Date(fechaMes.getFullYear(), fechaMes.getMonth(), 25);
     return {
       mes: r.mes,
@@ -1785,7 +1785,7 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
       nombre_mes: `${nombresMes[r.num_mes-1]} ${r.anio}`,
       periodo_inicio: inicio.toISOString().split('T')[0],
       periodo_fin: fin.toISOString().split('T')[0],
-      periodo_label: `25 ${nombresMes[(r.num_mes-2+12)%12]} → 25 ${nombresMes[r.num_mes-1]}`,
+      periodo_label: `26 ${nombresMes[(r.num_mes-2+12)%12]} → 25 ${nombresMes[r.num_mes-1]}`,
       total_citas: r.total_citas,
       atendidas: r.atendidas,
       no_show: r.no_show,
@@ -1854,6 +1854,119 @@ async function metricaCategorias({ desde, hasta, sucursal }) {
   return { total_ingresos: total, categorias: lista };
 }
 
+// ============================================
+// METRICA 16.b (NUEVA v5.16): CATEGORIAS CON COMPARACION MES ANTERIOR
+// Devuelve por categoria: actual + mes anterior (mismo punto) + mes anterior completo + variacion
+// El "mes anterior mismo punto" = mismo numero de dias pero del mes anterior
+// El "mes anterior total" = mes Redvital completo cerrado anterior
+// ============================================
+async function metricaCategoriasComparativa({ desde, hasta, sucursal }) {
+  // Calcular rango actual
+  const fechaDesde = new Date(desde);
+  const fechaHasta = new Date(hasta);
+  const diasActual = Math.round((fechaHasta - fechaDesde) / 86400000) + 1;
+
+  // Rango "mes anterior mismo punto" = mismo numero de dias del mes anterior
+  const desdeAnterior = new Date(fechaDesde);
+  desdeAnterior.setMonth(desdeAnterior.getMonth() - 1);
+  const hastaAnterior = new Date(fechaHasta);
+  hastaAnterior.setMonth(hastaAnterior.getMonth() - 1);
+
+  // Rango "mes anterior total" = del dia 26 (2 meses atras) al 25 (mes anterior)
+  // Si fechaDesde es 26-abr-2026, mes anterior total seria 26-mar a 25-abr
+  const mesAnteriorTotalDesde = new Date(fechaDesde);
+  mesAnteriorTotalDesde.setMonth(mesAnteriorTotalDesde.getMonth() - 1);
+  // mesAnteriorTotalDesde ya esta en dia 26 del mes anterior
+  const mesAnteriorTotalHasta = new Date(fechaDesde);
+  mesAnteriorTotalHasta.setDate(mesAnteriorTotalHasta.getDate() - 1);
+  // Eso da el dia anterior al fechaDesde, que es dia 25 del mes anterior
+
+  // Helper para hacer query y agrupar
+  async function obtenerCategorias(d, h) {
+    const sql = `
+      SELECT productos_venta, profesional_atencion, valor_pagado
+      FROM ventas
+      WHERE fecha BETWEEN $1::date AND $2::date
+        AND ($3::text IS NULL OR sucursal = $3)
+        AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+    `;
+    const { rows } = await pool.query(sql, [d, h, sucursal]);
+    const acum = {};
+    for (const row of rows) {
+      const texto = `${row.productos_venta || ''} ${row.profesional_atencion || ''}`;
+      const cat = clasificarCategoria(texto);
+      const valor = Number(row.valor_pagado) || 0;
+      if (!acum[cat]) acum[cat] = { num_ventas: 0, ingresos: 0 };
+      acum[cat].num_ventas++;
+      acum[cat].ingresos += valor;
+    }
+    return acum;
+  }
+
+  const fmtDate = d => d.toISOString().split('T')[0];
+
+  // Obtener los 3 periodos
+  const [actual, anteriorMismoPunto, anteriorTotal] = await Promise.all([
+    obtenerCategorias(fmtDate(fechaDesde), fmtDate(fechaHasta)),
+    obtenerCategorias(fmtDate(desdeAnterior), fmtDate(hastaAnterior)),
+    obtenerCategorias(fmtDate(mesAnteriorTotalDesde), fmtDate(mesAnteriorTotalHasta))
+  ]);
+
+  // Unificar todas las categorias presentes en cualquiera de los 3 periodos
+  const todasCategorias = new Set([
+    ...Object.keys(actual),
+    ...Object.keys(anteriorMismoPunto),
+    ...Object.keys(anteriorTotal)
+  ]);
+
+  const lista = [];
+  for (const cat of todasCategorias) {
+    const a = actual[cat] || { num_ventas: 0, ingresos: 0 };
+    const b = anteriorMismoPunto[cat] || { num_ventas: 0, ingresos: 0 };
+    const c = anteriorTotal[cat] || { num_ventas: 0, ingresos: 0 };
+
+    // Variacion vs mismo punto del mes pasado (% sobre num_ventas)
+    let variacionPct = null;
+    if (b.num_ventas > 0) {
+      variacionPct = +((a.num_ventas - b.num_ventas) * 100 / b.num_ventas).toFixed(1);
+    } else if (a.num_ventas > 0) {
+      variacionPct = 100; // nuevo vs cero
+    }
+
+    // Proyeccion fin de mes basado en ritmo actual
+    let proyeccionFinMes = a.num_ventas;
+    let proyeccionIngresos = a.ingresos;
+    const totalDiasMes = 30; // aprox dias entre 26 y 25 mes siguiente
+    if (diasActual > 0 && diasActual < totalDiasMes) {
+      proyeccionFinMes = Math.round(a.num_ventas * totalDiasMes / diasActual);
+      proyeccionIngresos = Math.round(a.ingresos * totalDiasMes / diasActual);
+    }
+
+    lista.push({
+      categoria: cat,
+      actual_num: a.num_ventas,
+      actual_ingresos: a.ingresos,
+      anterior_mismo_punto_num: b.num_ventas,
+      anterior_mismo_punto_ingresos: b.ingresos,
+      anterior_total_num: c.num_ventas,
+      anterior_total_ingresos: c.ingresos,
+      variacion_pct: variacionPct,
+      proyeccion_fin_mes: proyeccionFinMes,
+      proyeccion_ingresos: proyeccionIngresos
+    });
+  }
+
+  // Ordenar por ingresos actual desc
+  lista.sort((a, b) => b.actual_ingresos - a.actual_ingresos);
+
+  return {
+    periodo_actual: { desde: fmtDate(fechaDesde), hasta: fmtDate(fechaHasta), dias: diasActual },
+    periodo_anterior_mismo_punto: { desde: fmtDate(desdeAnterior), hasta: fmtDate(hastaAnterior) },
+    periodo_anterior_total: { desde: fmtDate(mesAnteriorTotalDesde), hasta: fmtDate(mesAnteriorTotalHasta) },
+    categorias: lista
+  };
+}
+
 
 function wrap(fn, useReq) {
   return async (req, res) => {
@@ -1883,6 +1996,7 @@ app.get("/api/metricas/origen-reservas", wrap(metricaOrigenReservas));
 app.get("/api/metricas/serie-temporal", wrap(metricaSerieTemporal));
 app.get("/api/metricas/comparativa-mensual", wrap(metricaComparativaMensual));
 app.get("/api/metricas/categorias", wrap(metricaCategorias));
+app.get("/api/metricas/categorias-comparativa", wrap(metricaCategoriasComparativa));
 app.get("/api/metricas/marketing", wrap(metricaMarketing));
 app.get("/api/metricas/capacidad", wrap(metricaCapacidad));
 app.get("/api/metricas/profesional-detalle", wrap(metricaProfesionalDetalle));
@@ -1957,6 +2071,7 @@ app.get("/api/metricas/all", async (req, res) => {
       ["serie_temporal", metricaSerieTemporal(filtros)],
       ["comparativa_mensual", metricaComparativaMensual(filtros)],
       ["categorias", metricaCategorias(filtros)],
+      ["categorias_comparativa", metricaCategoriasComparativa(filtros)],
       ["marketing", metricaMarketing(filtros)],
       ["capacidad", metricaCapacidad(filtros)],
       ["profesional_detalle", metricaProfesionalDetalle(filtros)],
@@ -2086,7 +2201,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.15",
+    servidor: "Redvital Backend v5.16",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2353,7 +2468,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.15",
+    servidor: "Redvital Backend v5.16",
     schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
@@ -2404,6 +2519,6 @@ app.get("/", (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.15 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.16 corriendo en puerto " + PORT);
   await inicializarBD();
 });
