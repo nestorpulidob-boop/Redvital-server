@@ -194,7 +194,37 @@ async function inicializarBD() {
       )
     `);
 
-    console.log("Indices, tabla webhooks_raw, columnas uuid y campanias_marketing verificados correctamente");
+    // Tabla v5.16: KPIs detallados de Ads (Google, Meta, etc)
+    // Cada fila es una "snapshot" en un momento dado de una campana
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ads_kpis (
+        id BIGSERIAL PRIMARY KEY,
+        plataforma TEXT NOT NULL,           -- 'google_ads', 'meta_ads', 'tiktok', etc
+        campania_nombre TEXT NOT NULL,
+        campania_id TEXT,                    -- ID externo (Google Ads campaign ID, etc)
+        estado TEXT,                         -- 'activa', 'pausada', 'eliminada'
+        fecha_desde DATE NOT NULL,           -- inicio del periodo medido
+        fecha_hasta DATE NOT NULL,           -- fin del periodo medido
+        impresiones BIGINT DEFAULT 0,
+        clicks BIGINT DEFAULT 0,
+        ctr_pct NUMERIC(6,2),                -- porcentaje
+        cpc_promedio NUMERIC(10,2),
+        costo BIGINT DEFAULT 0,
+        conversiones NUMERIC(10,2) DEFAULT 0,
+        costo_conversion NUMERIC(10,2),
+        tasa_conversion_pct NUMERIC(6,2),
+        presupuesto_diario BIGINT,
+        comentario TEXT,
+        creada_en TIMESTAMPTZ DEFAULT NOW(),
+        actualizada_en TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    // Indices para queries comunes
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_plataforma ON ads_kpis(plataforma)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_fecha ON ads_kpis(fecha_hasta DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_campania ON ads_kpis(campania_nombre)`);
+
+    console.log("Indices, tabla webhooks_raw, columnas uuid, campanias_marketing y ads_kpis verificados correctamente");
   } catch (err) {
     console.error("Error inicializando BD:", err.message);
   }
@@ -2156,6 +2186,210 @@ app.delete("/api/campanias/:id", async (req, res) => {
   try {
     await pool.query(`DELETE FROM campanias_marketing WHERE id = $1`, [req.params.id]);
     res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================
+// CRUD: ADS KPIs (v5.16) - Google Ads, Meta Ads, etc
+// ============================================
+app.get("/api/ads-kpis", async (req, res) => {
+  try {
+    const { plataforma, desde, hasta } = req.query;
+    let sql = `SELECT id, plataforma, campania_nombre, campania_id, estado,
+                      fecha_desde, fecha_hasta,
+                      impresiones, clicks, ctr_pct,
+                      cpc_promedio, costo, conversiones,
+                      costo_conversion, tasa_conversion_pct,
+                      presupuesto_diario, comentario,
+                      creada_en, actualizada_en
+               FROM ads_kpis WHERE 1=1`;
+    const params = [];
+    if (plataforma) { params.push(plataforma); sql += ` AND plataforma = $${params.length}`; }
+    if (desde) { params.push(desde); sql += ` AND fecha_hasta >= $${params.length}::date`; }
+    if (hasta) { params.push(hasta); sql += ` AND fecha_desde <= $${params.length}::date`; }
+    sql += ` ORDER BY fecha_hasta DESC, creada_en DESC`;
+    const { rows } = await pool.query(sql, params);
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/ads-kpis", async (req, res) => {
+  try {
+    const k = req.body || {};
+    if (!k.plataforma || !k.campania_nombre || !k.fecha_desde || !k.fecha_hasta) {
+      return res.status(400).json({ ok: false, error: "Faltan: plataforma, campania_nombre, fecha_desde, fecha_hasta" });
+    }
+    // Calcular metricas derivadas si vienen vacias
+    const clicks = Number(k.clicks) || 0;
+    const impresiones = Number(k.impresiones) || 0;
+    const costo = Number(k.costo) || 0;
+    const conversiones = Number(k.conversiones) || 0;
+    const ctr = impresiones > 0 ? +(100 * clicks / impresiones).toFixed(2) : 0;
+    const cpc = clicks > 0 ? +(costo / clicks).toFixed(2) : 0;
+    const costoConv = conversiones > 0 ? +(costo / conversiones).toFixed(2) : null;
+    const tasaConv = clicks > 0 ? +(100 * conversiones / clicks).toFixed(2) : 0;
+
+    const { rows } = await pool.query(
+      `INSERT INTO ads_kpis (plataforma, campania_nombre, campania_id, estado,
+                             fecha_desde, fecha_hasta,
+                             impresiones, clicks, ctr_pct,
+                             cpc_promedio, costo, conversiones,
+                             costo_conversion, tasa_conversion_pct,
+                             presupuesto_diario, comentario)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       RETURNING *`,
+      [k.plataforma, k.campania_nombre, k.campania_id || null, k.estado || 'activa',
+       k.fecha_desde, k.fecha_hasta,
+       impresiones, clicks, k.ctr_pct || ctr,
+       k.cpc_promedio || cpc, costo, conversiones,
+       k.costo_conversion || costoConv, k.tasa_conversion_pct || tasaConv,
+       k.presupuesto_diario || null, k.comentario || null]
+    );
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.put("/api/ads-kpis/:id", async (req, res) => {
+  try {
+    const k = req.body || {};
+    const clicks = Number(k.clicks) || 0;
+    const impresiones = Number(k.impresiones) || 0;
+    const costo = Number(k.costo) || 0;
+    const conversiones = Number(k.conversiones) || 0;
+    const ctr = impresiones > 0 ? +(100 * clicks / impresiones).toFixed(2) : 0;
+    const cpc = clicks > 0 ? +(costo / clicks).toFixed(2) : 0;
+    const costoConv = conversiones > 0 ? +(costo / conversiones).toFixed(2) : null;
+    const tasaConv = clicks > 0 ? +(100 * conversiones / clicks).toFixed(2) : 0;
+
+    const { rows } = await pool.query(
+      `UPDATE ads_kpis SET
+         plataforma=$1, campania_nombre=$2, campania_id=$3, estado=$4,
+         fecha_desde=$5, fecha_hasta=$6,
+         impresiones=$7, clicks=$8, ctr_pct=$9,
+         cpc_promedio=$10, costo=$11, conversiones=$12,
+         costo_conversion=$13, tasa_conversion_pct=$14,
+         presupuesto_diario=$15, comentario=$16,
+         actualizada_en=NOW()
+       WHERE id=$17
+       RETURNING *`,
+      [k.plataforma, k.campania_nombre, k.campania_id || null, k.estado || 'activa',
+       k.fecha_desde, k.fecha_hasta,
+       impresiones, clicks, k.ctr_pct || ctr,
+       k.cpc_promedio || cpc, costo, conversiones,
+       k.costo_conversion || costoConv, k.tasa_conversion_pct || tasaConv,
+       k.presupuesto_diario || null, k.comentario || null,
+       req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ ok: false, error: "No encontrado" });
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete("/api/ads-kpis/:id", async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM ads_kpis WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Resumen agregado por plataforma para el dashboard
+app.get("/api/ads-resumen", async (req, res) => {
+  try {
+    const { desde, hasta } = req.query;
+    // Por defecto usar mes Redvital actual
+    const hoy = new Date();
+    let desdeF = desde, hastaF = hasta;
+    if (!desdeF) {
+      const inicio = hoy.getDate() >= 26
+        ? new Date(hoy.getFullYear(), hoy.getMonth(), 26)
+        : new Date(hoy.getFullYear(), hoy.getMonth() - 1, 26);
+      desdeF = inicio.toISOString().split('T')[0];
+    }
+    if (!hastaF) hastaF = hoy.toISOString().split('T')[0];
+
+    // Resumen por plataforma (suma de KPIs de cada campania, ultimo snapshot por campania)
+    const sql = `
+      WITH ultimos_snapshots AS (
+        SELECT DISTINCT ON (plataforma, campania_nombre)
+          plataforma, campania_nombre, estado,
+          impresiones, clicks, costo, conversiones,
+          ctr_pct, cpc_promedio, costo_conversion, tasa_conversion_pct
+        FROM ads_kpis
+        WHERE fecha_hasta >= $1::date AND fecha_desde <= $2::date
+        ORDER BY plataforma, campania_nombre, fecha_hasta DESC
+      )
+      SELECT
+        plataforma,
+        COUNT(*)::int AS num_campanias,
+        COUNT(*) FILTER (WHERE estado = 'activa')::int AS campanias_activas,
+        SUM(impresiones)::bigint AS impresiones_total,
+        SUM(clicks)::bigint AS clicks_total,
+        SUM(costo)::bigint AS costo_total,
+        SUM(conversiones)::numeric AS conversiones_total,
+        CASE WHEN SUM(impresiones) > 0
+             THEN ROUND(100.0 * SUM(clicks) / SUM(impresiones), 2)
+             ELSE 0 END AS ctr_promedio,
+        CASE WHEN SUM(clicks) > 0
+             THEN ROUND(SUM(costo)::numeric / SUM(clicks), 2)
+             ELSE 0 END AS cpc_promedio,
+        CASE WHEN SUM(conversiones) > 0
+             THEN ROUND(SUM(costo)::numeric / SUM(conversiones), 2)
+             ELSE 0 END AS costo_conversion_promedio
+      FROM ultimos_snapshots
+      GROUP BY plataforma
+    `;
+    const { rows: plataformas } = await pool.query(sql, [desdeF, hastaF]);
+
+    // Detalle por campania (ultimo snapshot por campania)
+    const sqlCampanias = `
+      SELECT DISTINCT ON (plataforma, campania_nombre)
+        id, plataforma, campania_nombre, campania_id, estado,
+        fecha_desde, fecha_hasta,
+        impresiones, clicks, ctr_pct,
+        cpc_promedio, costo, conversiones,
+        costo_conversion, tasa_conversion_pct,
+        presupuesto_diario, actualizada_en
+      FROM ads_kpis
+      WHERE fecha_hasta >= $1::date AND fecha_desde <= $2::date
+      ORDER BY plataforma, campania_nombre, fecha_hasta DESC
+    `;
+    const { rows: campanias } = await pool.query(sqlCampanias, [desdeF, hastaF]);
+
+    // Totales globales
+    const totales = {
+      costo: plataformas.reduce((s,p)=>s+Number(p.costo_total||0),0),
+      clicks: plataformas.reduce((s,p)=>s+Number(p.clicks_total||0),0),
+      impresiones: plataformas.reduce((s,p)=>s+Number(p.impresiones_total||0),0),
+      conversiones: plataformas.reduce((s,p)=>s+Number(p.conversiones_total||0),0),
+      campanias: campanias.length,
+      activas: plataformas.reduce((s,p)=>s+Number(p.campanias_activas||0),0)
+    };
+    totales.ctr = totales.impresiones > 0
+      ? +(100 * totales.clicks / totales.impresiones).toFixed(2) : 0;
+    totales.cpc = totales.clicks > 0
+      ? Math.round(totales.costo / totales.clicks) : 0;
+    totales.costo_conv = totales.conversiones > 0
+      ? Math.round(totales.costo / totales.conversiones) : 0;
+
+    res.json({
+      ok: true,
+      data: {
+        periodo: { desde: desdeF, hasta: hastaF },
+        totales,
+        plataformas,
+        campanias
+      }
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
