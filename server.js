@@ -6,7 +6,7 @@ const { Pool } = require("pg");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 // ============================================
 // CONEXION A POSTGRESQL
@@ -2863,10 +2863,246 @@ app.get("/", (req, res) => {
 });
 
 // ============================================
+// IMPORTADOR CSV DE GOOGLE ADS / META / OTROS
+// ============================================
+
+// Crear tabla ads_kpis si no existe (idempotente)
+async function inicializarAdsKpis() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ads_kpis (
+        id SERIAL PRIMARY KEY,
+        platform VARCHAR(50) NOT NULL,
+        campaign_name VARCHAR(255) NOT NULL,
+        campaign_status VARCHAR(50),
+        campaign_type VARCHAR(100),
+        impressions INTEGER DEFAULT 0,
+        clicks INTEGER DEFAULT 0,
+        cost_clp INTEGER DEFAULT 0,
+        conversions DECIMAL(10,2) DEFAULT 0,
+        ctr DECIMAL(5,2) DEFAULT 0,
+        cpc INTEGER DEFAULT 0,
+        cpa INTEGER DEFAULT 0,
+        conversion_rate DECIMAL(5,2) DEFAULT 0,
+        date_range_start DATE,
+        date_range_end DATE,
+        imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        raw_data JSONB
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_platform ON ads_kpis(platform);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_imported ON ads_kpis(imported_at);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_campaign ON ads_kpis(campaign_name);`);
+    console.log("Tabla ads_kpis OK");
+  } catch (e) {
+    console.error("Error inicializando ads_kpis:", e.message);
+  }
+}
+
+// Parser de linea CSV que respeta comillas
+function parseCsvLine(line) {
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (c === "," && !inQuotes) {
+      result.push(current.trim());
+      current = "";
+    } else {
+      current += c;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
+
+function toNumber(val) {
+  if (val === undefined || val === null) return 0;
+  const s = String(val).trim();
+  if (s === "" || s === "--" || s === "-") return 0;
+  const cleaned = s.replace(/[",%$\s]/g, "").replace(/CLP/gi, "");
+  const n = parseFloat(cleaned);
+  return isNaN(n) ? 0 : n;
+}
+
+// POST /api/ads/import-csv  - recibe { csvContent, platform } y carga ads_kpis
+app.post("/api/ads/import-csv", async (req, res) => {
+  try {
+    const { csvContent, platform } = req.body;
+    if (!csvContent || typeof csvContent !== "string") {
+      return res.status(400).json({ error: "Falta csvContent (string) en el body" });
+    }
+    const plat = (platform || "google_ads").toLowerCase();
+
+    const lines = csvContent.split(/\r?\n/).filter(l => l.trim() !== "");
+    if (lines.length < 3) {
+      return res.status(400).json({ error: "CSV invalido o vacio" });
+    }
+
+    // Detectar fila de headers (Google Ads suele tenerla en linea 3, indice 2)
+    let headerIndex = -1;
+    for (let i = 0; i < Math.min(8, lines.length); i++) {
+      const low = lines[i].toLowerCase();
+      if (low.includes("campa") && (low.includes("costo") || low.includes("clic") || low.includes("conversi"))) {
+        headerIndex = i;
+        break;
+      }
+    }
+    if (headerIndex === -1) {
+      return res.status(400).json({ error: "No se encontro fila de headers del CSV" });
+    }
+
+    const headers = parseCsvLine(lines[headerIndex]);
+    const idxOf = (...names) => {
+      for (const n of names) {
+        const i = headers.findIndex(h => h.toLowerCase() === n.toLowerCase());
+        if (i !== -1) return i;
+      }
+      return -1;
+    };
+
+    const colEstado = idxOf("Estado de la campaña", "Estado");
+    const colCampana = idxOf("Campaña", "Campana");
+    const colTipo = idxOf("Tipo de campaña", "Tipo");
+    const colCosto = idxOf("Costo");
+    const colImpr = idxOf("Impr.", "Impresiones");
+    const colClics = idxOf("Clics", "Interacciones");
+    const colConv = idxOf("Conversiones");
+    const colCpc = idxOf("Prom. CPC", "CPC prom.");
+    const colCpa = idxOf("Costo/conv.", "Costo por conv.");
+    const colCtr = idxOf("Porcentaje de interacción", "CTR");
+    const colConvRate = idxOf("Porcentaje de conv.", "Tasa de conv.");
+
+    if (colCampana === -1) {
+      return res.status(400).json({ error: "No se encontro columna Campaña en el CSV" });
+    }
+
+    // Borrar imports del mismo dia y misma plataforma para evitar duplicados
+    await pool.query(
+      "DELETE FROM ads_kpis WHERE platform=$1 AND DATE(imported_at)=CURRENT_DATE",
+      [plat]
+    );
+
+    let inserted = 0;
+    let skipped = 0;
+    const importDate = new Date().toISOString().slice(0, 10);
+
+    for (let i = headerIndex + 1; i < lines.length; i++) {
+      const row = parseCsvLine(lines[i]);
+      const nombre = row[colCampana];
+      if (!nombre || nombre.startsWith("Total") || nombre === "--" || nombre === "") {
+        skipped++;
+        continue;
+      }
+      try {
+        await pool.query(
+          `INSERT INTO ads_kpis (
+            platform, campaign_name, campaign_status, campaign_type,
+            impressions, clicks, cost_clp, conversions, ctr, cpc, cpa, conversion_rate,
+            date_range_end, raw_data
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+          [
+            plat,
+            nombre,
+            colEstado >= 0 ? row[colEstado] || null : null,
+            colTipo >= 0 ? row[colTipo] || null : null,
+            colImpr >= 0 ? toNumber(row[colImpr]) : 0,
+            colClics >= 0 ? toNumber(row[colClics]) : 0,
+            colCosto >= 0 ? toNumber(row[colCosto]) : 0,
+            colConv >= 0 ? toNumber(row[colConv]) : 0,
+            colCtr >= 0 ? toNumber(row[colCtr]) : 0,
+            colCpc >= 0 ? toNumber(row[colCpc]) : 0,
+            colCpa >= 0 ? toNumber(row[colCpa]) : 0,
+            colConvRate >= 0 ? toNumber(row[colConvRate]) : 0,
+            importDate,
+            JSON.stringify({ row, headers })
+          ]
+        );
+        inserted++;
+      } catch (rowErr) {
+        skipped++;
+        console.error("Fila CSV omitida:", rowErr.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      platform: plat,
+      inserted,
+      skipped,
+      total_lines: lines.length - headerIndex - 1
+    });
+  } catch (e) {
+    console.error("Error importando CSV:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/ads/kpis  - lista campañas (opcional ?platform=google_ads)
+app.get("/api/ads/kpis", async (req, res) => {
+  try {
+    const { platform, limit } = req.query;
+    let q = `SELECT id, platform, campaign_name, campaign_status, campaign_type,
+                    impressions, clicks, cost_clp, conversions, ctr, cpc, cpa,
+                    conversion_rate, date_range_end, imported_at
+             FROM ads_kpis
+             WHERE DATE(imported_at) = (SELECT MAX(DATE(imported_at)) FROM ads_kpis WHERE 1=1 ${platform ? "AND platform=$1" : ""})`;
+    const params = [];
+    if (platform) {
+      params.push(platform);
+      q += ` AND platform=$1`;
+    }
+    q += ` ORDER BY conversions DESC, cost_clp DESC LIMIT ${parseInt(limit) || 200}`;
+    const result = await pool.query(q, params);
+    res.json({ success: true, count: result.rows.length, data: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/ads/summary  - resumen agregado por plataforma del ultimo import
+app.get("/api/ads/summary", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        platform,
+        COUNT(*) AS campanas,
+        SUM(cost_clp)::INTEGER AS costo_total,
+        SUM(conversions)::DECIMAL(12,2) AS conversiones_total,
+        SUM(clicks)::INTEGER AS clics_total,
+        SUM(impressions)::INTEGER AS impresiones_total,
+        CASE WHEN SUM(conversions) > 0
+          THEN ROUND(SUM(cost_clp)::DECIMAL / SUM(conversions))::INTEGER
+          ELSE 0 END AS cpa_promedio,
+        CASE WHEN SUM(impressions) > 0
+          THEN ROUND(SUM(clicks)::DECIMAL * 100 / SUM(impressions), 2)
+          ELSE 0 END AS ctr_promedio,
+        MAX(imported_at) AS ultimo_import
+      FROM ads_kpis
+      WHERE DATE(imported_at) = (SELECT MAX(DATE(imported_at)) FROM ads_kpis)
+      GROUP BY platform
+      ORDER BY costo_total DESC
+    `);
+    res.json({ success: true, data: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================
 // START
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.16 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.17 corriendo en puerto " + PORT);
   await inicializarBD();
+  await inicializarAdsKpis();
 });
