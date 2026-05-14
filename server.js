@@ -3096,6 +3096,258 @@ app.get("/api/ads/summary", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+// ============================================
+// v5.18: BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE
+// ============================================
+
+// ============================================
+// INICIALIZACION DE TABLAS DEL BOT (separado de inicializarBD)
+// ============================================
+async function inicializarBotBD() {
+  try {
+    // Pacientes que llegaron via bot WhatsApp
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_pacientes (
+        id BIGSERIAL PRIMARY KEY,
+        wa_id TEXT UNIQUE NOT NULL,
+        nombre TEXT,
+        rut TEXT,
+        primera_interaccion TIMESTAMPTZ DEFAULT NOW(),
+        ultima_interaccion TIMESTAMPTZ DEFAULT NOW(),
+        mensaje_inicial TEXT,
+        referral_source_type TEXT,
+        referral_source_id TEXT,
+        referral_source_url TEXT,
+        referral_headline TEXT,
+        referral_body TEXT,
+        referral_media_type TEXT,
+        ctwa_clid TEXT,
+        total_mensajes INT DEFAULT 0,
+        total_citas_agendadas INT DEFAULT 0,
+        uuid_paciente_reservo TEXT,
+        notas TEXT,
+        creado_en TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bot_pacientes_wa ON bot_pacientes(wa_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bot_pacientes_rut ON bot_pacientes(rut)`);
+
+    // Historial de conversaciones
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_conversaciones (
+        id BIGSERIAL PRIMARY KEY,
+        wa_id TEXT NOT NULL,
+        timestamp TIMESTAMPTZ DEFAULT NOW(),
+        direccion TEXT NOT NULL,
+        mensaje TEXT,
+        tipo_mensaje TEXT DEFAULT 'text',
+        wa_message_id TEXT,
+        intent TEXT,
+        accion_ejecutada TEXT,
+        datos_extra JSONB,
+        error TEXT
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bot_conv_wa ON bot_conversaciones(wa_id, timestamp DESC)`);
+
+    // Sesiones activas
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_sesiones (
+        wa_id TEXT PRIMARY KEY,
+        estado TEXT DEFAULT 'inicial',
+        contexto JSONB DEFAULT '{}'::jsonb,
+        ultima_actividad TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    // Citas creadas por el bot
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_citas (
+        id BIGSERIAL PRIMARY KEY,
+        wa_id TEXT NOT NULL,
+        uuid_cita TEXT,
+        uuid_paciente TEXT,
+        sede TEXT,
+        sucursal TEXT,
+        profesional TEXT,
+        tratamiento TEXT,
+        fecha DATE,
+        hora TIME,
+        estado TEXT DEFAULT 'creada',
+        creada_en TIMESTAMPTZ DEFAULT NOW(),
+        referral_source_type TEXT,
+        referral_source_id TEXT
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bot_citas_wa ON bot_citas(wa_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bot_citas_fecha ON bot_citas(fecha)`);
+
+    console.log("[bot BD] Tablas del bot WhatsApp verificadas");
+  } catch (err) {
+    console.error("[bot BD] Error inicializando:", err.message);
+  }
+}
+
+// ============================================
+// CLIENTE RESERVO AGENDAMIENTO ONLINE
+// ============================================
+// Usa los UUIDs de agendas online configurados en Render como UUID_AGENDA_SEDE*_*
+// Docs: https://reservo.cl/APIpublica/v2/agenda_online/{uuid}/...
+
+const AGENDAS_BOT = [
+  // sede2 (Victoria, 6 boxes) - mas capacidad, primero
+  { sede: 'sede2', tipo: 'general', uuid: process.env.UUID_AGENDA_SEDE2_GENERAL, token: process.env.TOKEN_SEDE2 },
+  { sede: 'sede2', tipo: 'derma',   uuid: process.env.UUID_AGENDA_SEDE2_DERMA,   token: process.env.TOKEN_SEDE2 },
+  { sede: 'sede2', tipo: 'salas',   uuid: process.env.UUID_AGENDA_SEDE2_SALAS,   token: process.env.TOKEN_SEDE2 },
+  // sede1 (Maturana, 2 boxes)
+  { sede: 'sede1', tipo: 'default',     uuid: process.env.UUID_AGENDA_SEDE1_DEFAULT,     token: process.env.TOKEN_SEDE1 },
+  { sede: 'sede1', tipo: 'sucursales',  uuid: process.env.UUID_AGENDA_SEDE1_SUCURSALES,  token: process.env.TOKEN_SEDE1 },
+  { sede: 'sede1', tipo: 'sucursales2', uuid: process.env.UUID_AGENDA_SEDE1_SUCURSALES2, token: process.env.TOKEN_SEDE1 }
+].filter(a => a.uuid && a.token);
+
+// GET profesionales de una agenda
+async function reservoGetProfesionales(uuid, token) {
+  try {
+    const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/profesionales/`, {
+      headers: { Authorization: RESERVO_AUTH(token) },
+      timeout: 15000
+    });
+    return r.data || [];
+  } catch (err) {
+    console.error(`[reservo profesionales ${uuid}]`, err.message);
+    return [];
+  }
+}
+
+// GET tratamientos de una agenda
+async function reservoGetTratamientos(uuid, token) {
+  try {
+    const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/tratamientos/`, {
+      headers: { Authorization: RESERVO_AUTH(token) },
+      timeout: 15000
+    });
+    return r.data || [];
+  } catch (err) {
+    console.error(`[reservo tratamientos ${uuid}]`, err.message);
+    return [];
+  }
+}
+
+// GET sucursales de una agenda
+async function reservoGetSucursales(uuid, token) {
+  try {
+    const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/sucursales/`, {
+      headers: { Authorization: RESERVO_AUTH(token) },
+      timeout: 15000
+    });
+    return r.data || [];
+  } catch (err) {
+    console.error(`[reservo sucursales ${uuid}]`, err.message);
+    return [];
+  }
+}
+
+// GET horarios disponibles
+async function reservoGetHorarios(uuid, token, params) {
+  try {
+    const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/horarios_disponibles/`, {
+      headers: { Authorization: RESERVO_AUTH(token) },
+      params: params || {},
+      timeout: 15000
+    });
+    return r.data || [];
+  } catch (err) {
+    console.error(`[reservo horarios ${uuid}]`, err.message);
+    return [];
+  }
+}
+
+// GET proxima hora disponible
+async function reservoProximaHora(uuid, token, params) {
+  try {
+    const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/proxima_hora_disponible/`, {
+      headers: { Authorization: RESERVO_AUTH(token) },
+      params: params || {},
+      timeout: 15000
+    });
+    return r.data;
+  } catch (err) {
+    console.error(`[reservo proxima ${uuid}]`, err.message);
+    return null;
+  }
+}
+
+// GET verificar existencia paciente por RUT
+async function reservoVerificarPaciente(uuid, token, rut) {
+  try {
+    const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/makereserva/existencia_rut_api/`, {
+      headers: { Authorization: RESERVO_AUTH(token) },
+      params: { rut },
+      timeout: 15000
+    });
+    return r.data;
+  } catch (err) {
+    console.error(`[reservo verificar rut ${rut}]`, err.message);
+    return null;
+  }
+}
+
+// POST crear reserva (confirmar cita)
+async function reservoCrearReserva(uuid, token, body) {
+  try {
+    const r = await axios.post(`${RESERVO_API}/agenda_online/${uuid}/makereserva/confirmApptAPI/`, body, {
+      headers: { Authorization: RESERVO_AUTH(token), 'Content-Type': 'application/json' },
+      timeout: 30000
+    });
+    return r.data;
+  } catch (err) {
+    console.error(`[reservo crear reserva]`, err.message);
+    return { error: err.message, detalles: err.response ? err.response.data : null };
+  }
+}
+
+// Endpoint de testeo: ver profesionales y tratamientos disponibles
+app.get("/api/bot/test-reservo", async (req, res) => {
+  const resultado = [];
+  for (const agenda of AGENDAS_BOT) {
+    const [profs, trats] = await Promise.all([
+      reservoGetProfesionales(agenda.uuid, agenda.token),
+      reservoGetTratamientos(agenda.uuid, agenda.token)
+    ]);
+    resultado.push({
+      sede: agenda.sede,
+      tipo: agenda.tipo,
+      uuid: agenda.uuid,
+      profesionales: Array.isArray(profs) ? profs.length : 'error',
+      tratamientos: Array.isArray(trats) ? trats.length : 'error',
+      sample_profesional: Array.isArray(profs) && profs[0] ? profs[0] : null,
+      sample_tratamiento: Array.isArray(trats) && trats[0] ? trats[0] : null
+    });
+  }
+  res.json({ ok: true, total_agendas: AGENDAS_BOT.length, agendas: resultado });
+});
+
+// Endpoint: listar TODOS los tratamientos disponibles (cross-agendas)
+app.get("/api/bot/tratamientos", async (req, res) => {
+  const tratamientos = {};
+  for (const agenda of AGENDAS_BOT) {
+    const trats = await reservoGetTratamientos(agenda.uuid, agenda.token);
+    if (!Array.isArray(trats)) continue;
+    for (const t of trats) {
+      const key = t.nombre || t.descripcion || 'sin_nombre';
+      if (!tratamientos[key]) {
+        tratamientos[key] = { nombre: key, agendas: [] };
+      }
+      tratamientos[key].agendas.push({
+        sede: agenda.sede,
+        tipo: agenda.tipo,
+        uuid: agenda.uuid,
+        tratamiento_raw: t
+      });
+    }
+  }
+  res.json({ ok: true, total: Object.keys(tratamientos).length, tratamientos: Object.values(tratamientos) });
+});
 
 // ============================================
 // START
