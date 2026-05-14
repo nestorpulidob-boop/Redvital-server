@@ -2155,7 +2155,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.28",
+    servidor: "Redvital Backend v5.29",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2382,7 +2382,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.28 - Bot WhatsApp + Claude + Catálogo + Function Calling",
+    servidor: "Redvital Backend v5.29 - Bot WhatsApp + Claude + Catálogo + Function Calling",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -3775,8 +3775,59 @@ CASOS ESPECIALES
 - Si el paciente abandona a mitad → no insistas, dejá la conversación abierta.`;
 }
 
+// === HISTORIAL COMPLETO (con bloques de tool) en bot_sesiones ===
+// En vez de solo texto, guardamos el array de mensajes Claude completo (incluye tool_use/tool_result)
+// Así Claude "ve" los UUIDs reales que devolvieron las tools y no los inventa.
+
+async function obtenerSesion(wa_id) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT contexto FROM bot_sesiones WHERE wa_id = $1`,
+      [wa_id]
+    );
+    if (rows.length === 0) return { mensajes: [] };
+    const ctx = rows[0].contexto || {};
+    return { mensajes: Array.isArray(ctx.mensajes) ? ctx.mensajes : [] };
+  } catch (err) {
+    console.error('[bot] obtenerSesion', err.message);
+    return { mensajes: [] };
+  }
+}
+
+async function guardarSesion(wa_id, mensajes) {
+  try {
+    // Limitar el historial a los últimos 30 mensajes para no crecer infinito
+    let recortado = mensajes;
+    if (mensajes.length > 30) {
+      recortado = mensajes.slice(mensajes.length - 30);
+      // Asegurar que no empiece con un tool_result huérfano
+      while (recortado.length > 0 && recortado[0].role === 'user' &&
+             Array.isArray(recortado[0].content) &&
+             recortado[0].content.some(b => b.type === 'tool_result')) {
+        recortado = recortado.slice(1);
+      }
+    }
+    await pool.query(
+      `INSERT INTO bot_sesiones (wa_id, contexto, ultima_actividad)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (wa_id) DO UPDATE SET contexto = $2, ultima_actividad = NOW()`,
+      [wa_id, JSON.stringify({ mensajes: recortado })]
+    );
+  } catch (err) {
+    console.error('[bot] guardarSesion', err.message);
+  }
+}
+
+async function resetSesion(wa_id) {
+  try {
+    await pool.query(`DELETE FROM bot_sesiones WHERE wa_id = $1`, [wa_id]);
+  } catch (err) {
+    console.error('[bot] resetSesion', err.message);
+  }
+}
+
+// Mantenemos obtenerHistorial por compatibilidad (lo usa el endpoint de admin de conversaciones)
 async function obtenerHistorial(wa_id, limit = 10) {
-  // Solo traer texto plano (ignorar mensajes con tool_use/tool_result en formato Claude)
   const { rows } = await pool.query(
     `SELECT direccion, mensaje, timestamp FROM bot_conversaciones
      WHERE wa_id = $1 AND mensaje IS NOT NULL AND mensaje != ''
@@ -3844,20 +3895,22 @@ async function upsertPaciente(wa_id, mensaje, referral) {
 
 // === LOOP CONVERSACIONAL CON TOOL USE ===
 // Toma historial + mensaje nuevo, llama a Claude, ejecuta tools si hace falta, y devuelve respuesta final
-async function procesarConversacionConTools(historialTexto, mensajeUsuario, opciones = {}) {
-  const maxIter = opciones.maxIter || 5;
+async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
+  const maxIter = opciones.maxIter || 6;
   const waId = opciones.waId || null;
   const system = await construirSystemPrompt();
   const toolsLog = [];
 
-  // Mensajes para Claude: empezamos con historial texto + nuevo mensaje user
-  let messages = [...historialTexto, { role: 'user', content: mensajeUsuario }];
+  // Cargar el historial completo de la sesión (incluye bloques tool_use/tool_result)
+  const sesion = await obtenerSesion(waId);
+  let messages = [...sesion.mensajes, { role: 'user', content: mensajeUsuario }];
 
   for (let iter = 0; iter < maxIter; iter++) {
     console.log(`[bot loop] iter ${iter + 1}/${maxIter}`);
     const respuesta = await claudeMessage(messages, system, BOT_TOOLS);
 
     if (respuesta.error) {
+      // No guardamos la sesión si hubo error de Claude (dejamos el estado anterior)
       return {
         ok: false,
         error: respuesta.error,
@@ -3906,7 +3959,6 @@ async function procesarConversacionConTools(historialTexto, mensajeUsuario, opci
                   inp.hora_con_segundos || null
                 ]
               );
-              // Incrementar contador de citas del paciente
               await pool.query(
                 `UPDATE bot_pacientes SET total_citas_agendadas = total_citas_agendadas + 1 WHERE wa_id = $1`,
                 [waId]
@@ -3925,19 +3977,20 @@ async function procesarConversacionConTools(historialTexto, mensajeUsuario, opci
         }
       }
 
-      // Agregar los tool_results como mensaje user
       messages.push({ role: 'user', content: toolResults });
-
-      // Continuar el loop
       continue;
     }
 
-    // end_turn, max_tokens, stop_sequence — extraer texto final y devolverlo
+    // end_turn — extraer texto final
     let textoFinal = '';
     for (const block of content) {
       if (block.type === 'text') textoFinal += block.text;
     }
     if (!textoFinal) textoFinal = 'Disculpá, no entendí. ¿Podés repetir?';
+
+    // Guardar la respuesta del assistant en el historial y persistir la sesión
+    messages.push({ role: 'assistant', content: content });
+    if (waId) await guardarSesion(waId, messages);
 
     return {
       ok: true,
@@ -3948,10 +4001,11 @@ async function procesarConversacionConTools(historialTexto, mensajeUsuario, opci
     };
   }
 
-  // Si llegamos acá, agotamos las iteraciones
+  // Agotamos iteraciones — guardamos igual el estado para no perder contexto
+  if (waId) await guardarSesion(waId, messages);
   return {
     ok: false,
-    texto: 'Disculpá, esta consulta se está complicando. ¿Querés hablar con secretaría?',
+    texto: 'Disculpá, esta consulta se está complicando. ¿Querés que te derive con una secretaria? Podés llamar al centro.',
     tools_log: toolsLog,
     error: 'max_iteraciones'
   };
@@ -3964,14 +4018,8 @@ async function procesarMensajeBot(wa_id, texto, referral) {
   await upsertPaciente(wa_id, texto, referral);
   await guardarMensaje(wa_id, 'in', texto);
 
-  // Historial: últimos 10 mensajes en formato texto plano
-  const historial = await obtenerHistorial(wa_id, 10);
-
-  // Quitamos el último mensaje del historial porque ya lo guardamos y lo vamos a re-agregar manualmente
-  // (obtenerHistorial trae el que acabamos de guardar al final)
-  const historialSinUltimo = historial.slice(0, -1);
-
-  const resultado = await procesarConversacionConTools(historialSinUltimo, texto || '(mensaje sin texto)', { waId: wa_id });
+  // El historial ahora lo maneja la sesión (bot_sesiones) dentro de procesarConversacionConTools
+  const resultado = await procesarConversacionConTools(texto || '(mensaje sin texto)', { waId: wa_id });
 
   // Enviar respuesta por WhatsApp
   await whatsappEnviarTexto(wa_id, resultado.texto);
@@ -3989,19 +4037,17 @@ app.post('/api/bot/chat-test', async (req, res) => {
       return res.status(400).json({ ok: false, error: "Faltan wa_id y mensaje" });
     }
 
-    // Si reset=true, borrar historial previo de ese wa_id de test
+    // Si reset=true, borrar historial previo de ese wa_id de test (incluida la sesión)
     if (reset) {
       await pool.query(`DELETE FROM bot_conversaciones WHERE wa_id = $1`, [wa_id]);
       await pool.query(`DELETE FROM bot_pacientes WHERE wa_id = $1`, [wa_id]);
+      await resetSesion(wa_id);
     }
 
     await upsertPaciente(wa_id, mensaje, null);
     await guardarMensaje(wa_id, 'in', mensaje);
 
-    const historial = await obtenerHistorial(wa_id, 10);
-    const historialSinUltimo = historial.slice(0, -1);
-
-    const resultado = await procesarConversacionConTools(historialSinUltimo, mensaje, { waId: wa_id });
+    const resultado = await procesarConversacionConTools(mensaje, { waId: wa_id });
 
     await guardarMensaje(wa_id, 'out', resultado.texto, {
       datos: { tools_log: resultado.tools_log, iteraciones: resultado.iteraciones, modo: 'chat-test' }
@@ -4013,8 +4059,7 @@ app.post('/api/bot/chat-test', async (req, res) => {
       mensaje_usuario: mensaje,
       respuesta_bot: resultado.texto,
       iteraciones: resultado.iteraciones,
-      tools_usadas: resultado.tools_log.map(t => ({ nombre: t.nombre, input: t.input, output_preview: JSON.stringify(t.output).substring(0, 300) })),
-      historial_completo: historial
+      tools_usadas: resultado.tools_log.map(t => ({ nombre: t.nombre, input: t.input, output_preview: JSON.stringify(t.output).substring(0, 300) }))
     });
   } catch (err) {
     console.error('[chat-test]', err.message);
@@ -4734,7 +4779,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.28 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.29 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
