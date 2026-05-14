@@ -81,6 +81,7 @@ const COSTO_FIJO_DIARIO = 733000;
 const META_DIARIA = 2770000;
 
 const RESERVO_API = "https://reservo.cl/APIpublica/v2";
+const RESERVO_BASE = "https://reservo.cl";  // makereserva cuelga del dominio raíz, NO de /APIpublica/v2
 const RESERVO_AUTH = (token) => `Token ${token}`;
 const WEBHOOK_UUIDS = {
   sede1: process.env.WEBHOOK_UUID_SEDE1 || "db625bcc-b469-4637-be0e-24cb00eb3826",
@@ -2154,7 +2155,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.27",
+    servidor: "Redvital Backend v5.28",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2381,7 +2382,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.27 - Bot WhatsApp + Claude + Catálogo + Function Calling",
+    servidor: "Redvital Backend v5.28 - Bot WhatsApp + Claude + Catálogo + Function Calling",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -2912,7 +2913,7 @@ async function reservoProximaHora(uuid, token, params) {
 // Body: { rut }. Respuestas: {existe:1, paciente:uuid, datos_faltantes} | {existe:0} | {marcado:1}
 async function reservoVerificarPaciente(token, rut) {
   try {
-    const r = await axios.post(`${RESERVO_API}/makereserva/existencia_rut_api/`,
+    const r = await axios.post(`${RESERVO_BASE}/makereserva/existencia_rut_api/`,
       { rut: rut },
       {
         headers: { Authorization: RESERVO_AUTH(token), 'Content-Type': 'application/json' },
@@ -2935,7 +2936,7 @@ async function reservoVerificarPaciente(token, rut) {
 // Respuesta inválida: status_code 400 + {status:-1, error:{}}
 async function reservoCrearReserva(token, body) {
   try {
-    const r = await axios.post(`${RESERVO_API}/makereserva/confirmApptAPI/`, body, {
+    const r = await axios.post(`${RESERVO_BASE}/makereserva/confirmApptAPI/`, body, {
       headers: { Authorization: RESERVO_AUTH(token), 'Content-Type': 'application/json' },
       timeout: 30000,
       validateStatus: () => true
@@ -3679,7 +3680,9 @@ REGLAS ESTRICTAS — SEGUIRLAS SIEMPRE
 
 **7. CANCELAR/REAGENDAR = derivar.** "Para cancelar o cambiar una cita existente necesitás llamar al centro, ahí te atiende una secretaria."
 
-**8. MANTENÉ CONTEXTO.** Si en mensajes anteriores se identificó un tratamiento y se buscaron horarios, NO vuelvas a buscar_tratamientos cuando el paciente diga una hora ("16:30") o un día ("lunes"). Usá el contexto que ya tenés.
+**8. MANTENÉ CONTEXTO — REGLA CRÍTICA.** buscar_tratamientos se llama UNA SOLA VEZ por servicio, al principio. Una vez que tenés el uuid_tratamiento y las agendas, NO la vuelvas a llamar NUNCA en esa conversación. Cuando el paciente dice un día ("lunes"), una hora ("16:15"), o su RUT, vos YA TENÉS toda la info del tratamiento guardada del primer mensaje. NO la busques de nuevo. Si te encontrás llamando buscar_tratamientos por segunda vez, estás haciendo algo mal — usá lo que ya tenés en el historial de la conversación.
+
+**9. GUARDÁ Y REUSÁ LOS UUIDs.** Cuando consultar_disponibilidad te devuelve un horario, ese horario trae: uuid_profesional, sucursal_uuid, fecha, hora_con_segundos, time_zone. Cuando el paciente elige una hora, RECORDÁ esos datos exactos del horario elegido. Los vas a pasar tal cual a verificar_paciente_rut (el uuid_agenda) y a crear_reserva (todos). NO inventes UUIDs nunca.
 
 ═══════════════════════════════════════════
 FLUJO DE AGENDAMIENTO (seguilo en este orden)
@@ -4731,7 +4734,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.27 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.28 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
