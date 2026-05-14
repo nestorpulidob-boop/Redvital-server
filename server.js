@@ -1,3 +1,7 @@
+// ============================================
+// REDVITAL BACKEND v5.18
+// Bot WhatsApp + Claude + Reservo Agendamiento
+// ============================================
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
@@ -30,14 +34,16 @@ const SEDES = {
   sede1: {
     nombre: "RedVital Sede Maturana",
     sucursal: "RedVital Sede Maturana",
+    direccion: "Maturana 293, Villa Alemana",
     token: process.env.TOKEN_SEDE1,
-    box: 7
+    box: 2
   },
   sede2: {
     nombre: "Centro Medico Redvital",
     sucursal: "Centro Medico Redvital",
+    direccion: "Victoria 766, Villa Alemana",
     token: process.env.TOKEN_SEDE2,
-    box: 5
+    box: 6
   }
 };
 
@@ -64,7 +70,6 @@ const ESTADOS = {
   LISTA_ESPERA: ["Lista de Espera"]
 };
 
-// Estados de venta validos (excluye Eliminada)
 const ESTADOS_VENTA_VALIDA = ["Realizada", "Modificada"];
 
 function inList(arr) {
@@ -75,39 +80,24 @@ const TICKET_PROMEDIO = 30000;
 const COSTO_FIJO_DIARIO = 733000;
 const META_DIARIA = 2770000;
 
-// API de Reservo (para listar/validar webhooks)
-// IMPORTANTE: Reservo usa "Token", NO "Bearer"
 const RESERVO_API = "https://reservo.cl/APIpublica/v2";
 const RESERVO_AUTH = (token) => `Token ${token}`;
 const WEBHOOK_UUIDS = {
   sede1: process.env.WEBHOOK_UUID_SEDE1 || "db625bcc-b469-4637-be0e-24cb00eb3826",
   sede2: process.env.WEBHOOK_UUID_SEDE2 || "d6993f4e-a5e8-4c89-92e4-85826858da11"
 };
-// Mapeo de TODOS los UUIDs de webhooks conocidos a su sede
-// Usado en /webhook/reservo para identificar de que sede viene cada notificacion
 const WEBHOOK_TO_SEDE = {
-  // Sede1 (RedVital Sede Maturana)
   "db625bcc-b469-4637-be0e-24cb00eb3826": "sede1",
   "7854ea21-206d-45e6-b164-7171ed8b2ea6": "sede1",
   "608efcc9-234b-46b5-a916-2e594de6b9b3": "sede1",
-  // Sede2 (Centro Medico Redvital)
   "d6993f4e-a5e8-4c89-92e4-85826858da11": "sede2",
   "6598f956-dc73-4418-8d88-20cb7d1e4de9": "sede2",
   "a5299762-f11e-4c62-b997-ef1b1ad63988": "sede2"
 };
 
-// Costos fijos mensuales (para calculo de utilidad)
 const COSTO_FIJO_MENSUAL = 20637600;
-//   - Creditos: 9.600.000
-//   - Arriendo (133 UF * 40.200): 5.346.600
-//   - Personal/secretarias: 4.691.000
-//   - Variables (agua/luz/internet): 1.000.000
-
-// % que se queda Redvital (fijo, global) - 47% del bruto despues de pagar a TODOS
 const PCT_REDVITAL_GLOBAL = 0.47;
 
-// Heuristica para clasificar productos en categorias (servicios)
-// Cada categoria es {nombre, regex} - se evalua en orden, primer match gana
 const CATEGORIAS_SERVICIO = [
   { nombre: 'Endoscopia',       regex: /(ENDOSCO|COLONOSCOP|GASTROSCOP)/i },
   { nombre: 'Ecografia',        regex: /(ECOGRAF|ECO ABDOM|ECO MAMA|ECO PELV|ECOTOMOGR|SONOC)/i },
@@ -127,10 +117,8 @@ const CATEGORIAS_SERVICIO = [
   { nombre: 'Test medicos',     regex: /(TEST DE|MONITOREO|EXAMEN)/i },
   { nombre: 'Consulta',         regex: /(CONSULTA|CONTROL|EVALUACION)/i }
 ];
-// Para SQL: regex unica para detectar "examenes" (todo lo que NO sea Consulta)
 const EXAMENES_REGEX = `(RADIOGRAF|ECOGRAF|ENDOSCO|COLONOSCOP|GASTROSCOP|ESPIROMETR|HOLTER|ECOCARDIOG|EXAMEN|LABORATORIO|RX |RAYOS|TOMOGRAF|RESONANC|MAMOGRAF|DENSITOMETR|TEST DE|AUDIOMETR|ELECTROCARDIO|EEG|MONITOREO|SONOC|BIOPSI)`;
 
-// Helper JS para clasificar un texto en una categoria
 function clasificarCategoria(texto) {
   if (!texto) return 'Sin categoria';
   for (const cat of CATEGORIAS_SERVICIO) {
@@ -140,7 +128,7 @@ function clasificarCategoria(texto) {
 }
 
 // ============================================
-// INICIALIZAR BD - solo indices, no recrea tablas
+// INICIALIZAR BD
 // ============================================
 async function inicializarBD() {
   try {
@@ -151,7 +139,6 @@ async function inicializarBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_id_paciente ON citas(id_paciente)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_tratamiento ON citas(tratamiento)`);
 
-    // Tabla para capturar webhooks crudos (debug + procesamiento posterior)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS webhooks_raw (
         id BIGSERIAL PRIMARY KEY,
@@ -167,12 +154,9 @@ async function inicializarBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_wh_evento ON webhooks_raw(evento)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_wh_procesado ON webhooks_raw(procesado)`);
 
-    // v5.7: agregar columnas uuid para mapeo de webhooks Reservo
     await pool.query(`ALTER TABLE citas ADD COLUMN IF NOT EXISTS uuid_cita TEXT`);
     await pool.query(`ALTER TABLE ventas ADD COLUMN IF NOT EXISTS uuid_venta TEXT`);
     await pool.query(`ALTER TABLE webhooks_raw ADD COLUMN IF NOT EXISTS uuid_evento TEXT`);
-    // v5.7.1: drop indices parciales viejos (no funcionan con ON CONFLICT) y recrear completos
-    // PostgreSQL permite multiples NULL en UNIQUE indexes - los trata como distintos
     await pool.query(`DROP INDEX IF EXISTS idx_citas_uuid`);
     await pool.query(`DROP INDEX IF EXISTS idx_ventas_uuid`);
     await pool.query(`DROP INDEX IF EXISTS idx_wh_uuid_evento`);
@@ -180,7 +164,6 @@ async function inicializarBD() {
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_ventas_uuid ON ventas(uuid_venta)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_wh_uuid_evento ON webhooks_raw(uuid_evento)`);
 
-    // v5.9: Tabla de campanias de marketing
     await pool.query(`
       CREATE TABLE IF NOT EXISTS campanias_marketing (
         id BIGSERIAL PRIMARY KEY,
@@ -194,20 +177,18 @@ async function inicializarBD() {
       )
     `);
 
-    // Tabla v5.16: KPIs detallados de Ads (Google, Meta, etc)
-    // Cada fila es una "snapshot" en un momento dado de una campana
     await pool.query(`
       CREATE TABLE IF NOT EXISTS ads_kpis (
         id BIGSERIAL PRIMARY KEY,
-        plataforma TEXT NOT NULL,           -- 'google_ads', 'meta_ads', 'tiktok', etc
+        plataforma TEXT NOT NULL,
         campania_nombre TEXT NOT NULL,
-        campania_id TEXT,                    -- ID externo (Google Ads campaign ID, etc)
-        estado TEXT,                         -- 'activa', 'pausada', 'eliminada'
-        fecha_desde DATE NOT NULL,           -- inicio del periodo medido
-        fecha_hasta DATE NOT NULL,           -- fin del periodo medido
+        campania_id TEXT,
+        estado TEXT,
+        fecha_desde DATE NOT NULL,
+        fecha_hasta DATE NOT NULL,
         impresiones BIGINT DEFAULT 0,
         clicks BIGINT DEFAULT 0,
-        ctr_pct NUMERIC(6,2),                -- porcentaje
+        ctr_pct NUMERIC(6,2),
         cpc_promedio NUMERIC(10,2),
         costo BIGINT DEFAULT 0,
         conversiones NUMERIC(10,2) DEFAULT 0,
@@ -219,7 +200,6 @@ async function inicializarBD() {
         actualizada_en TIMESTAMPTZ DEFAULT NOW()
       )
     `);
-    // Indices para queries comunes
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_plataforma ON ads_kpis(plataforma)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_fecha ON ads_kpis(fecha_hasta DESC)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_campania ON ads_kpis(campania_nombre)`);
@@ -230,7 +210,6 @@ async function inicializarBD() {
   }
 }
 
-// Guardar webhook crudo en BD con dedupe por uuid_evento (Reservo puede mandar duplicados)
 async function guardarWebhookRaw(sedeKey, evento, uuid_evento, payload) {
   try {
     const r = await pool.query(
@@ -240,23 +219,16 @@ async function guardarWebhookRaw(sedeKey, evento, uuid_evento, payload) {
        RETURNING id`,
       [sedeKey, evento, uuid_evento || null, JSON.stringify(payload || {})]
     );
-    return r.rows[0] ? r.rows[0].id : null; // null si fue duplicado
+    return r.rows[0] ? r.rows[0].id : null;
   } catch (err) {
     console.error(`Error guardando webhook crudo:`, err.message);
     return null;
   }
 }
 
-// =================================================
-// MAPEO Reservo -> tabla citas (v5.7)
-// =================================================
-
-// Genera un id BIGINT deterministico desde el uuid (para satisfacer PK NOT NULL)
-// Range: 10^17 a 1.72*10^17 - NO choca con ids reales de Reservo (~10^8)
 function uuidToBigint(uuid) {
   if (!uuid) return null;
   const hash = crypto.createHash('sha256').update(String(uuid)).digest('hex');
-  // 14 hex chars = 56 bits + offset 10^17
   return (BigInt('0x' + hash.substring(0, 14)) + BigInt('100000000000000000')).toString();
 }
 
@@ -272,11 +244,8 @@ function mapearCitaReservo(payload) {
   const agenda = datos.agenda || {};
   const tratamiento = (datos.tratamientos && datos.tratamientos[0]) || {};
 
-  // Extraer fecha y horas del campo "inicio" (formato: 2026-05-06T19:00:00Z)
   const inicio = datos.inicio ? new Date(datos.inicio) : null;
   const fin = datos.fin ? new Date(datos.fin) : null;
-  // Convertir a hora local Chile (America/Santiago = UTC-4 generalmente)
-  // Para simplificar, restamos 4 horas (Chile horario invierno) - puede haber +/- 1 segun DST
   const inicioCL = inicio ? new Date(inicio.getTime() - 4 * 3600000) : null;
   const finCL = fin ? new Date(fin.getTime() - 4 * 3600000) : null;
 
@@ -315,17 +284,12 @@ function mapearCitaReservo(payload) {
   };
 }
 
-// =================================================
-// MAPEO Reservo -> tabla ventas (v5.7)
-// =================================================
 function mapearVentaReservo(payload) {
   const datos = payload && payload.datos;
   if (!datos || !datos.uuid) return null;
 
   const items = datos.items || [];
   const productos = items.map(it => it.item ? it.item.nombre : '').filter(Boolean).join(' + ');
-
-  // Profesional: buscar en meta_data del primer item
   const itemConProf = items.find(it => it.meta_data && it.meta_data.profesional_comision);
   const profesionalAtencion = itemConProf ? itemConProf.meta_data.profesional_comision.nombre : null;
 
@@ -333,7 +297,6 @@ function mapearVentaReservo(payload) {
   const partesNom = [receptor.nombre, receptor.apellido_paterno, receptor.apellido_materno].filter(Boolean);
   const nombreDemandante = partesNom.join(' ').trim() || null;
 
-  // Distribuir pagos por tipo (codigos: Efec, Tcre, Tdeb, Trans, Cheque, etc)
   let efectivo = 0, tarjetaCredito = 0, tarjetaDebito = 0, transferencia = 0, cheque = 0;
   (datos.pagos || []).forEach(p => {
     const tipo = p.meta_data && p.meta_data.tipo_pago ? (p.meta_data.tipo_pago.codigo || '') : '';
@@ -374,13 +337,11 @@ function mapearVentaReservo(payload) {
   };
 }
 
-// UPSERT cita por uuid_cita
 async function guardarCitaReservo(payload) {
   const fila = mapearCitaReservo(payload);
   if (!fila) throw new Error("payload de cita sin uuid o datos");
   const cols = Object.keys(fila);
   const placeholders = cols.map((_, i) => `$${i+1}`).join(', ');
-  // No actualizar id_cita ni uuid_cita en UPDATE (son immutable)
   const updateClause = cols.filter(c => c !== 'uuid_cita' && c !== 'id_cita').map(c => `${c} = EXCLUDED.${c}`).join(', ');
   const sql = `INSERT INTO citas (${cols.join(', ')}) VALUES (${placeholders})
                ON CONFLICT (uuid_cita) DO UPDATE SET ${updateClause}
@@ -390,7 +351,6 @@ async function guardarCitaReservo(payload) {
   return rows[0];
 }
 
-// UPSERT venta por uuid_venta
 async function guardarVentaReservo(payload) {
   const fila = mapearVentaReservo(payload);
   if (!fila) throw new Error("payload de venta sin uuid o datos");
@@ -405,7 +365,6 @@ async function guardarVentaReservo(payload) {
   return rows[0];
 }
 
-// Manejador unificado: guarda raw + procesa segun evento
 async function manejarWebhook(sedeKey, body) {
   const evento = body && body.evento;
   const uuid_evento = body && body.uuid_evento;
@@ -417,14 +376,12 @@ async function manejarWebhook(sedeKey, body) {
 
   console.log(`[webhook ${sedeKey}] ${evento || "?"} uuid_evento=${uuid_evento || "?"}`);
 
-  // 1. Guardar payload completo (con dedupe por uuid_evento)
   const rawId = await guardarWebhookRaw(sedeKey, evento, uuid_evento, body);
   if (!rawId) {
     console.log(`[webhook ${sedeKey}] duplicado uuid_evento=${uuid_evento}, omitido`);
     return;
   }
 
-  // 2. Procesar segun tipo de evento
   let procesado = false;
   let errorMsg = null;
   try {
@@ -437,28 +394,22 @@ async function manejarWebhook(sedeKey, body) {
       console.log(`[webhook ${sedeKey}] venta upsert OK uuid=${r && r.uuid_venta}`);
       procesado = true;
     } else {
-      // pacientes y otros: solo guardar raw, no procesar
-      procesado = true; // marcar como procesado (intencionalmente ignorado)
+      procesado = true;
     }
   } catch (err) {
     errorMsg = err.message;
     console.error(`[webhook ${sedeKey}] Error procesando ${evento}:`, err.message);
   }
 
-  // 3. Marcar resultado en webhooks_raw
   await pool.query(
     `UPDATE webhooks_raw SET procesado = $1, error = $2 WHERE id = $3`,
     [procesado, errorMsg, rawId]
   ).catch(e => console.error("Error actualizando webhooks_raw:", e.message));
 }
 
-// Wrappers legacy (no se usan pero quedan por compatibilidad)
 async function guardarCita(sedeKey, datos) { console.log(`[legacy] guardarCita ${sedeKey}`); }
 async function guardarVenta(sedeKey, datos) { console.log(`[legacy] guardarVenta ${sedeKey}`); }
 
-// ============================================
-// HELPERS
-// ============================================
 function parseRango(req) {
   const hoy = new Date();
   const hace90 = new Date(hoy.getTime() - 90 * 86400000);
@@ -502,7 +453,6 @@ async function metricaKpis({ desde, hasta, sede, sucursal }) {
   const pctAtencion = total > 0 ? +(100 * r.atendidas / total).toFixed(2) : 0;
   const ingresosEstimados = r.atendidas * TICKET_PROMEDIO;
 
-  // Ingresos reales: solo ventas no eliminadas
   let ingresosReales = 0, numVentas = 0, ticketRealPromedio = 0;
   try {
     const v = await pool.query(
@@ -545,9 +495,6 @@ async function metricaKpis({ desde, hasta, sede, sucursal }) {
   };
 }
 
-// ============================================
-// METRICA 2: NO-SHOW POR PROFESIONAL
-// ============================================
 async function metricaNoShowProfesional({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
@@ -568,9 +515,6 @@ async function metricaNoShowProfesional({ desde, hasta, sucursal }) {
   return rows;
 }
 
-// ============================================
-// METRICA 3: PACIENTES CON MAS NO-SHOW
-// ============================================
 async function metricaPacientesNoShow({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
@@ -593,9 +537,6 @@ async function metricaPacientesNoShow({ desde, hasta, sucursal }) {
   return rows;
 }
 
-// ============================================
-// METRICA 4: PACIENTES CON MAS SUSPENSIONES
-// ============================================
 async function metricaPacientesSuspension({ desde, hasta, sucursal }) {
   const susp = ESTADOS.SUSPENDIDA.concat(ESTADOS.CANCELADA);
   const sql = `
@@ -618,434 +559,7 @@ async function metricaPacientesSuspension({ desde, hasta, sucursal }) {
   return rows;
 }
 
-// ============================================
-// METRICA 5: TOP PROFESIONALES (con ingresos REALES de ventas)
-// ============================================
-// ============================================
-// METRICA 22: ALERTAS INTELIGENTES (motor de recomendaciones)
-// Detecta automaticamente: caidas, oportunidades, NS alto, ticket alto ocioso
-// ============================================
-async function metricaAlertas({ desde, hasta, sucursal }) {
-  const alertas = [];
-
-  // Calcular periodo anterior del mismo tamaño
-  const d1 = new Date(desde);
-  const d2 = new Date(hasta);
-  const diasPeriodo = Math.round((d2 - d1) / 86400000) + 1;
-  const desdeAnterior = new Date(d1);
-  desdeAnterior.setDate(desdeAnterior.getDate() - diasPeriodo);
-  const hastaAnterior = new Date(d1);
-  hastaAnterior.setDate(hastaAnterior.getDate() - 1);
-  const desdeA = desdeAnterior.toISOString().split('T')[0];
-  const hastaA = hastaAnterior.toISOString().split('T')[0];
-
-  // ====== ALERTA 1 y 2: CAIDA / CRECIMIENTO POR ESPECIALIDAD ======
-  const sqlEspec = `
-    WITH actual AS (
-      SELECT tratamiento, COUNT(*)::int AS n
-      FROM citas
-      WHERE fecha BETWEEN $1::date AND $2::date
-        AND ($3::text IS NULL OR sucursal = $3)
-        AND tratamiento IS NOT NULL
-      GROUP BY tratamiento
-    ),
-    anterior AS (
-      SELECT tratamiento, COUNT(*)::int AS n
-      FROM citas
-      WHERE fecha BETWEEN $4::date AND $5::date
-        AND ($3::text IS NULL OR sucursal = $3)
-        AND tratamiento IS NOT NULL
-      GROUP BY tratamiento
-    )
-    SELECT
-      a.tratamiento,
-      a.n AS n_actual,
-      COALESCE(p.n, 0) AS n_anterior,
-      CASE WHEN p.n > 0 THEN ROUND(100.0 * (a.n - p.n) / p.n, 1)::float ELSE NULL END AS variacion_pct
-    FROM actual a
-    LEFT JOIN anterior p ON p.tratamiento = a.tratamiento
-    WHERE a.n >= 5  -- minimo 5 citas para no alertar sobre ruido
-    ORDER BY n_actual DESC
-  `;
-  const { rows: especialidades } = await pool.query(sqlEspec, [desde, hasta, sucursal, desdeA, hastaA]);
-
-  for (const esp of especialidades) {
-    const v = esp.variacion_pct;
-    if (v === null || v === undefined) continue;
-    const ticketEstim = TICKET_PROMEDIO;
-    const perdidaPotencial = Math.abs(esp.n_anterior - esp.n_actual) * ticketEstim;
-
-    if (v <= -20 && esp.n_anterior >= 10) {
-      alertas.push({
-        tipo: 'caida_fuerte',
-        prioridad: 1,
-        icono: '🚨',
-        titulo: `${esp.tratamiento} cayó ${Math.abs(v)}%`,
-        diagnostico: `Pasó de ${esp.n_anterior} a ${esp.n_actual} citas. Perdiste ~$${(perdidaPotencial/1000000).toFixed(1)}M en ingresos potenciales.`,
-        sugerencia: `URGENTE: pautar Meta Ads ($60-80k) específico para esta especialidad. Audiencia 35-65 años, 15km de tus sedes. Mensaje: "${esp.tratamiento} disponible esta semana en Redvital".`,
-        retorno_estimado: perdidaPotencial,
-        accion: 'pautar_meta_ads'
-      });
-    } else if (v <= -10 && v > -20 && esp.n_anterior >= 10) {
-      alertas.push({
-        tipo: 'caida_moderada',
-        prioridad: 2,
-        icono: '⚠️',
-        titulo: `${esp.tratamiento} bajó ${Math.abs(v)}%`,
-        diagnostico: `${esp.n_actual} citas vs ${esp.n_anterior} anterior. Tendencia preocupante.`,
-        sugerencia: `Reforzar contenido orgánico en Instagram/Facebook esta semana. Si no mejora en 15 días, pautar $40-60k en Meta Ads.`,
-        retorno_estimado: perdidaPotencial,
-        accion: 'reforzar_organico'
-      });
-    } else if (v >= 25 && esp.n_actual >= 10) {
-      alertas.push({
-        tipo: 'oportunidad',
-        prioridad: 3,
-        icono: '💎',
-        titulo: `${esp.tratamiento} creció +${v}% — momento para escalar`,
-        diagnostico: `Pasó de ${esp.n_anterior} a ${esp.n_actual} citas. Hay demanda real activa.`,
-        sugerencia: `Aprovechá la inercia: pautar $40k en Meta Ads para CAPITALIZAR la tendencia. Es más barato pautar cuando ya hay demanda.`,
-        retorno_estimado: esp.n_actual * ticketEstim * 0.3,
-        accion: 'pautar_meta_ads'
-      });
-    }
-  }
-
-  // ====== ALERTA 3: NS ALTO POR CANAL ======
-  const sqlCanal = `
-    SELECT
-      CASE
-        WHEN origen LIKE 'Agenda Online%' THEN 'Online (web/app)'
-        WHEN origen = 'Backoffice Reservo' THEN 'Telefono/Mostrador'
-        WHEN origen IS NULL OR origen = '' THEN 'Sin registro'
-        ELSE origen
-      END AS canal,
-      COUNT(*)::int AS total,
-      COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS ns,
-      ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)}) / NULLIF(COUNT(*), 0), 1)::float AS pct_ns
-    FROM citas
-    WHERE fecha BETWEEN $1::date AND $2::date
-      AND ($3::text IS NULL OR sucursal = $3)
-    GROUP BY canal
-    HAVING COUNT(*) >= 30
-  `;
-  const { rows: canales } = await pool.query(sqlCanal, [desde, hasta, sucursal]);
-  for (const c of canales) {
-    if (c.pct_ns >= 12) {
-      const perdida = c.ns * TICKET_PROMEDIO;
-      alertas.push({
-        tipo: 'ns_alto_canal',
-        prioridad: 1,
-        icono: '📉',
-        titulo: `Canal "${c.canal}" tiene ${c.pct_ns}% de no-show`,
-        diagnostico: `${c.ns} de ${c.total} pacientes faltaron. Perdiste $${(perdida/1000000).toFixed(1)}M en ese canal.`,
-        sugerencia: c.canal.includes('Online')
-          ? `Activar confirmaciones WhatsApp 24h antes para citas online (mayor compromiso). Esperás bajar NS de ${c.pct_ns}% a ~7%.`
-          : `Llamada de confirmación 24h antes a citas de este canal.`,
-        retorno_estimado: perdida * 0.5,
-        accion: 'activar_confirmaciones'
-      });
-    }
-  }
-
-  // ====== ALERTA 4: CAPACIDAD OCIOSA SIGNIFICATIVA ======
-  const cap = await metricaCapacidad({ desde, hasta, sucursal });
-  if (cap.total.pct_uso_real < 30 && cap.total.cupos_capacidad > 100) {
-    alertas.push({
-      tipo: 'capacidad_ociosa',
-      prioridad: 2,
-      icono: '🪑',
-      titulo: `Solo ${cap.total.pct_uso_real}% de uso real de infraestructura`,
-      diagnostico: `${cap.total.cupos_vacios} cupos vacíos en el período. Lucro cesante: $${(cap.total.lucro_cesante_vacios/1000000).toFixed(1)}M.`,
-      sugerencia: `Llenar agenda es más rentable que captar nuevos. Reactivá a pacientes que vinieron 2-6 meses atrás con campaña WhatsApp recordatoria.`,
-      retorno_estimado: cap.total.lucro_cesante_vacios * 0.2,
-      accion: 'reactivar_pacientes'
-    });
-  }
-
-  // ====== ALERTA 5: TICKET ALTO CON BAJA PROGRAMACION ======
-  // Especialidades con valor alto pero pocas citas
-  const sqlValor = `
-    SELECT productos_venta, profesional_atencion,
-           COUNT(*)::int AS num,
-           AVG(valor_pagado)::bigint AS ticket_promedio,
-           SUM(valor_pagado)::bigint AS ingresos
-    FROM ventas
-    WHERE fecha BETWEEN $1::date AND $2::date
-      AND ($3::text IS NULL OR sucursal = $3)
-      AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
-      AND valor_pagado >= 80000
-    GROUP BY productos_venta, profesional_atencion
-    HAVING COUNT(*) >= 3
-    ORDER BY ticket_promedio DESC
-    LIMIT 10
-  `;
-  const { rows: ticketAlto } = await pool.query(sqlValor, [desde, hasta, sucursal]);
-  if (ticketAlto.length > 0) {
-    const top = ticketAlto[0];
-    alertas.push({
-      tipo: 'ticket_alto_ocioso',
-      prioridad: 3,
-      icono: '💎',
-      titulo: `${top.productos_venta} factura $${(Number(top.ticket_promedio)/1000).toFixed(0)}k por procedimiento`,
-      diagnostico: `Solo ${top.num} procedimientos en el período. Ticket alto = mucho margen por paciente nuevo.`,
-      sugerencia: `Pautá Meta Ads específico para "${top.productos_venta}" con $50-80k. Cada paciente nuevo te deja ~$${Math.round(Number(top.ticket_promedio) * 0.47 / 1000)}k de margen.`,
-      retorno_estimado: Number(top.ticket_promedio) * 0.47 * 5,
-      accion: 'pautar_meta_ads'
-    });
-  }
-
-  // ====== ALERTA 6: SEDE SUBUTILIZADA ======
-  for (const sede of cap.por_sede) {
-    if (sede.pct_uso_real < 20 && sede.cupos_capacidad > 100) {
-      alertas.push({
-        tipo: 'sede_subutilizada',
-        prioridad: 2,
-        icono: '🏥',
-        titulo: `${sede.sucursal} solo al ${sede.pct_uso_real}% de uso`,
-        diagnostico: `${sede.cupos_vacios} cupos vacíos = $${(sede.lucro_cesante_vacios/1000000).toFixed(1)}M sin facturar.`,
-        sugerencia: `Política de derivación: cuando otra sede esté llena, secretaria debe ofrecer ${sede.sucursal} primero.`,
-        retorno_estimado: sede.lucro_cesante_vacios * 0.15,
-        accion: 'derivar_pacientes'
-      });
-    }
-  }
-
-  // ====== ALERTA 7 (NUEVA v5.15): GAP CONTRA TARIFA OFICIAL ======
-  // Detecta profesionales que cobran consistentemente menos que su tarifa Fonasa
-  try {
-    const sqlGap = `
-      WITH ventas_consulta AS (
-        SELECT
-          v.profesional_atencion AS profesional,
-          v.valor_pagado,
-          COUNT(*) OVER (PARTITION BY v.profesional_atencion) AS total_ventas
-        FROM ventas v
-        WHERE v.fecha BETWEEN $1::date AND $2::date
-          AND v.estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
-          AND ($3::text IS NULL OR v.sucursal = $3)
-          AND v.profesional_atencion IS NOT NULL
-      ),
-      profesionales_gap AS (
-        SELECT
-          vc.profesional,
-          COUNT(*)::int AS total_ventas,
-          MAX(vc.total_ventas)::int AS n_ventas,
-          (SELECT MIN(monto) FROM tarifas_oficiales t
-           WHERE t.profesional = vc.profesional AND t.categoria = 'Consulta') AS tarifa_minima,
-          COUNT(*) FILTER (
-            WHERE vc.valor_pagado < (
-              SELECT MIN(monto) FROM tarifas_oficiales t
-              WHERE t.profesional = vc.profesional AND t.categoria = 'Consulta'
-            )
-          )::int AS ventas_bajo_tarifa,
-          SUM(
-            (SELECT MIN(monto) FROM tarifas_oficiales t
-             WHERE t.profesional = vc.profesional AND t.categoria = 'Consulta')
-            - vc.valor_pagado
-          ) FILTER (
-            WHERE vc.valor_pagado < (
-              SELECT MIN(monto) FROM tarifas_oficiales t
-              WHERE t.profesional = vc.profesional AND t.categoria = 'Consulta'
-            )
-          )::bigint AS gap_total
-        FROM ventas_consulta vc
-        GROUP BY vc.profesional
-        HAVING (SELECT MIN(monto) FROM tarifas_oficiales t
-                WHERE t.profesional = vc.profesional AND t.categoria = 'Consulta') IS NOT NULL
-          AND COUNT(*) >= 5
-      )
-      SELECT * FROM profesionales_gap
-      WHERE ventas_bajo_tarifa >= 3
-        AND gap_total IS NOT NULL
-        AND gap_total > 5000
-      ORDER BY gap_total DESC
-      LIMIT 5
-    `;
-    const { rows: gaps } = await pool.query(sqlGap, [desde, hasta, sucursal]);
-
-    for (const g of gaps) {
-      const gapTotal = Number(g.gap_total || 0);
-      const pctBajo = g.total_ventas > 0 ? Math.round(100 * g.ventas_bajo_tarifa / g.total_ventas) : 0;
-      alertas.push({
-        tipo: 'gap_tarifa',
-        prioridad: 2,
-        icono: '💸',
-        titulo: `${g.profesional} cobra bajo tarifa oficial`,
-        diagnostico: `${g.ventas_bajo_tarifa} de ${g.total_ventas} consultas (${pctBajo}%) cobradas bajo la tarifa Fonasa de $${Number(g.tarifa_minima).toLocaleString('es-CL')}.`,
-        sugerencia: `GAP acumulado: $${gapTotal.toLocaleString('es-CL')}. Revisar con el profesional si son descuentos autorizados o errores de caja.`,
-        retorno_estimado: gapTotal,
-        accion: 'revisar_tarifas'
-      });
-    }
-  } catch (err) {
-    console.error('Error alerta gap_tarifa:', err.message);
-    // Si tabla tarifas_oficiales no existe, ignorar silenciosamente
-  }
-
-  // Ordenar por prioridad (1 = mas urgente)
-  alertas.sort((a, b) => a.prioridad - b.prioridad);
-
-  return {
-    total: alertas.length,
-    criticas: alertas.filter(a => a.prioridad === 1).length,
-    importantes: alertas.filter(a => a.prioridad === 2).length,
-    oportunidades: alertas.filter(a => a.prioridad === 3).length,
-    alertas
-  };
-}
-
-
-// Para cada profesional muestra: consultas, ingresos totales, ticket promedio
-// y desglose por especialidad/categoria
-// ============================================
-async function metricaProfesionalDetalle({ desde, hasta, sucursal }) {
-  // METRICA 21 v5.15: PROFESIONAL × ESPECIALIDAD CON TARIFAS OFICIALES
-  // Compara cobrado real vs tarifa oficial (Fonasa/Particular)
-  // Calcula GAP y margen Redvital usando margen_redvital_pct de cada tarifa
-  const sql = `
-    WITH ventas_validas AS (
-      SELECT
-        v.profesional_atencion AS profesional,
-        v.productos_venta,
-        v.valor_pagado,
-        v.sucursal,
-        v.fecha
-      FROM ventas v
-      WHERE v.fecha BETWEEN $1::date AND $2::date
-        AND v.estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
-        AND ($3::text IS NULL OR v.sucursal = $3)
-        AND v.profesional_atencion IS NOT NULL
-    ),
-    -- Asociar cada venta con su tarifa oficial mas cercana
-    ventas_tarifadas AS (
-      SELECT
-        vv.*,
-        -- Buscar tarifa Fonasa del profesional
-        (SELECT monto FROM tarifas_oficiales t
-         WHERE t.profesional = vv.profesional
-           AND t.modalidad = 'fonasa'
-           AND t.categoria = 'Consulta'
-         LIMIT 1) AS tarifa_fonasa,
-        -- Buscar tarifa Particular del profesional
-        (SELECT monto FROM tarifas_oficiales t
-         WHERE t.profesional = vv.profesional
-           AND t.modalidad = 'particular'
-           AND t.categoria = 'Consulta'
-         LIMIT 1) AS tarifa_particular,
-        -- Margen Redvital pct del profesional (28.5 para consultas, NULL si no es consulta)
-        (SELECT margen_redvital_pct FROM tarifas_oficiales t
-         WHERE t.profesional = vv.profesional
-           AND t.categoria = 'Consulta'
-         LIMIT 1) AS margen_pct
-      FROM ventas_validas vv
-    )
-    SELECT
-      profesional,
-      productos_venta,
-      sucursal,
-      COUNT(*)::int AS num_consultas,
-      SUM(valor_pagado)::bigint AS ingresos_total,
-      ROUND(AVG(valor_pagado))::bigint AS ticket_promedio,
-      MIN(valor_pagado)::bigint AS ticket_min,
-      MAX(valor_pagado)::bigint AS ticket_max,
-      COUNT(DISTINCT valor_pagado)::int AS variaciones_precio,
-      MAX(tarifa_fonasa)::bigint AS tarifa_fonasa,
-      MAX(tarifa_particular)::bigint AS tarifa_particular,
-      MAX(margen_pct)::numeric AS margen_pct,
-      -- Contar ventas que matchean Fonasa exacto
-      COUNT(*) FILTER (WHERE valor_pagado = tarifa_fonasa)::int AS num_fonasa,
-      -- Contar ventas que matchean Particular exacto
-      COUNT(*) FILTER (WHERE valor_pagado = tarifa_particular)::int AS num_particular,
-      -- Contar ventas que NO coinciden con ninguna tarifa (gap)
-      COUNT(*) FILTER (
-        WHERE valor_pagado != tarifa_fonasa
-          AND valor_pagado != tarifa_particular
-          AND tarifa_fonasa IS NOT NULL
-      )::int AS num_fuera_tarifa
-    FROM ventas_tarifadas
-    GROUP BY profesional, productos_venta, sucursal
-    ORDER BY ingresos_total DESC
-  `;
-  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
-
-  // Agrupar por profesional (consolidar productos)
-  const profesionales = {};
-  for (const row of rows) {
-    const prof = row.profesional;
-    if (!profesionales[prof]) {
-      profesionales[prof] = {
-        profesional: prof,
-        sucursal: row.sucursal,
-        num_consultas: 0,
-        ingresos_total: 0,
-        num_fonasa: 0,
-        num_particular: 0,
-        num_fuera_tarifa: 0,
-        tarifa_fonasa: row.tarifa_fonasa ? Number(row.tarifa_fonasa) : null,
-        tarifa_particular: row.tarifa_particular ? Number(row.tarifa_particular) : null,
-        margen_pct: row.margen_pct ? Number(row.margen_pct) : 47,  // default 47 si no hay tarifa
-        especialidades: []
-      };
-    }
-    profesionales[prof].num_consultas += Number(row.num_consultas);
-    profesionales[prof].ingresos_total += Number(row.ingresos_total);
-    profesionales[prof].num_fonasa += Number(row.num_fonasa || 0);
-    profesionales[prof].num_particular += Number(row.num_particular || 0);
-    profesionales[prof].num_fuera_tarifa += Number(row.num_fuera_tarifa || 0);
-    profesionales[prof].especialidades.push({
-      producto: row.productos_venta || 'Sin especificar',
-      num_consultas: Number(row.num_consultas),
-      ingresos: Number(row.ingresos_total),
-      ticket_promedio: Number(row.ticket_promedio),
-      ticket_min: Number(row.ticket_min),
-      ticket_max: Number(row.ticket_max),
-      variaciones_precio: Number(row.variaciones_precio)
-    });
-  }
-
-  // Calcular metricas finales por profesional
-  const lista = Object.values(profesionales).map(p => {
-    const ticketPromedio = p.num_consultas > 0 ? Math.round(p.ingresos_total / p.num_consultas) : 0;
-    const margenPct = p.margen_pct || 28.5;
-
-    // Ingreso esperado segun mix de modalidades
-    const ingresoEsperado =
-      p.num_fonasa * (p.tarifa_fonasa || 0) +
-      p.num_particular * (p.tarifa_particular || 0) +
-      // Las "fuera de tarifa" las contamos contra el promedio entre fonasa y particular
-      p.num_fuera_tarifa * ((p.tarifa_fonasa || 0) + (p.tarifa_particular || 0)) / 2;
-
-    const gap = p.ingresos_total - ingresoEsperado;
-
-    return {
-      profesional: p.profesional,
-      sucursal: p.sucursal,
-      num_consultas: p.num_consultas,
-      ingresos_total: p.ingresos_total,
-      ticket_promedio: ticketPromedio,
-      tarifa_fonasa: p.tarifa_fonasa,
-      tarifa_particular: p.tarifa_particular,
-      num_fonasa: p.num_fonasa,
-      num_particular: p.num_particular,
-      num_fuera_tarifa: p.num_fuera_tarifa,
-      ingreso_esperado: Math.round(ingresoEsperado),
-      gap: Math.round(gap),
-      margen_pct: margenPct,
-      margen_redvital: Math.round(p.ingresos_total * margenPct / 100),
-      especialidades: p.especialidades
-    };
-  }).sort((a, b) => b.ingresos_total - a.ingresos_total);
-
-  return {
-    total_profesionales: lista.length,
-    profesionales: lista
-  };
-}
-
-
 async function metricaTopProfesionales({ desde, hasta, sucursal }) {
-  // Une citas con ventas via profesional (best effort, no hay id_cita en ventas)
   const sql = `
     WITH ventas_prof AS (
       SELECT
@@ -1088,9 +602,6 @@ async function metricaTopProfesionales({ desde, hasta, sucursal }) {
   return rows;
 }
 
-// ============================================
-// METRICA 6: EVOLUCION POR ESPECIALIDAD
-// ============================================
 async function metricaEspecialidades({ desde, hasta, sucursal }) {
   const dias = Math.max(1, Math.round((new Date(hasta) - new Date(desde)) / 86400000) + 1);
   const desdeAnt = new Date(new Date(desde).getTime() - dias * 86400000).toISOString().split("T")[0];
@@ -1139,9 +650,6 @@ async function metricaEspecialidades({ desde, hasta, sucursal }) {
   };
 }
 
-// ============================================
-// METRICA 7: OCUPACION POR HORA
-// ============================================
 async function metricaOcupacionHora({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
@@ -1158,9 +666,6 @@ async function metricaOcupacionHora({ desde, hasta, sucursal }) {
   return rows;
 }
 
-// ============================================
-// METRICA 8: OCUPACION POR DIA SEMANA
-// ============================================
 async function metricaOcupacionDiaSemana({ desde, hasta, sucursal }) {
   const nombres = ["Domingo", "Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado"];
   const sql = `
@@ -1177,9 +682,6 @@ async function metricaOcupacionDiaSemana({ desde, hasta, sucursal }) {
   return rows.map(r => ({ ...r, dia: nombres[r.dow] }));
 }
 
-// ============================================
-// METRICA 9: PACIENTES EN RIESGO
-// ============================================
 async function metricaPacientesEnRiesgo(req) {
   const diasUmbral = parseInt(req.query.dias) || 90;
   const sede = req.query.sede || "ambas";
@@ -1228,9 +730,6 @@ async function metricaPacientesEnRiesgo(req) {
   return { dias_umbral: diasUmbral, sede, total: rows.length, pacientes: rows };
 }
 
-// ============================================
-// METRICA 10: POR SEDE (con ingresos reales)
-// ============================================
 async function metricaPorSede({ desde, hasta }) {
   const sqlCitas = `
     SELECT
@@ -1250,7 +749,6 @@ async function metricaPorSede({ desde, hasta }) {
   `;
   const { rows: citas } = await pool.query(sqlCitas, [desde, hasta]);
 
-  // Ingresos reales por sucursal
   const sqlVentas = `
     SELECT
       sucursal,
@@ -1282,9 +780,6 @@ async function metricaPorSede({ desde, hasta }) {
   });
 }
 
-// ============================================
-// METRICA 11: DEMOGRAFIA
-// ============================================
 async function metricaDemografia({ sucursal }) {
   const sql = `
     WITH paciente_demo AS (
@@ -1313,9 +808,6 @@ async function metricaDemografia({ sucursal }) {
   return { total_pacientes: total, distribucion: rows };
 }
 
-// ============================================
-// METRICA 12: PREVISION (con ingresos reales)
-// ============================================
 async function metricaPrevision({ desde, hasta, sucursal }) {
   const sql = `
     WITH citas_prev AS (
@@ -1352,9 +844,6 @@ async function metricaPrevision({ desde, hasta, sucursal }) {
   return rows;
 }
 
-// ============================================
-// METRICA 13: ORIGEN RESERVAS
-// ============================================
 async function metricaOrigenReservas({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
@@ -1375,10 +864,6 @@ async function metricaOrigenReservas({ desde, hasta, sucursal }) {
   return rows;
 }
 
-// ============================================
-// METRICA 17: PACIENTES NUEVOS VS RECURRENTES (marketing)
-// Un paciente "nuevo" es aquel cuya primera cita en TODA la BD esta dentro del periodo
-// ============================================
 async function metricaPacientesNuevos({ desde, hasta, sucursal }) {
   const sql = `
     WITH primera_cita_por_paciente AS (
@@ -1421,9 +906,6 @@ async function metricaPacientesNuevos({ desde, hasta, sucursal }) {
   };
 }
 
-// ============================================
-// METRICA 18: ORIGEN AMPLIADO (con NS y conversion por canal)
-// ============================================
 async function metricaOrigenAmpliado({ desde, hasta, sucursal }) {
   const sql = `
     SELECT
@@ -1450,9 +932,6 @@ async function metricaOrigenAmpliado({ desde, hasta, sucursal }) {
   return rows;
 }
 
-// ============================================
-// METRICA 19: DASHBOARD MARKETING (combinado)
-// ============================================
 async function metricaMarketing({ desde, hasta, sucursal }) {
   const [origen, pacientes, campanias] = await Promise.all([
     metricaOrigenAmpliado({ desde, hasta, sucursal }),
@@ -1462,12 +941,7 @@ async function metricaMarketing({ desde, hasta, sucursal }) {
   return { origen, pacientes, campanias };
 }
 
-// ============================================
-// CAMPANIAS DE MARKETING (registro y costo por paciente)
-// Tabla: campanias_marketing (id, nombre, plataforma, fecha_inicio, fecha_fin, presupuesto, comentario)
-// ============================================
 async function listarCampaniasConCalculo({ desde, hasta }) {
-  // Trae campanias que se solapan con el rango pedido y calcula CPP
   const sql = `
     SELECT
       cm.id, cm.nombre, cm.plataforma, cm.fecha_inicio, cm.fecha_fin,
@@ -1523,34 +997,25 @@ async function listarCampaniasConCalculo({ desde, hasta }) {
       };
     });
   } catch (e) {
-    // Si la tabla no existe aun
     return [];
   }
 }
 
-
-// ============================================
-// CONFIGURACION DE INFRAESTRUCTURA (boxes + horarios)
-// Usado para calcular % uso de capacidad
-// ============================================
 const INFRAESTRUCTURA = {
-  // Centro Medico Redvital (Victoria) - 6 boxes, lun-sab
   'Centro Medico Redvital': {
     boxes: 6,
-    cupos_por_hora: 3, // cupo estandar 20 min
-    horario_lunes_viernes: { inicio: 8, fin: 20 }, // 12 horas
-    horario_sabado: { inicio: 9, fin: 13 }         // 4 horas (9-13)
+    cupos_por_hora: 3,
+    horario_lunes_viernes: { inicio: 8, fin: 20 },
+    horario_sabado: { inicio: 9, fin: 13 }
   },
-  // Maturana - 2 boxes, lun-vie hasta 19h (NO trabaja sabados)
   'RedVital Sede Maturana': {
     boxes: 2,
-    cupos_por_hora: 3, // cupo estandar 20 min
-    horario_lunes_viernes: { inicio: 8, fin: 19 }, // 11 horas
-    horario_sabado: null                            // cerrado
+    cupos_por_hora: 3,
+    horario_lunes_viernes: { inicio: 8, fin: 19 },
+    horario_sabado: null
   }
 };
 
-// Calcula capacidad teorica de una sede en un rango de fechas
 function calcularCapacidadSede(sucursal, desde, hasta) {
   const cfg = INFRAESTRUCTURA[sucursal];
   if (!cfg) return { sucursal, boxes: 0, cupos_capacidad: 0, dias_lv: 0, dias_sab: 0 };
@@ -1580,14 +1045,10 @@ function calcularCapacidadSede(sucursal, desde, hasta) {
   };
 }
 
-// ============================================
-// METRICA 20: USO DE INFRAESTRUCTURA (capacidad vs uso real)
-// ============================================
 async function metricaCapacidad({ desde, hasta, sucursal }) {
   const sedes = sucursal ? [sucursal] : Object.keys(INFRAESTRUCTURA);
   const capacidades = sedes.map(s => calcularCapacidadSede(s, desde, hasta));
 
-  // Cupos programados (excluyendo Eliminado, que liberan cupo)
   const sql = `
     SELECT
       sucursal,
@@ -1653,7 +1114,6 @@ async function metricaCapacidad({ desde, hasta, sucursal }) {
   total.pct_uso_infra = total.cupos_capacidad > 0 ? +(100 * total.cupos_programados / total.cupos_capacidad).toFixed(1) : 0;
   total.pct_uso_real = total.cupos_capacidad > 0 ? +(100 * total.cupos_atendidos / total.cupos_capacidad).toFixed(1) : 0;
 
-  // Top profesionales por uso de cupos
   const sqlProf = `
     SELECT sucursal, profesional,
            COUNT(*)::int AS cupos_programados,
@@ -1679,7 +1139,6 @@ async function metricaCapacidad({ desde, hasta, sucursal }) {
     }))
   };
 }
-
 
 async function metricaSerieTemporal({ desde, hasta, sucursal }) {
   const sql = `
@@ -1718,19 +1177,10 @@ async function metricaSerieTemporal({ desde, hasta, sucursal }) {
   return rows;
 }
 
-// ============================================
-// METRICA 15: COMPARATIVA MENSUAL CON UTILIDAD NETA
-// Mes Redvital = del dia 26 de un mes al 25 del mes siguiente (ambos inclusive)
-// Ej: "Mayo Redvital" = 26 abril -> 25 mayo
-// Margen Redvital = 47% del bruto (despues de pagar a TODOS los profesionales)
-// ============================================
 async function metricaComparativaMensual({ desde, hasta, sucursal }) {
   const sql = `
     WITH ventas_clasificadas AS (
       SELECT
-        -- Asignar a "mes Redvital": si dia >= 26, pertenece al mes siguiente; sino al actual
-        -- Ej: 26 abril -> mes Redvital "mayo" (representado como primer dia: 2026-05-01)
-        --     25 abril -> mes Redvital "abril" (2026-04-01)
         CASE
           WHEN EXTRACT(DAY FROM fecha) >= 26
           THEN DATE_TRUNC('month', fecha + INTERVAL '7 days')::date
@@ -1739,7 +1189,6 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
         valor_pagado,
         productos_venta,
         profesional_atencion,
-        -- Clasificar consulta vs examen (para info, ya no se usa para margen)
         CASE
           WHEN UPPER(COALESCE(productos_venta,'')) ~ '${EXAMENES_REGEX}'
             OR UPPER(COALESCE(profesional_atencion,'')) ~ '${EXAMENES_REGEX}'
@@ -1796,7 +1245,6 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
   `;
   const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
 
-  // Calcular utilidad neta por mes (margen unico 47% global)
   return rows.map(r => {
     const ingresoTotal = Number(r.ingresos_total) || 0;
     const margenBruto = Math.round(ingresoTotal * PCT_REDVITAL_GLOBAL);
@@ -1804,8 +1252,7 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
     const utilidadNeta = margenBruto - COSTO_FIJO_MENSUAL;
     const margenPct = ingresoTotal > 0 ? +(100 * utilidadNeta / ingresoTotal).toFixed(1) : 0;
     const nombresMes = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
-    // Calcular fechas reales del periodo Redvital: dia 26 mes anterior -> dia 25 de este mes
-    const fechaMes = new Date(r.mes); // primer dia del mes "destino"
+    const fechaMes = new Date(r.mes);
     const inicio = new Date(fechaMes.getFullYear(), fechaMes.getMonth() - 1, 26);
     const fin = new Date(fechaMes.getFullYear(), fechaMes.getMonth(), 25);
     return {
@@ -1837,10 +1284,6 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
   });
 }
 
-// ============================================
-// METRICA 16: VENTAS POR CATEGORIA DE SERVICIO
-// Agrupa por categoria detectada de productos_venta
-// ============================================
 async function metricaCategorias({ desde, hasta, sucursal }) {
   const sql = `
     SELECT productos_venta, profesional_atencion,
@@ -1852,7 +1295,6 @@ async function metricaCategorias({ desde, hasta, sucursal }) {
   `;
   const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
 
-  // Clasificar en JS y agrupar por categoria + profesional
   const acumulador = {};
   for (const row of rows) {
     const texto = `${row.productos_venta || ''} ${row.profesional_atencion || ''}`;
@@ -1871,7 +1313,6 @@ async function metricaCategorias({ desde, hasta, sucursal }) {
     acumulador[cat].profesionales[prof].num_ventas++;
     acumulador[cat].profesionales[prof].ingresos += valor;
   }
-  // Convertir a array y ordenar
   const lista = Object.values(acumulador).map(c => ({
     categoria: c.categoria,
     num_ventas: c.num_ventas,
@@ -1884,34 +1325,21 @@ async function metricaCategorias({ desde, hasta, sucursal }) {
   return { total_ingresos: total, categorias: lista };
 }
 
-// ============================================
-// METRICA 16.b (NUEVA v5.16): CATEGORIAS CON COMPARACION MES ANTERIOR
-// Devuelve por categoria: actual + mes anterior (mismo punto) + mes anterior completo + variacion
-// El "mes anterior mismo punto" = mismo numero de dias pero del mes anterior
-// El "mes anterior total" = mes Redvital completo cerrado anterior
-// ============================================
 async function metricaCategoriasComparativa({ desde, hasta, sucursal }) {
-  // Calcular rango actual
   const fechaDesde = new Date(desde);
   const fechaHasta = new Date(hasta);
   const diasActual = Math.round((fechaHasta - fechaDesde) / 86400000) + 1;
 
-  // Rango "mes anterior mismo punto" = mismo numero de dias del mes anterior
   const desdeAnterior = new Date(fechaDesde);
   desdeAnterior.setMonth(desdeAnterior.getMonth() - 1);
   const hastaAnterior = new Date(fechaHasta);
   hastaAnterior.setMonth(hastaAnterior.getMonth() - 1);
 
-  // Rango "mes anterior total" = del dia 26 (2 meses atras) al 25 (mes anterior)
-  // Si fechaDesde es 26-abr-2026, mes anterior total seria 26-mar a 25-abr
   const mesAnteriorTotalDesde = new Date(fechaDesde);
   mesAnteriorTotalDesde.setMonth(mesAnteriorTotalDesde.getMonth() - 1);
-  // mesAnteriorTotalDesde ya esta en dia 26 del mes anterior
   const mesAnteriorTotalHasta = new Date(fechaDesde);
   mesAnteriorTotalHasta.setDate(mesAnteriorTotalHasta.getDate() - 1);
-  // Eso da el dia anterior al fechaDesde, que es dia 25 del mes anterior
 
-  // Helper para hacer query y agrupar
   async function obtenerCategorias(d, h) {
     const sql = `
       SELECT productos_venta, profesional_atencion, valor_pagado
@@ -1935,14 +1363,12 @@ async function metricaCategoriasComparativa({ desde, hasta, sucursal }) {
 
   const fmtDate = d => d.toISOString().split('T')[0];
 
-  // Obtener los 3 periodos
   const [actual, anteriorMismoPunto, anteriorTotal] = await Promise.all([
     obtenerCategorias(fmtDate(fechaDesde), fmtDate(fechaHasta)),
     obtenerCategorias(fmtDate(desdeAnterior), fmtDate(hastaAnterior)),
     obtenerCategorias(fmtDate(mesAnteriorTotalDesde), fmtDate(mesAnteriorTotalHasta))
   ]);
 
-  // Unificar todas las categorias presentes en cualquiera de los 3 periodos
   const todasCategorias = new Set([
     ...Object.keys(actual),
     ...Object.keys(anteriorMismoPunto),
@@ -1955,18 +1381,16 @@ async function metricaCategoriasComparativa({ desde, hasta, sucursal }) {
     const b = anteriorMismoPunto[cat] || { num_ventas: 0, ingresos: 0 };
     const c = anteriorTotal[cat] || { num_ventas: 0, ingresos: 0 };
 
-    // Variacion vs mismo punto del mes pasado (% sobre num_ventas)
     let variacionPct = null;
     if (b.num_ventas > 0) {
       variacionPct = +((a.num_ventas - b.num_ventas) * 100 / b.num_ventas).toFixed(1);
     } else if (a.num_ventas > 0) {
-      variacionPct = 100; // nuevo vs cero
+      variacionPct = 100;
     }
 
-    // Proyeccion fin de mes basado en ritmo actual
     let proyeccionFinMes = a.num_ventas;
     let proyeccionIngresos = a.ingresos;
-    const totalDiasMes = 30; // aprox dias entre 26 y 25 mes siguiente
+    const totalDiasMes = 30;
     if (diasActual > 0 && diasActual < totalDiasMes) {
       proyeccionFinMes = Math.round(a.num_ventas * totalDiasMes / diasActual);
       proyeccionIngresos = Math.round(a.ingresos * totalDiasMes / diasActual);
@@ -1986,7 +1410,6 @@ async function metricaCategoriasComparativa({ desde, hasta, sucursal }) {
     });
   }
 
-  // Ordenar por ingresos actual desc
   lista.sort((a, b) => b.actual_ingresos - a.actual_ingresos);
 
   return {
@@ -1997,13 +1420,135 @@ async function metricaCategoriasComparativa({ desde, hasta, sucursal }) {
   };
 }
 
+async function metricaProfesionalDetalle({ desde, hasta, sucursal }) {
+  const sql = `
+    WITH ventas_validas AS (
+      SELECT
+        v.profesional_atencion AS profesional,
+        v.productos_venta,
+        v.valor_pagado,
+        v.sucursal,
+        v.fecha
+      FROM ventas v
+      WHERE v.fecha BETWEEN $1::date AND $2::date
+        AND v.estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+        AND ($3::text IS NULL OR v.sucursal = $3)
+        AND v.profesional_atencion IS NOT NULL
+    ),
+    ventas_tarifadas AS (
+      SELECT
+        vv.*,
+        (SELECT monto FROM tarifas_oficiales t
+         WHERE t.profesional = vv.profesional
+           AND t.modalidad = 'fonasa'
+           AND t.categoria = 'Consulta'
+         LIMIT 1) AS tarifa_fonasa,
+        (SELECT monto FROM tarifas_oficiales t
+         WHERE t.profesional = vv.profesional
+           AND t.modalidad = 'particular'
+           AND t.categoria = 'Consulta'
+         LIMIT 1) AS tarifa_particular,
+        (SELECT margen_redvital_pct FROM tarifas_oficiales t
+         WHERE t.profesional = vv.profesional
+           AND t.categoria = 'Consulta'
+         LIMIT 1) AS margen_pct
+      FROM ventas_validas vv
+    )
+    SELECT
+      profesional,
+      productos_venta,
+      sucursal,
+      COUNT(*)::int AS num_consultas,
+      SUM(valor_pagado)::bigint AS ingresos_total,
+      ROUND(AVG(valor_pagado))::bigint AS ticket_promedio,
+      MIN(valor_pagado)::bigint AS ticket_min,
+      MAX(valor_pagado)::bigint AS ticket_max,
+      COUNT(DISTINCT valor_pagado)::int AS variaciones_precio,
+      MAX(tarifa_fonasa)::bigint AS tarifa_fonasa,
+      MAX(tarifa_particular)::bigint AS tarifa_particular,
+      MAX(margen_pct)::numeric AS margen_pct,
+      COUNT(*) FILTER (WHERE valor_pagado = tarifa_fonasa)::int AS num_fonasa,
+      COUNT(*) FILTER (WHERE valor_pagado = tarifa_particular)::int AS num_particular,
+      COUNT(*) FILTER (
+        WHERE valor_pagado != tarifa_fonasa
+          AND valor_pagado != tarifa_particular
+          AND tarifa_fonasa IS NOT NULL
+      )::int AS num_fuera_tarifa
+    FROM ventas_tarifadas
+    GROUP BY profesional, productos_venta, sucursal
+    ORDER BY ingresos_total DESC
+  `;
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
 
-// ============================================
-// METRICA 21.b (NUEVA v5.16): PROFESIONAL CON COMPARACION MES ANTERIOR
-// Devuelve por profesional: actual + mes anterior (mismo punto) + mes anterior completo
-// ============================================
+  const profesionales = {};
+  for (const row of rows) {
+    const prof = row.profesional;
+    if (!profesionales[prof]) {
+      profesionales[prof] = {
+        profesional: prof,
+        sucursal: row.sucursal,
+        num_consultas: 0,
+        ingresos_total: 0,
+        num_fonasa: 0,
+        num_particular: 0,
+        num_fuera_tarifa: 0,
+        tarifa_fonasa: row.tarifa_fonasa ? Number(row.tarifa_fonasa) : null,
+        tarifa_particular: row.tarifa_particular ? Number(row.tarifa_particular) : null,
+        margen_pct: row.margen_pct ? Number(row.margen_pct) : 47,
+        especialidades: []
+      };
+    }
+    profesionales[prof].num_consultas += Number(row.num_consultas);
+    profesionales[prof].ingresos_total += Number(row.ingresos_total);
+    profesionales[prof].num_fonasa += Number(row.num_fonasa || 0);
+    profesionales[prof].num_particular += Number(row.num_particular || 0);
+    profesionales[prof].num_fuera_tarifa += Number(row.num_fuera_tarifa || 0);
+    profesionales[prof].especialidades.push({
+      producto: row.productos_venta || 'Sin especificar',
+      num_consultas: Number(row.num_consultas),
+      ingresos: Number(row.ingresos_total),
+      ticket_promedio: Number(row.ticket_promedio),
+      ticket_min: Number(row.ticket_min),
+      ticket_max: Number(row.ticket_max),
+      variaciones_precio: Number(row.variaciones_precio)
+    });
+  }
+
+  const lista = Object.values(profesionales).map(p => {
+    const ticketPromedio = p.num_consultas > 0 ? Math.round(p.ingresos_total / p.num_consultas) : 0;
+    const margenPct = p.margen_pct || 28.5;
+    const ingresoEsperado =
+      p.num_fonasa * (p.tarifa_fonasa || 0) +
+      p.num_particular * (p.tarifa_particular || 0) +
+      p.num_fuera_tarifa * ((p.tarifa_fonasa || 0) + (p.tarifa_particular || 0)) / 2;
+    const gap = p.ingresos_total - ingresoEsperado;
+
+    return {
+      profesional: p.profesional,
+      sucursal: p.sucursal,
+      num_consultas: p.num_consultas,
+      ingresos_total: p.ingresos_total,
+      ticket_promedio: ticketPromedio,
+      tarifa_fonasa: p.tarifa_fonasa,
+      tarifa_particular: p.tarifa_particular,
+      num_fonasa: p.num_fonasa,
+      num_particular: p.num_particular,
+      num_fuera_tarifa: p.num_fuera_tarifa,
+      ingreso_esperado: Math.round(ingresoEsperado),
+      gap: Math.round(gap),
+      margen_pct: margenPct,
+      margen_redvital: Math.round(p.ingresos_total * margenPct / 100),
+      especialidades: p.especialidades
+    };
+  }).sort((a, b) => b.ingresos_total - a.ingresos_total);
+
+  return {
+    total_profesionales: lista.length,
+    profesionales: lista
+  };
+}
+
 async function metricaProfesionalComparativa({ desde, hasta, sucursal }) {
-  // Helper para obtener stats por profesional en un rango
   async function obtenerProfesionales(d, h) {
     const sql = `
       SELECT profesional_atencion AS profesional,
@@ -2027,18 +1572,15 @@ async function metricaProfesionalComparativa({ desde, hasta, sucursal }) {
     return map;
   }
 
-  // Calcular rangos
   const fechaDesde = new Date(desde);
   const fechaHasta = new Date(hasta);
   const diasActual = Math.round((fechaHasta - fechaDesde) / 86400000) + 1;
 
-  // "Mismo punto mes pasado" = mismo numero de dias del mes anterior
   const desdeAnterior = new Date(fechaDesde);
   desdeAnterior.setMonth(desdeAnterior.getMonth() - 1);
   const hastaAnterior = new Date(fechaHasta);
   hastaAnterior.setMonth(hastaAnterior.getMonth() - 1);
 
-  // "Mes anterior total" = del dia 26 (2 meses atras) al 25 (mes anterior)
   const mesAnteriorTotalDesde = new Date(fechaDesde);
   mesAnteriorTotalDesde.setMonth(mesAnteriorTotalDesde.getMonth() - 1);
   const mesAnteriorTotalHasta = new Date(fechaDesde);
@@ -2052,7 +1594,6 @@ async function metricaProfesionalComparativa({ desde, hasta, sucursal }) {
     obtenerProfesionales(fmtDate(mesAnteriorTotalDesde), fmtDate(mesAnteriorTotalHasta))
   ]);
 
-  // Unificar todos los profesionales presentes en cualquiera de los 3 periodos
   const todosProfs = new Set([
     ...Object.keys(actual),
     ...Object.keys(anteriorMP),
@@ -2080,7 +1621,6 @@ async function metricaProfesionalComparativa({ desde, hasta, sucursal }) {
       proyeccionIngresos = Math.round(a.ingresos * totalDiasMes / diasActual);
     }
 
-    // Ticket promedio actual y anterior total
     const ticketActual = a.num_ventas > 0 ? Math.round(a.ingresos / a.num_ventas) : 0;
     const ticketAnteriorTotal = c.num_ventas > 0 ? Math.round(c.ingresos / c.num_ventas) : 0;
 
@@ -2100,7 +1640,6 @@ async function metricaProfesionalComparativa({ desde, hasta, sucursal }) {
     });
   }
 
-  // Ordenar por ingresos actual desc
   lista.sort((a, b) => b.actual_ingresos - a.actual_ingresos);
 
   return {
@@ -2109,6 +1648,99 @@ async function metricaProfesionalComparativa({ desde, hasta, sucursal }) {
   };
 }
 
+async function metricaAlertas({ desde, hasta, sucursal }) {
+  const alertas = [];
+  const d1 = new Date(desde);
+  const d2 = new Date(hasta);
+  const diasPeriodo = Math.round((d2 - d1) / 86400000) + 1;
+  const desdeAnterior = new Date(d1);
+  desdeAnterior.setDate(desdeAnterior.getDate() - diasPeriodo);
+  const hastaAnterior = new Date(d1);
+  hastaAnterior.setDate(hastaAnterior.getDate() - 1);
+  const desdeA = desdeAnterior.toISOString().split('T')[0];
+  const hastaA = hastaAnterior.toISOString().split('T')[0];
+
+  const sqlEspec = `
+    WITH actual AS (
+      SELECT tratamiento, COUNT(*)::int AS n
+      FROM citas
+      WHERE fecha BETWEEN $1::date AND $2::date
+        AND ($3::text IS NULL OR sucursal = $3)
+        AND tratamiento IS NOT NULL
+      GROUP BY tratamiento
+    ),
+    anterior AS (
+      SELECT tratamiento, COUNT(*)::int AS n
+      FROM citas
+      WHERE fecha BETWEEN $4::date AND $5::date
+        AND ($3::text IS NULL OR sucursal = $3)
+        AND tratamiento IS NOT NULL
+      GROUP BY tratamiento
+    )
+    SELECT
+      a.tratamiento,
+      a.n AS n_actual,
+      COALESCE(p.n, 0) AS n_anterior,
+      CASE WHEN p.n > 0 THEN ROUND(100.0 * (a.n - p.n) / p.n, 1)::float ELSE NULL END AS variacion_pct
+    FROM actual a
+    LEFT JOIN anterior p ON p.tratamiento = a.tratamiento
+    WHERE a.n >= 5
+    ORDER BY n_actual DESC
+  `;
+  const { rows: especialidades } = await pool.query(sqlEspec, [desde, hasta, sucursal, desdeA, hastaA]);
+
+  for (const esp of especialidades) {
+    const v = esp.variacion_pct;
+    if (v === null || v === undefined) continue;
+    const ticketEstim = TICKET_PROMEDIO;
+    const perdidaPotencial = Math.abs(esp.n_anterior - esp.n_actual) * ticketEstim;
+
+    if (v <= -20 && esp.n_anterior >= 10) {
+      alertas.push({
+        tipo: 'caida_fuerte',
+        prioridad: 1,
+        icono: '🚨',
+        titulo: `${esp.tratamiento} cayó ${Math.abs(v)}%`,
+        diagnostico: `Pasó de ${esp.n_anterior} a ${esp.n_actual} citas. Perdiste ~$${(perdidaPotencial/1000000).toFixed(1)}M en ingresos potenciales.`,
+        sugerencia: `URGENTE: pautar Meta Ads ($60-80k) específico para esta especialidad. Audiencia 35-65 años, 15km de tus sedes. Mensaje: "${esp.tratamiento} disponible esta semana en Redvital".`,
+        retorno_estimado: perdidaPotencial,
+        accion: 'pautar_meta_ads'
+      });
+    } else if (v <= -10 && v > -20 && esp.n_anterior >= 10) {
+      alertas.push({
+        tipo: 'caida_moderada',
+        prioridad: 2,
+        icono: '⚠️',
+        titulo: `${esp.tratamiento} bajó ${Math.abs(v)}%`,
+        diagnostico: `${esp.n_actual} citas vs ${esp.n_anterior} anterior. Tendencia preocupante.`,
+        sugerencia: `Reforzar contenido orgánico en Instagram/Facebook esta semana. Si no mejora en 15 días, pautar $40-60k en Meta Ads.`,
+        retorno_estimado: perdidaPotencial,
+        accion: 'reforzar_organico'
+      });
+    } else if (v >= 25 && esp.n_actual >= 10) {
+      alertas.push({
+        tipo: 'oportunidad',
+        prioridad: 3,
+        icono: '💎',
+        titulo: `${esp.tratamiento} creció +${v}% — momento para escalar`,
+        diagnostico: `Pasó de ${esp.n_anterior} a ${esp.n_actual} citas. Hay demanda real activa.`,
+        sugerencia: `Aprovechá la inercia: pautar $40k en Meta Ads para CAPITALIZAR la tendencia. Es más barato pautar cuando ya hay demanda.`,
+        retorno_estimado: esp.n_actual * ticketEstim * 0.3,
+        accion: 'pautar_meta_ads'
+      });
+    }
+  }
+
+  alertas.sort((a, b) => a.prioridad - b.prioridad);
+
+  return {
+    total: alertas.length,
+    criticas: alertas.filter(a => a.prioridad === 1).length,
+    importantes: alertas.filter(a => a.prioridad === 2).length,
+    oportunidades: alertas.filter(a => a.prioridad === 3).length,
+    alertas
+  };
+}
 
 function wrap(fn, useReq) {
   return async (req, res) => {
@@ -2147,9 +1779,6 @@ app.get("/api/metricas/alertas", wrap(metricaAlertas));
 app.get("/api/metricas/origen-ampliado", wrap(metricaOrigenAmpliado));
 app.get("/api/metricas/pacientes-nuevos", wrap(metricaPacientesNuevos));
 
-// ============================================
-// CRUD: CAMPAÑAS DE MARKETING
-// ============================================
 app.get("/api/campanias", async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -2191,9 +1820,6 @@ app.delete("/api/campanias/:id", async (req, res) => {
   }
 });
 
-// ============================================
-// CRUD: ADS KPIs (v5.16) - Google Ads, Meta Ads, etc
-// ============================================
 app.get("/api/ads-kpis", async (req, res) => {
   try {
     const { plataforma, desde, hasta } = req.query;
@@ -2223,7 +1849,6 @@ app.post("/api/ads-kpis", async (req, res) => {
     if (!k.plataforma || !k.campania_nombre || !k.fecha_desde || !k.fecha_hasta) {
       return res.status(400).json({ ok: false, error: "Faltan: plataforma, campania_nombre, fecha_desde, fecha_hasta" });
     }
-    // Calcular metricas derivadas si vienen vacias
     const clicks = Number(k.clicks) || 0;
     const impresiones = Number(k.impresiones) || 0;
     const costo = Number(k.costo) || 0;
@@ -2302,11 +1927,9 @@ app.delete("/api/ads-kpis/:id", async (req, res) => {
   }
 });
 
-// Resumen agregado por plataforma para el dashboard
 app.get("/api/ads-resumen", async (req, res) => {
   try {
     const { desde, hasta } = req.query;
-    // Por defecto usar mes Redvital actual
     const hoy = new Date();
     let desdeF = desde, hastaF = hasta;
     if (!desdeF) {
@@ -2317,7 +1940,6 @@ app.get("/api/ads-resumen", async (req, res) => {
     }
     if (!hastaF) hastaF = hoy.toISOString().split('T')[0];
 
-    // Resumen por plataforma (suma de KPIs de cada campania, ultimo snapshot por campania)
     const sql = `
       WITH ultimos_snapshots AS (
         SELECT DISTINCT ON (plataforma, campania_nombre)
@@ -2350,7 +1972,6 @@ app.get("/api/ads-resumen", async (req, res) => {
     `;
     const { rows: plataformas } = await pool.query(sql, [desdeF, hastaF]);
 
-    // Detalle por campania (ultimo snapshot por campania)
     const sqlCampanias = `
       SELECT DISTINCT ON (plataforma, campania_nombre)
         id, plataforma, campania_nombre, campania_id, estado,
@@ -2365,7 +1986,6 @@ app.get("/api/ads-resumen", async (req, res) => {
     `;
     const { rows: campanias } = await pool.query(sqlCampanias, [desdeF, hastaF]);
 
-    // Totales globales
     const totales = {
       costo: plataformas.reduce((s,p)=>s+Number(p.costo_total||0),0),
       clicks: plataformas.reduce((s,p)=>s+Number(p.clicks_total||0),0),
@@ -2395,9 +2015,6 @@ app.get("/api/ads-resumen", async (req, res) => {
   }
 });
 
-// ============================================
-// ENDPOINT MAESTRO
-// ============================================
 app.get("/api/metricas/all", async (req, res) => {
   try {
     const filtros = parseRango(req);
@@ -2446,9 +2063,6 @@ app.get("/api/metricas/all", async (req, res) => {
   }
 });
 
-// ============================================
-// STATUS
-// ============================================
 app.get("/api/webhooks/recientes", async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 20, 100);
@@ -2459,15 +2073,6 @@ app.get("/api/webhooks/recientes", async (req, res) => {
     if (evento) { params.push(evento); where += ` AND evento = $${params.length}`; }
     if (sede) { params.push(sede); where += ` AND sede = $${params.length}`; }
     params.push(limit);
-    const sql = `
-      SELECT id, recibido_en, sede, evento, procesado, error,
-             jsonb_object_keys(payload) AS dummy_keys
-      FROM webhooks_raw
-      WHERE ${where}
-      ORDER BY recibido_en DESC
-      LIMIT $${params.length}
-    `;
-    // Versión sin keys, más simple
     const sql2 = `
       SELECT id, recibido_en, sede, evento, procesado, error,
              (SELECT array_agg(k) FROM jsonb_object_keys(payload) k) AS keys_top,
@@ -2484,7 +2089,6 @@ app.get("/api/webhooks/recientes", async (req, res) => {
       webhooks: rows
     });
   } catch (err) {
-    console.error("Error en /api/webhooks/recientes:", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -2500,7 +2104,7 @@ app.get("/api/webhooks/sample", async (req, res) => {
       [evento]
     );
     if (rows.length === 0) {
-      return res.json({ ok: true, mensaje: `No hay webhooks de tipo "${evento}" todavia. Espera a que pasen citas reales en la clinica.` });
+      return res.json({ ok: true, mensaje: `No hay webhooks de tipo "${evento}" todavia.` });
     }
     res.json({ ok: true, sample: rows[0] });
   } catch (err) {
@@ -2549,7 +2153,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.16",
+    servidor: "Redvital Backend v5.18",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2563,15 +2167,8 @@ app.get("/api/status", async (req, res) => {
   });
 });
 
-// ============================================
-// WEBHOOKS
-// ============================================
-// ============================================
-// WEBHOOKS - responden 200 rápido y procesan en background
-// ============================================
 app.post("/webhook/sede1", async (req, res) => {
   ultimaActualizacion.sede1 = new Date().toISOString();
-  // SIEMPRE responder 200 rápido (Reservo reintenta si no es 200)
   res.status(200).json({ ok: true });
   manejarWebhook("sede1", req.body).catch(err => console.error("Error sede1:", err.message));
 });
@@ -2582,22 +2179,17 @@ app.post("/webhook/sede2", async (req, res) => {
   manejarWebhook("sede2", req.body).catch(err => console.error("Error sede2:", err.message));
 });
 
-// Endpoint generico /webhook/reservo (este es el que apuntan los webhooks reales)
-// Identifica la sede leyendo body.fuente (UUID del webhook) contra WEBHOOK_TO_SEDE
 app.post("/webhook/reservo", async (req, res) => {
-  // SIEMPRE responder 200 rapido, especialmente para health check (ping)
   res.status(200).json({ ok: true });
 
   const fuente = req.body && req.body.fuente;
   const evento = req.body && req.body.evento;
 
-  // Si es ping (health check), responder y NO procesar (no hay 'fuente' en pings)
   if (evento === "ping") {
-    console.log(`[webhook /reservo] PING (health check Reservo) ${new Date().toISOString()}`);
+    console.log(`[webhook /reservo] PING ${new Date().toISOString()}`);
     return;
   }
 
-  // Identificar sede por UUID de fuente
   const sede = WEBHOOK_TO_SEDE[fuente] || "desconocida";
   if (sede === "sede1") ultimaActualizacion.sede1 = new Date().toISOString();
   else if (sede === "sede2") ultimaActualizacion.sede2 = new Date().toISOString();
@@ -2606,9 +2198,6 @@ app.post("/webhook/reservo", async (req, res) => {
   manejarWebhook(sede, req.body).catch(err => console.error(`Error /webhook/reservo (${sede}):`, err.message));
 });
 
-// ============================================
-// ADMIN: Listar webhooks registrados en Reservo
-// ============================================
 app.get("/api/admin/listar-webhooks", async (req, res) => {
   const resultados = {};
   for (const sedeKey of ["sede1", "sede2"]) {
@@ -2628,16 +2217,9 @@ app.get("/api/admin/listar-webhooks", async (req, res) => {
       resultados[sedeKey] = { error: err.message, codigo: err.code };
     }
   }
-  res.json({
-    ok: true,
-    instrucciones: "Aqui se ven los webhooks registrados en Reservo con cada token. Verifica que la 'url' apunte a https://redvital-server.onrender.com/webhook/sede1 (o sede2).",
-    resultados
-  });
+  res.json({ ok: true, resultados });
 });
 
-// ============================================
-// ADMIN: Reprocesar webhooks pendientes (los que llegaron pero no se mapearon)
-// ============================================
 app.get("/api/admin/reprocesar-webhooks", async (req, res) => {
   const { rows } = await pool.query(
     `SELECT id, sede, evento, payload, uuid_evento FROM webhooks_raw
@@ -2668,10 +2250,6 @@ app.get("/api/admin/reprocesar-webhooks", async (req, res) => {
   });
 });
 
-// ============================================
-// ADMIN: Activar (validar) los webhooks en Reservo
-// Una vez validados, Reservo empezara a enviar notificaciones reales
-// ============================================
 app.get("/api/admin/activar-webhooks", async (req, res) => {
   const resultados = {};
   for (const sedeKey of ["sede1", "sede2"]) {
@@ -2696,16 +2274,9 @@ app.get("/api/admin/activar-webhooks", async (req, res) => {
       resultados[sedeKey] = { error: err.message, codigo: err.code };
     }
   }
-  res.json({
-    ok: true,
-    mensaje: "Validacion solicitada. Si el http_status es 200, los webhooks quedaron activos y Reservo empezara a enviar eventos. Si es 400 o 401, ver el detalle de la respuesta.",
-    resultados
-  });
+  res.json({ ok: true, resultados });
 });
 
-// ============================================
-// DASHBOARD (con ingresos reales)
-// ============================================
 app.get("/api/dashboard", async (req, res) => {
   try {
     const sede = req.query.sede || "ambas";
@@ -2770,14 +2341,10 @@ app.get("/api/dashboard", async (req, res) => {
       citas: citas.rows.slice(0, 50)
     });
   } catch (err) {
-    console.error("Error en dashboard:", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// ============================================
-// STATS
-// ============================================
 app.get("/api/stats", async (req, res) => {
   try {
     const total = await pool.query("SELECT COUNT(*)::int AS n FROM citas");
@@ -2810,63 +2377,19 @@ app.get("/api/stats", async (req, res) => {
   }
 });
 
-// ============================================
-// HOME
-// ============================================
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.16",
-    schema: "historico (citas: 31 cols, ventas: 36 cols + webhooks_raw + comparativa mensual con utilidad neta)",
+    servidor: "Redvital Backend v5.18 - Bot WhatsApp + Claude",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
-      webhooks: ["/webhook/sede1", "/webhook/sede2", "/webhook/reservo"],
-      debug_webhooks: [
-        "/api/webhooks/resumen",
-        "/api/webhooks/recientes",
-        "/api/webhooks/sample?evento=citas",
-        "/api/webhooks/sample?evento=ventas"
-      ],
-      admin: [
-        "/api/admin/listar-webhooks",
-        "/api/admin/activar-webhooks",
-        "/api/admin/reprocesar-webhooks"
-      ],
-      metricas: [
-        "/api/metricas/all",
-        "/api/metricas/kpis",
-        "/api/metricas/no-show-profesional",
-        "/api/metricas/pacientes-no-show",
-        "/api/metricas/pacientes-suspension",
-        "/api/metricas/top-profesionales",
-        "/api/metricas/especialidades",
-        "/api/metricas/ocupacion-hora",
-        "/api/metricas/ocupacion-dia-semana",
-        "/api/metricas/pacientes-en-riesgo",
-        "/api/metricas/por-sede",
-        "/api/metricas/demografia",
-        "/api/metricas/prevision",
-        "/api/metricas/origen-reservas",
-        "/api/metricas/serie-temporal",
-        "/api/metricas/comparativa-mensual",
-        "/api/metricas/categorias"
-      ]
-    },
-    parametros: {
-      desde: "YYYY-MM-DD (default: hace 90 dias)",
-      hasta: "YYYY-MM-DD (default: hoy)",
-      sede: "ambas | sede1 | sede2 (default: ambas)",
-      dias: "solo /pacientes-en-riesgo (default: 90)"
+      bot: ["/api/bot/test-reservo", "/api/bot/debug-env", "/api/bot/tratamientos", "/webhook/whatsapp"]
     }
   });
 });
 
-// ============================================
-// IMPORTADOR CSV DE GOOGLE ADS / META / OTROS
-// ============================================
-
-// Crear tabla ads_kpis si no existe (idempotente)
+// IMPORTADOR CSV
 async function inicializarAdsKpis() {
   try {
     await pool.query(`
@@ -2893,13 +2416,11 @@ async function inicializarAdsKpis() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_platform ON ads_kpis(platform);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_imported ON ads_kpis(imported_at);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_campaign ON ads_kpis(campaign_name);`);
-    console.log("Tabla ads_kpis OK");
   } catch (e) {
     console.error("Error inicializando ads_kpis:", e.message);
   }
 }
 
-// Parser de linea CSV que respeta comillas
 function parseCsvLine(line) {
   const result = [];
   let current = "";
@@ -2933,12 +2454,11 @@ function toNumber(val) {
   return isNaN(n) ? 0 : n;
 }
 
-// POST /api/ads/import-csv  - recibe { csvContent, platform } y carga ads_kpis
 app.post("/api/ads/import-csv", async (req, res) => {
   try {
     const { csvContent, platform } = req.body;
     if (!csvContent || typeof csvContent !== "string") {
-      return res.status(400).json({ error: "Falta csvContent (string) en el body" });
+      return res.status(400).json({ error: "Falta csvContent" });
     }
     const plat = (platform || "google_ads").toLowerCase();
 
@@ -2947,7 +2467,6 @@ app.post("/api/ads/import-csv", async (req, res) => {
       return res.status(400).json({ error: "CSV invalido o vacio" });
     }
 
-    // Detectar fila de headers (Google Ads suele tenerla en linea 3, indice 2)
     let headerIndex = -1;
     for (let i = 0; i < Math.min(8, lines.length); i++) {
       const low = lines[i].toLowerCase();
@@ -2957,7 +2476,7 @@ app.post("/api/ads/import-csv", async (req, res) => {
       }
     }
     if (headerIndex === -1) {
-      return res.status(400).json({ error: "No se encontro fila de headers del CSV" });
+      return res.status(400).json({ error: "No se encontro fila de headers" });
     }
 
     const headers = parseCsvLine(lines[headerIndex]);
@@ -2982,10 +2501,9 @@ app.post("/api/ads/import-csv", async (req, res) => {
     const colConvRate = idxOf("Porcentaje de conv.", "Tasa de conv.");
 
     if (colCampana === -1) {
-      return res.status(400).json({ error: "No se encontro columna Campaña en el CSV" });
+      return res.status(400).json({ error: "No se encontro columna Campaña" });
     }
 
-    // Borrar imports del mismo dia y misma plataforma para evitar duplicados
     await pool.query(
       "DELETE FROM ads_kpis WHERE platform=$1 AND DATE(imported_at)=CURRENT_DATE",
       [plat]
@@ -3010,8 +2528,7 @@ app.post("/api/ads/import-csv", async (req, res) => {
             date_range_end, raw_data
           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
           [
-            plat,
-            nombre,
+            plat, nombre,
             colEstado >= 0 ? row[colEstado] || null : null,
             colTipo >= 0 ? row[colTipo] || null : null,
             colImpr >= 0 ? toNumber(row[colImpr]) : 0,
@@ -3029,24 +2546,15 @@ app.post("/api/ads/import-csv", async (req, res) => {
         inserted++;
       } catch (rowErr) {
         skipped++;
-        console.error("Fila CSV omitida:", rowErr.message);
       }
     }
 
-    res.json({
-      success: true,
-      platform: plat,
-      inserted,
-      skipped,
-      total_lines: lines.length - headerIndex - 1
-    });
+    res.json({ success: true, platform: plat, inserted, skipped, total_lines: lines.length - headerIndex - 1 });
   } catch (e) {
-    console.error("Error importando CSV:", e);
     res.status(500).json({ error: e.message });
   }
 });
 
-// GET /api/ads/kpis  - lista campañas (opcional ?platform=google_ads)
 app.get("/api/ads/kpis", async (req, res) => {
   try {
     const { platform, limit } = req.query;
@@ -3068,7 +2576,6 @@ app.get("/api/ads/kpis", async (req, res) => {
   }
 });
 
-// GET /api/ads/summary  - resumen agregado por plataforma del ultimo import
 app.get("/api/ads/summary", async (req, res) => {
   try {
     const result = await pool.query(`
@@ -3096,16 +2603,16 @@ app.get("/api/ads/summary", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-// ============================================
-// v5.18: BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE
-// ============================================
 
 // ============================================
-// INICIALIZACION DE TABLAS DEL BOT (separado de inicializarBD)
+// =============================================================
+// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.18)
+// =============================================================
 // ============================================
+
+// Inicializa tablas del bot (separado de inicializarBD para no romper lo existente)
 async function inicializarBotBD() {
   try {
-    // Pacientes que llegaron via bot WhatsApp
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_pacientes (
         id BIGSERIAL PRIMARY KEY,
@@ -3130,9 +2637,7 @@ async function inicializarBotBD() {
       )
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_bot_pacientes_wa ON bot_pacientes(wa_id)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bot_pacientes_rut ON bot_pacientes(rut)`);
 
-    // Historial de conversaciones
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_conversaciones (
         id BIGSERIAL PRIMARY KEY,
@@ -3150,7 +2655,6 @@ async function inicializarBotBD() {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_bot_conv_wa ON bot_conversaciones(wa_id, timestamp DESC)`);
 
-    // Sesiones activas
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_sesiones (
         wa_id TEXT PRIMARY KEY,
@@ -3160,7 +2664,6 @@ async function inicializarBotBD() {
       )
     `);
 
-    // Citas creadas por el bot
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_citas (
         id BIGSERIAL PRIMARY KEY,
@@ -3179,10 +2682,8 @@ async function inicializarBotBD() {
         referral_source_id TEXT
       )
     `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bot_citas_wa ON bot_citas(wa_id)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_bot_citas_fecha ON bot_citas(fecha)`);
 
-    console.log("[bot BD] Tablas del bot WhatsApp verificadas");
+    console.log("[bot BD] Tablas del bot verificadas");
   } catch (err) {
     console.error("[bot BD] Error inicializando:", err.message);
   }
@@ -3191,122 +2692,153 @@ async function inicializarBotBD() {
 // ============================================
 // CLIENTE RESERVO AGENDAMIENTO ONLINE
 // ============================================
-// Usa los UUIDs de agendas online configurados en Render como UUID_AGENDA_SEDE*_*
-// Docs: https://reservo.cl/APIpublica/v2/agenda_online/{uuid}/...
-
 const AGENDAS_BOT = [
-  // sede2 (Victoria, 6 boxes) - mas capacidad, primero
   { sede: 'sede2', tipo: 'general', uuid: process.env.UUID_AGENDA_SEDE2_GENERAL, token: process.env.TOKEN_SEDE2 },
   { sede: 'sede2', tipo: 'derma',   uuid: process.env.UUID_AGENDA_SEDE2_DERMA,   token: process.env.TOKEN_SEDE2 },
   { sede: 'sede2', tipo: 'salas',   uuid: process.env.UUID_AGENDA_SEDE2_SALAS,   token: process.env.TOKEN_SEDE2 },
-  // sede1 (Maturana, 2 boxes)
   { sede: 'sede1', tipo: 'default',     uuid: process.env.UUID_AGENDA_SEDE1_DEFAULT,     token: process.env.TOKEN_SEDE1 },
   { sede: 'sede1', tipo: 'sucursales',  uuid: process.env.UUID_AGENDA_SEDE1_SUCURSALES,  token: process.env.TOKEN_SEDE1 },
   { sede: 'sede1', tipo: 'sucursales2', uuid: process.env.UUID_AGENDA_SEDE1_SUCURSALES2, token: process.env.TOKEN_SEDE1 }
 ].filter(a => a.uuid && a.token);
 
-// GET profesionales de una agenda
 async function reservoGetProfesionales(uuid, token) {
   try {
     const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/profesionales/`, {
       headers: { Authorization: RESERVO_AUTH(token) },
-      timeout: 15000
+      timeout: 15000,
+      validateStatus: () => true
     });
+    if (r.status >= 400) {
+      return { __error: true, http: r.status, body: r.data };
+    }
     return r.data || [];
   } catch (err) {
-    console.error(`[reservo profesionales ${uuid}]`, err.message);
-    return [];
+    return { __error: true, http: 0, body: err.message };
   }
 }
 
-// GET tratamientos de una agenda
 async function reservoGetTratamientos(uuid, token) {
   try {
     const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/tratamientos/`, {
       headers: { Authorization: RESERVO_AUTH(token) },
-      timeout: 15000
+      timeout: 15000,
+      validateStatus: () => true
     });
+    if (r.status >= 400) {
+      return { __error: true, http: r.status, body: r.data };
+    }
     return r.data || [];
   } catch (err) {
-    console.error(`[reservo tratamientos ${uuid}]`, err.message);
-    return [];
+    return { __error: true, http: 0, body: err.message };
   }
 }
 
-// GET sucursales de una agenda
 async function reservoGetSucursales(uuid, token) {
   try {
     const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/sucursales/`, {
       headers: { Authorization: RESERVO_AUTH(token) },
-      timeout: 15000
+      timeout: 15000,
+      validateStatus: () => true
     });
+    if (r.status >= 400) {
+      return { __error: true, http: r.status, body: r.data };
+    }
     return r.data || [];
   } catch (err) {
-    console.error(`[reservo sucursales ${uuid}]`, err.message);
-    return [];
+    return { __error: true, http: 0, body: err.message };
   }
 }
 
-// GET horarios disponibles
 async function reservoGetHorarios(uuid, token, params) {
   try {
     const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/horarios_disponibles/`, {
       headers: { Authorization: RESERVO_AUTH(token) },
       params: params || {},
-      timeout: 15000
+      timeout: 15000,
+      validateStatus: () => true
     });
+    if (r.status >= 400) {
+      return { __error: true, http: r.status, body: r.data };
+    }
     return r.data || [];
   } catch (err) {
-    console.error(`[reservo horarios ${uuid}]`, err.message);
-    return [];
+    return { __error: true, http: 0, body: err.message };
   }
 }
 
-// GET proxima hora disponible
 async function reservoProximaHora(uuid, token, params) {
   try {
     const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/proxima_hora_disponible/`, {
       headers: { Authorization: RESERVO_AUTH(token) },
       params: params || {},
-      timeout: 15000
+      timeout: 15000,
+      validateStatus: () => true
     });
+    if (r.status >= 400) {
+      return { __error: true, http: r.status, body: r.data };
+    }
     return r.data;
   } catch (err) {
-    console.error(`[reservo proxima ${uuid}]`, err.message);
-    return null;
+    return { __error: true, http: 0, body: err.message };
   }
 }
 
-// GET verificar existencia paciente por RUT
 async function reservoVerificarPaciente(uuid, token, rut) {
   try {
     const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/makereserva/existencia_rut_api/`, {
       headers: { Authorization: RESERVO_AUTH(token) },
       params: { rut },
-      timeout: 15000
+      timeout: 15000,
+      validateStatus: () => true
     });
+    if (r.status >= 400) {
+      return { __error: true, http: r.status, body: r.data };
+    }
     return r.data;
   } catch (err) {
-    console.error(`[reservo verificar rut ${rut}]`, err.message);
-    return null;
+    return { __error: true, http: 0, body: err.message };
   }
 }
 
-// POST crear reserva (confirmar cita)
 async function reservoCrearReserva(uuid, token, body) {
   try {
     const r = await axios.post(`${RESERVO_API}/agenda_online/${uuid}/makereserva/confirmApptAPI/`, body, {
       headers: { Authorization: RESERVO_AUTH(token), 'Content-Type': 'application/json' },
-      timeout: 30000
+      timeout: 30000,
+      validateStatus: () => true
     });
+    if (r.status >= 400) {
+      return { __error: true, http: r.status, body: r.data };
+    }
     return r.data;
   } catch (err) {
-    console.error(`[reservo crear reserva]`, err.message);
-    return { error: err.message, detalles: err.response ? err.response.data : null };
+    return { __error: true, http: 0, body: err.message };
   }
 }
 
-// Endpoint de testeo: ver profesionales y tratamientos disponibles
+// ============================================
+// ENDPOINTS BOT (debug + admin)
+// ============================================
+app.get("/api/bot/debug-env", (req, res) => {
+  const fmt = v => v ? `OK (${String(v).substring(0, 6)}...)` : 'FALTA';
+  res.json({
+    ok: true,
+    token_sede1: fmt(process.env.TOKEN_SEDE1),
+    token_sede2: fmt(process.env.TOKEN_SEDE2),
+    uuid_sede1_default: fmt(process.env.UUID_AGENDA_SEDE1_DEFAULT),
+    uuid_sede1_sucursales: fmt(process.env.UUID_AGENDA_SEDE1_SUCURSALES),
+    uuid_sede1_sucursales2: fmt(process.env.UUID_AGENDA_SEDE1_SUCURSALES2),
+    uuid_sede2_general: fmt(process.env.UUID_AGENDA_SEDE2_GENERAL),
+    uuid_sede2_derma: fmt(process.env.UUID_AGENDA_SEDE2_DERMA),
+    uuid_sede2_salas: fmt(process.env.UUID_AGENDA_SEDE2_SALAS),
+    claude_api_key: fmt(process.env.CLAUDE_API_KEY),
+    whatsapp_verify_token: fmt(process.env.WHATSAPP_VERIFY_TOKEN),
+    whatsapp_access_token: fmt(process.env.WHATSAPP_ACCESS_TOKEN),
+    whatsapp_phone_number_id: fmt(process.env.WHATSAPP_PHONE_NUMBER_ID),
+    agendas_bot_filtradas: AGENDAS_BOT.length
+  });
+});
+
 app.get("/api/bot/test-reservo", async (req, res) => {
   const resultado = [];
   for (const agenda of AGENDAS_BOT) {
@@ -3314,20 +2846,23 @@ app.get("/api/bot/test-reservo", async (req, res) => {
       reservoGetProfesionales(agenda.uuid, agenda.token),
       reservoGetTratamientos(agenda.uuid, agenda.token)
     ]);
+    const profsError = profs && profs.__error;
+    const tratsError = trats && trats.__error;
     resultado.push({
       sede: agenda.sede,
       tipo: agenda.tipo,
       uuid: agenda.uuid,
-      profesionales: Array.isArray(profs) ? profs.length : 'error',
-      tratamientos: Array.isArray(trats) ? trats.length : 'error',
-      sample_profesional: Array.isArray(profs) && profs[0] ? profs[0] : null,
-      sample_tratamiento: Array.isArray(trats) && trats[0] ? trats[0] : null
+      profesionales: profsError ? `ERROR http=${profs.http}` : (Array.isArray(profs) ? profs.length : 'fmt'),
+      profesionales_error_body: profsError ? profs.body : null,
+      tratamientos: tratsError ? `ERROR http=${trats.http}` : (Array.isArray(trats) ? trats.length : 'fmt'),
+      tratamientos_error_body: tratsError ? trats.body : null,
+      sample_profesional: !profsError && Array.isArray(profs) && profs[0] ? profs[0] : null,
+      sample_tratamiento: !tratsError && Array.isArray(trats) && trats[0] ? trats[0] : null
     });
   }
   res.json({ ok: true, total_agendas: AGENDAS_BOT.length, agendas: resultado });
 });
 
-// Endpoint: listar TODOS los tratamientos disponibles (cross-agendas)
 app.get("/api/bot/tratamientos", async (req, res) => {
   const tratamientos = {};
   for (const agenda of AGENDAS_BOT) {
@@ -3341,8 +2876,7 @@ app.get("/api/bot/tratamientos", async (req, res) => {
       tratamientos[key].agendas.push({
         sede: agenda.sede,
         tipo: agenda.tipo,
-        uuid: agenda.uuid,
-        tratamiento_raw: t
+        uuid: agenda.uuid
       });
     }
   }
@@ -3350,11 +2884,336 @@ app.get("/api/bot/tratamientos", async (req, res) => {
 });
 
 // ============================================
+// CLIENTE WHATSAPP CLOUD API (Meta)
+// ============================================
+const WA_API_VERSION = 'v21.0';
+const WA_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
+const WA_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
+const WA_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'redvital_bot_2026_xK9pQ';
+
+async function whatsappEnviarTexto(to, texto) {
+  if (!WA_ACCESS_TOKEN || !WA_PHONE_NUMBER_ID) {
+    console.warn('[wa] WHATSAPP_ACCESS_TOKEN o WHATSAPP_PHONE_NUMBER_ID no configurados, no envio mensaje');
+    return { ok: false, error: 'tokens no configurados' };
+  }
+  try {
+    const r = await axios.post(
+      `https://graph.facebook.com/${WA_API_VERSION}/${WA_PHONE_NUMBER_ID}/messages`,
+      {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: to,
+        type: 'text',
+        text: { body: texto }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${WA_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 15000,
+        validateStatus: () => true
+      }
+    );
+    if (r.status >= 400) {
+      console.error('[wa enviar]', r.status, JSON.stringify(r.data));
+      return { ok: false, status: r.status, data: r.data };
+    }
+    return { ok: true, data: r.data };
+  } catch (err) {
+    console.error('[wa enviar] error', err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+// ============================================
+// CLIENTE CLAUDE API
+// ============================================
+const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const CLAUDE_MODEL = 'claude-sonnet-4-5';
+
+async function claudeMessage(messages, systemPrompt, tools) {
+  if (!CLAUDE_API_KEY) {
+    console.warn('[claude] CLAUDE_API_KEY no configurada');
+    return { error: 'CLAUDE_API_KEY no configurada' };
+  }
+  try {
+    const body = {
+      model: CLAUDE_MODEL,
+      max_tokens: 1024,
+      messages: messages
+    };
+    if (systemPrompt) body.system = systemPrompt;
+    if (tools && tools.length > 0) body.tools = tools;
+
+    const r = await axios.post('https://api.anthropic.com/v1/messages', body, {
+      headers: {
+        'x-api-key': CLAUDE_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json'
+      },
+      timeout: 60000,
+      validateStatus: () => true
+    });
+    if (r.status >= 400) {
+      console.error('[claude]', r.status, JSON.stringify(r.data));
+      return { error: r.data };
+    }
+    return r.data;
+  } catch (err) {
+    console.error('[claude] error', err.message);
+    return { error: err.message };
+  }
+}
+
+// ============================================
+// ORQUESTADOR DEL BOT
+// ============================================
+const SYSTEM_PROMPT_BOT = `Eres el asistente de WhatsApp del Centro Médico Redvital en Villa Alemana, Chile.
+Tu trabajo es ayudar a pacientes a agendar citas de manera amigable, rápida y clara.
+
+REDVITAL tiene 2 sedes (a una cuadra de distancia, no es relevante para el paciente cuál elige):
+- Centro Médico Redvital: Victoria 766, Villa Alemana (6 boxes)
+- Sede Maturana: Maturana 293, Villa Alemana (2 boxes)
+
+REGLAS:
+1. NO le preguntes al paciente la sede. Vos elegís donde haya disponibilidad antes.
+2. Al confirmar la cita al final, SIEMPRE menciona la sede y dirección.
+3. Sé breve, cálido y profesional. No uses bullets ni listas largas en respuestas.
+4. Si no entendés algo, preguntá amablemente.
+5. Si el paciente ya tiene una cita futura, recordásela en vez de crear otra duplicada.
+6. Si el paciente quiere cancelar/reagendar, decile que llame al centro porque eso requiere atención humana.
+7. NUNCA inventes nombres de profesionales, especialidades, fechas u horas. Solo usá info real de la base.
+8. Si te preguntan algo que no es agendar (precios, horarios generales, etc.), respondé brevemente y ofrece ayuda con agendar.
+
+HORARIOS:
+- Lunes a Viernes: 8:00 - 20:00 (Victoria) / 8:00 - 19:00 (Maturana)
+- Sábados: 9:00 - 13:00 (solo Victoria)
+- Domingos: cerrado
+
+ESTILO DE RESPUESTAS:
+- Saludo inicial: "¡Hola! Soy el asistente de Redvital. ¿En qué te puedo ayudar?"
+- Tono: amable, cercano pero profesional. Tuteo (vos/usted depende del contexto, default tuteo).
+- Mensajes cortos, máx 3-4 oraciones.`;
+
+async function obtenerHistorial(wa_id, limit = 10) {
+  const { rows } = await pool.query(
+    `SELECT direccion, mensaje, timestamp FROM bot_conversaciones
+     WHERE wa_id = $1 ORDER BY timestamp DESC LIMIT $2`,
+    [wa_id, limit]
+  );
+  return rows.reverse().map(r => ({
+    role: r.direccion === 'in' ? 'user' : 'assistant',
+    content: r.mensaje || ''
+  }));
+}
+
+async function guardarMensaje(wa_id, direccion, mensaje, opciones = {}) {
+  try {
+    await pool.query(
+      `INSERT INTO bot_conversaciones (wa_id, direccion, mensaje, tipo_mensaje, wa_message_id, intent, accion_ejecutada, datos_extra, error)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        wa_id, direccion, mensaje || null,
+        opciones.tipo || 'text',
+        opciones.wa_message_id || null,
+        opciones.intent || null,
+        opciones.accion || null,
+        opciones.datos ? JSON.stringify(opciones.datos) : null,
+        opciones.error || null
+      ]
+    );
+  } catch (err) {
+    console.error('[bot] guardarMensaje', err.message);
+  }
+}
+
+async function upsertPaciente(wa_id, mensaje, referral) {
+  try {
+    const existe = await pool.query(`SELECT id FROM bot_pacientes WHERE wa_id = $1`, [wa_id]);
+    if (existe.rows.length === 0) {
+      await pool.query(
+        `INSERT INTO bot_pacientes (
+          wa_id, mensaje_inicial, referral_source_type, referral_source_id,
+          referral_source_url, referral_headline, referral_body, referral_media_type, ctwa_clid
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [
+          wa_id,
+          mensaje ? mensaje.substring(0, 500) : null,
+          referral ? referral.source_type : null,
+          referral ? referral.source_id : null,
+          referral ? referral.source_url : null,
+          referral ? referral.headline : null,
+          referral ? referral.body : null,
+          referral ? referral.media_type : null,
+          referral ? referral.ctwa_clid : null
+        ]
+      );
+      console.log(`[bot] paciente NUEVO ${wa_id}, referral=${referral ? referral.source_type : 'organico'}`);
+    } else {
+      await pool.query(
+        `UPDATE bot_pacientes SET ultima_interaccion = NOW(), total_mensajes = total_mensajes + 1 WHERE wa_id = $1`,
+        [wa_id]
+      );
+    }
+  } catch (err) {
+    console.error('[bot] upsertPaciente', err.message);
+  }
+}
+
+// Procesador principal: recibe un mensaje y responde
+async function procesarMensajeBot(wa_id, texto, referral) {
+  console.log(`[bot] mensaje IN ${wa_id}: ${texto ? texto.substring(0, 80) : '(sin texto)'}`);
+
+  await upsertPaciente(wa_id, texto, referral);
+  await guardarMensaje(wa_id, 'in', texto);
+
+  // Construir historial de conversación para Claude
+  const historial = await obtenerHistorial(wa_id, 10);
+
+  // Agregar el mensaje actual al final
+  historial.push({ role: 'user', content: texto || '(mensaje sin texto)' });
+
+  // Llamar a Claude (por ahora sin tools, después con function calling para Reservo)
+  const respuesta = await claudeMessage(historial, SYSTEM_PROMPT_BOT, null);
+
+  if (respuesta.error) {
+    const errMsg = 'Disculpá, tuve un problema técnico. ¿Podés intentar de nuevo en un minuto? Si es urgente, llamanos al centro.';
+    await whatsappEnviarTexto(wa_id, errMsg);
+    await guardarMensaje(wa_id, 'out', errMsg, { error: JSON.stringify(respuesta.error) });
+    return;
+  }
+
+  // Extraer texto de la respuesta de Claude
+  let textoRespuesta = '';
+  if (respuesta.content && Array.isArray(respuesta.content)) {
+    for (const bloque of respuesta.content) {
+      if (bloque.type === 'text') {
+        textoRespuesta += bloque.text;
+      }
+    }
+  }
+
+  if (!textoRespuesta) {
+    textoRespuesta = 'Disculpá, no entendí. ¿Podés repetir?';
+  }
+
+  await whatsappEnviarTexto(wa_id, textoRespuesta);
+  await guardarMensaje(wa_id, 'out', textoRespuesta);
+}
+
+// ============================================
+// WEBHOOK META WHATSAPP
+// ============================================
+// GET: handshake de verificación
+app.get('/webhook/whatsapp', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && token === WA_VERIFY_TOKEN) {
+    console.log('[wa webhook] handshake OK');
+    res.status(200).send(challenge);
+  } else {
+    console.warn('[wa webhook] handshake FALLIDO', { mode, token });
+    res.status(403).send('Forbidden');
+  }
+});
+
+// POST: recepción de mensajes
+app.post('/webhook/whatsapp', async (req, res) => {
+  // SIEMPRE responder 200 rápido (Meta reintenta si no es 200 en 20s)
+  res.status(200).send('EVENT_RECEIVED');
+
+  try {
+    const body = req.body;
+    if (!body || body.object !== 'whatsapp_business_account') return;
+
+    for (const entry of (body.entry || [])) {
+      for (const change of (entry.changes || [])) {
+        const value = change.value || {};
+        const mensajes = value.messages || [];
+
+        for (const msg of mensajes) {
+          const wa_id = msg.from;
+          const tipo = msg.type;
+          let texto = '';
+
+          if (tipo === 'text') {
+            texto = msg.text ? msg.text.body : '';
+          } else if (tipo === 'interactive') {
+            // botones / listas
+            if (msg.interactive && msg.interactive.button_reply) {
+              texto = msg.interactive.button_reply.title;
+            } else if (msg.interactive && msg.interactive.list_reply) {
+              texto = msg.interactive.list_reply.title;
+            }
+          } else {
+            // audio / imagen / video / sticker → respuesta default
+            texto = `[mensaje de tipo ${tipo} no soportado]`;
+          }
+
+          // Extraer referral (ad click) si viene
+          let referral = null;
+          if (msg.referral) {
+            referral = {
+              source_type: msg.referral.source_type,
+              source_id: msg.referral.source_id,
+              source_url: msg.referral.source_url,
+              headline: msg.referral.headline,
+              body: msg.referral.body,
+              media_type: msg.referral.media_type,
+              ctwa_clid: msg.referral.ctwa_clid
+            };
+          }
+
+          // Procesar el mensaje (async, no bloquea)
+          procesarMensajeBot(wa_id, texto, referral).catch(err => {
+            console.error('[bot] procesarMensajeBot error', err.message);
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[wa webhook POST]', err.message);
+  }
+});
+
+// Endpoint admin: ver conversaciones recientes del bot
+app.get('/api/bot/conversaciones', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const { rows } = await pool.query(
+      `SELECT wa_id, direccion, mensaje, timestamp, error
+       FROM bot_conversaciones
+       ORDER BY timestamp DESC
+       LIMIT $1`,
+      [limit]
+    );
+    res.json({ ok: true, total: rows.length, conversaciones: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/bot/pacientes', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM bot_pacientes ORDER BY ultima_interaccion DESC LIMIT 100`
+    );
+    res.json({ ok: true, total: rows.length, pacientes: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================
 // START
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.17 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.18 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
+  await inicializarBotBD();
 });
