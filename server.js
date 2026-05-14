@@ -200,9 +200,10 @@ async function inicializarBD() {
         actualizada_en TIMESTAMPTZ DEFAULT NOW()
       )
     `);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_plataforma ON ads_kpis(plataforma)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_fecha ON ads_kpis(fecha_hasta DESC)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_campania ON ads_kpis(campania_nombre)`);
+    // Índices envueltos: si la tabla existe con esquema viejo (en inglés), los CREATE INDEX fallan sin afectar el resto
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_plataforma ON ads_kpis(plataforma)`); } catch (e) { console.warn("[BD] idx_ads_kpis_plataforma:", e.message); }
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_fecha ON ads_kpis(fecha_hasta DESC)`); } catch (e) { console.warn("[BD] idx_ads_kpis_fecha:", e.message); }
+    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_campania ON ads_kpis(campania_nombre)`); } catch (e) { console.warn("[BD] idx_ads_kpis_campania:", e.message); }
 
     console.log("Indices, tabla webhooks_raw, columnas uuid, campanias_marketing y ads_kpis verificados correctamente");
   } catch (err) {
@@ -2153,7 +2154,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.18",
+    servidor: "Redvital Backend v5.19.2",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2380,7 +2381,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.18 - Bot WhatsApp + Claude",
+    servidor: "Redvital Backend v5.19.2 - Bot WhatsApp + Claude + Catálogo",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -3610,7 +3611,7 @@ async function buscarTratamientos(query, opciones = {}) {
        AND nombre_normalizado LIKE '%' || $1 || '%'
      GROUP BY nombre
      ORDER BY
-       CASE WHEN nombre_normalizado LIKE $1 || '%' THEN 0 ELSE 1 END,
+       CASE WHEN MIN(nombre_normalizado) LIKE $1 || '%' THEN 0 ELSE 1 END,
        nombre
      LIMIT $2`,
     [q, limit]
@@ -3645,7 +3646,7 @@ async function buscarProfesionales(query, opciones = {}) {
             OR LOWER(COALESCE(cargo, '')) LIKE '%' || $1 || '%')
      GROUP BY nombre
      ORDER BY
-       CASE WHEN nombre_normalizado LIKE $1 || '%' THEN 0 ELSE 1 END,
+       CASE WHEN MIN(nombre_normalizado) LIKE $1 || '%' THEN 0 ELSE 1 END,
        nombre
      LIMIT $2`,
     [q, limit]
@@ -3823,7 +3824,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.19 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.19.2 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
