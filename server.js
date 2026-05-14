@@ -2154,7 +2154,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.24",
+    servidor: "Redvital Backend v5.25",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2381,7 +2381,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.24 - Bot WhatsApp + Claude + Catálogo + Function Calling",
+    servidor: "Redvital Backend v5.25 - Bot WhatsApp + Claude + Catálogo + Function Calling",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -3080,6 +3080,147 @@ app.get("/api/bot/diag-horarios", async (req, res) => {
     horarios_disponibles: resultados,
     proxima_hora_disponible: resultadosProxima
   });
+});
+
+// ENDPOINT DIAGNÓSTICO: explora el flujo de makereserva de Reservo
+// modo=inspeccionar (default): explora endpoints auxiliares SIN crear citas
+// modo=probar: hace el POST real de crear reserva con datos de prueba (USA UN CUPO REAL)
+app.get("/api/bot/diag-crear-reserva", async (req, res) => {
+  const modo = req.query.modo || "inspeccionar";
+  const agenda = AGENDAS_BOT.find(a => a.tipo === 'general' && a.sede === 'sede2') || AGENDAS_BOT[0];
+
+  // Traer un tratamiento real
+  const trats = await reservoGetTratamientos(agenda.uuid, agenda.token);
+  if (trats.__error || !trats.__list || trats.__list.length === 0) {
+    return res.json({ ok: false, error: "No se pudieron traer tratamientos", detalle: trats });
+  }
+  const tratPrueba = trats.__list[0];
+
+  // Traer horarios disponibles reales para tener fecha/hora/profesional válidos
+  const respHorarios = await reservoGetHorarios(agenda.uuid, agenda.token, {
+    uuid_tratamiento: tratPrueba.uuid
+  });
+
+  let horarioReal = null;
+  if (respHorarios.__ok && Array.isArray(respHorarios.data)) {
+    for (const dia of respHorarios.data) {
+      for (const suc of (dia.sucursales || [])) {
+        for (const prof of (suc.profesionales || [])) {
+          if (prof.horas_disponibles && prof.horas_disponibles.length > 0) {
+            horarioReal = {
+              fecha: dia.fecha,
+              hora_iso: prof.horas_disponibles[0],
+              hora: prof.horas_disponibles[0].substring(11, 16),
+              uuid_profesional: prof.agenda,
+              profesional_nombre: prof.nombre,
+              sucursal_uuid: suc.uuid,
+              sucursal_nombre: suc.nombre
+            };
+            break;
+          }
+        }
+        if (horarioReal) break;
+      }
+      if (horarioReal) break;
+    }
+  }
+
+  const info = {
+    ok: true,
+    modo: modo,
+    agenda_usada: { uuid: agenda.uuid, sede: agenda.sede, tipo: agenda.tipo },
+    tratamiento_prueba: { uuid: tratPrueba.uuid, nombre: tratPrueba.nombre },
+    horario_real_encontrado: horarioReal
+  };
+
+  // === MODO INSPECCIONAR: explora endpoints auxiliares ===
+  if (modo === "inspeccionar") {
+    const exploracion = {};
+
+    // 1. Probar el endpoint de verificación de RUT (ya sabemos que funciona) con un RUT de prueba
+    const rutPrueba = "11111111-1";
+    try {
+      const r = await axios.get(`${RESERVO_API}/agenda_online/${agenda.uuid}/makereserva/existencia_rut_api/`, {
+        headers: { Authorization: RESERVO_AUTH(agenda.token) },
+        params: { rut: rutPrueba },
+        timeout: 15000,
+        validateStatus: () => true
+      });
+      exploracion.existencia_rut = { http: r.status, respuesta: JSON.stringify(r.data).substring(0, 300) };
+    } catch (e) {
+      exploracion.existencia_rut = { error: e.message };
+    }
+
+    // 2. Hacer un POST a confirmApptAPI con body VACÍO para que Reservo nos diga qué campos faltan
+    try {
+      const r = await axios.post(`${RESERVO_API}/agenda_online/${agenda.uuid}/makereserva/confirmApptAPI/`, {}, {
+        headers: { Authorization: RESERVO_AUTH(agenda.token), 'Content-Type': 'application/json' },
+        timeout: 15000,
+        validateStatus: () => true
+      });
+      exploracion.post_body_vacio = {
+        http: r.status,
+        respuesta: JSON.stringify(r.data).substring(0, 600),
+        nota: "Los errores de 'campo obligatorio' nos dicen qué campos espera Reservo"
+      };
+    } catch (e) {
+      exploracion.post_body_vacio = { error: e.message };
+    }
+
+    // 3. POST con campos parciales comunes para ver qué más pide
+    try {
+      const bodyParcial = {
+        uuid_tratamiento: tratPrueba.uuid,
+        rut: rutPrueba
+      };
+      const r = await axios.post(`${RESERVO_API}/agenda_online/${agenda.uuid}/makereserva/confirmApptAPI/`, bodyParcial, {
+        headers: { Authorization: RESERVO_AUTH(agenda.token), 'Content-Type': 'application/json' },
+        timeout: 15000,
+        validateStatus: () => true
+      });
+      exploracion.post_body_parcial = {
+        body_enviado: bodyParcial,
+        http: r.status,
+        respuesta: JSON.stringify(r.data).substring(0, 600)
+      };
+    } catch (e) {
+      exploracion.post_body_parcial = { error: e.message };
+    }
+
+    info.exploracion = exploracion;
+    info.siguiente_paso = "Revisar los errores de 'campo obligatorio' para saber el formato exacto. Cuando esté claro, llamar con ?modo=probar para hacer una reserva real de prueba.";
+    return res.json(info);
+  }
+
+  // === MODO PROBAR: hace el POST real (ocupa un cupo) ===
+  if (modo === "probar") {
+    if (!horarioReal) {
+      return res.json({ ...info, error: "No hay horarios disponibles para hacer la prueba real" });
+    }
+
+    // Body con datos de prueba — usando el formato que Reservo espera
+    // (se ajustará según lo que descubramos en modo inspeccionar)
+    const bodyPrueba = {
+      uuid_tratamiento: tratPrueba.uuid,
+      profesional: horarioReal.uuid_profesional,
+      fecha: horarioReal.fecha,
+      hora: horarioReal.hora,
+      rut: "11111111-1",
+      nombre: "PACIENTE",
+      apellido_paterno: "PRUEBA",
+      apellido_materno: "BOT",
+      telefono_1: "912345678",
+      mail: "prueba@test.cl"
+    };
+
+    const r = await reservoCrearReserva(agenda.uuid, agenda.token, bodyPrueba);
+    info.body_enviado = bodyPrueba;
+    info.resultado_creacion = r;
+    info.ADVERTENCIA = "Si la reserva se creó (no hay __error), BORRALA manualmente desde Reservo para no ocupar el cupo.";
+    return res.json(info);
+  }
+
+  return res.json({ ...info, error: "modo inválido. Usar ?modo=inspeccionar o ?modo=probar" });
 });
 
 // ============================================
@@ -4408,7 +4549,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.24 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.25 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
