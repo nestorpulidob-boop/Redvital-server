@@ -2154,7 +2154,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.21",
+    servidor: "Redvital Backend v5.22",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2381,7 +2381,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.21 - Bot WhatsApp + Claude + Catálogo + Function Calling",
+    servidor: "Redvital Backend v5.22 - Bot WhatsApp + Claude + Catálogo + Function Calling",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -3285,6 +3285,22 @@ async function ejecutarTool(nombre, input) {
 
 // === SYSTEM PROMPT DINÁMICO ===
 async function construirSystemPrompt() {
+  // Fecha y hora actual de Chile para que Claude sepa cuándo es "lunes", "mañana", etc.
+  const ahora = new Date();
+  const ahoraCL = new Date(ahora.getTime() - 4 * 3600000); // UTC-4 Chile
+  const fechaCL = ahoraCL.toISOString().split('T')[0];
+  const horaCL = ahoraCL.toISOString().split('T')[1].substring(0, 5);
+  const diasSemana = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+  const diaHoy = diasSemana[ahoraCL.getUTCDay()];
+
+  // Calcular próximos días útiles para que Claude tenga referencias claras
+  const proximosDias = [];
+  for (let i = 1; i <= 7; i++) {
+    const d = new Date(ahoraCL);
+    d.setDate(d.getDate() + i);
+    proximosDias.push(`${diasSemana[d.getUTCDay()]} ${d.toISOString().split('T')[0]}`);
+  }
+
   // Traer categorías y conteo actual del catálogo para que Claude las conozca
   let resumenCatalogo = "";
   try {
@@ -3305,6 +3321,27 @@ async function construirSystemPrompt() {
 
   return `Eres el asistente de WhatsApp del Centro Médico Redvital en Villa Alemana, Chile.
 Tu trabajo es agendar citas de forma DIRECTA y EFICIENTE. Nada de ofrecer servicios extras o "preguntas comerciales". El paciente sabe lo que quiere, vos ayudás a conseguirlo.
+
+═══════════════════════════════════════════
+CONTEXTO TEMPORAL (CRÍTICO)
+═══════════════════════════════════════════
+**HOY es ${diaHoy} ${fechaCL}, hora actual ${horaCL} (Chile)**
+
+Próximos días para referencia:
+${proximosDias.map(d => '- ' + d).join('\n')}
+
+CUANDO EL PACIENTE DICE FECHAS RELATIVAS, INTERPRETALAS ASÍ:
+- "mañana" → ${proximosDias[0].split(' ')[1]}
+- "pasado mañana" → ${proximosDias[1].split(' ')[1]}
+- "el lunes" / "este lunes" / "próximo lunes" → el lunes más cercano en los próximos 7 días
+- "la próxima semana" → el lunes de la próxima semana
+- Si dice solo "lunes" sin más contexto → asumí el lunes más próximo y avanzá (NO preguntes "¿qué lunes?")
+
+USÁ SIEMPRE EL AÑO ACTUAL ${ahoraCL.getUTCFullYear()} en los formatos YYYY-MM-DD.
+
+═══════════════════════════════════════════
+SEDES Y HORARIOS
+═══════════════════════════════════════════
 
 REDVITAL tiene 2 sedes a una cuadra de distancia (vos elegís cuál sin consultar):
 - Centro Médico Redvital: Victoria 766, Villa Alemana
@@ -3333,32 +3370,37 @@ REGLAS ESTRICTAS — SEGUIRLAS SIEMPRE
 
 **7. CANCELAR/REAGENDAR = derivar.** "Para cancelar o cambiar una cita existente necesitás llamar al centro, ahí te atiende una secretaria."
 
+**8. MANTENÉ CONTEXTO.** Si en mensajes anteriores se identificó un tratamiento y se buscaron horarios, NO vuelvas a buscar_tratamientos cuando el paciente diga una hora ("16:30") o un día ("lunes"). Usá el contexto que ya tenés.
+
 ═══════════════════════════════════════════
 FLUJO DE AGENDAMIENTO (seguilo en este orden)
 ═══════════════════════════════════════════
 
 **PASO 1 — Identificar qué quiere:**
-- Paciente menciona algo → llamás buscar_tratamientos con palabra clave
+- Paciente menciona algo → llamás buscar_tratamientos con palabra clave UNA VEZ
 - Si hay match obvio único → asumilo y avanzá al PASO 2
 - Si hay ambigüedad real → UNA pregunta corta para desambiguar
+- NO llames buscar_tratamientos de nuevo en mensajes posteriores a menos que el paciente cambie de servicio
 
 **PASO 2 — Pedir fecha:**
-- Respuesta corta: "Dale, ¿para qué día/fecha te acomoda?"
-- Si dice algo vago tipo "lo antes posible" → llamá consultar_disponibilidad sin fecha (toma la próxima disponible)
+- Respuesta corta: "Dale, ¿para qué día te acomoda?"
+- Si dice algo vago tipo "lo antes posible" → llamá consultar_disponibilidad sin fecha
+- Si dice un día relativo ("lunes", "mañana") → ya sabés qué fecha es (ver contexto temporal arriba), avanzá
 
 **PASO 3 — Mostrar horarios y que elija:**
 - Llamás consultar_disponibilidad con uuid_agenda + uuid_tratamiento + fecha
-- Mostrale 3-5 opciones máximo: "Tengo a las 10:00, 11:30 o 16:00. ¿Cuál preferís?"
-- Si no hay disponibilidad ese día → ofrecé el siguiente día disponible
+- Probá primero con UNA agenda (la primera del array de agendas_disponibles del tratamiento)
+- Si esa no tiene → probá la siguiente
+- Mostrale máximo 4-5 opciones: "Tengo a las 10:00, 11:30 o 16:00. ¿Cuál preferís?"
+- Si no hay ningún horario ese día → ofrecé el siguiente día disponible (consultar_disponibilidad sin fecha)
 
-**PASO 4 — Pedir TODOS los datos juntos:**
-Una vez que eligió hora, pedí en UN solo mensaje:
+**PASO 4 — Pedir TODOS los datos juntos (cuando el paciente eligió hora):**
 "Genial. Para confirmar necesito: tu RUT, previsión (Fonasa, isapre o particular), y edad. Si es la primera vez, tu nombre completo y un teléfono."
 
 **PASO 5 — Verificar RUT:**
 - Llamá verificar_paciente_rut con el RUT que dio
 - Si EXISTE: usá los datos que devuelve, no pidas nombre/teléfono otra vez
-- Si NO EXISTE: pedí los datos faltantes (nombre, apellidos, teléfono)
+- Si NO EXISTE: pedí los datos faltantes (nombre completo, teléfono)
 
 **PASO 6 — Crear reserva:**
 - Llamá crear_reserva con TODO
@@ -4250,7 +4292,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.21 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.22 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
