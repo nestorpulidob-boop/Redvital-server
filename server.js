@@ -2154,7 +2154,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.22",
+    servidor: "Redvital Backend v5.23",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2381,7 +2381,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.22 - Bot WhatsApp + Claude + Catálogo + Function Calling",
+    servidor: "Redvital Backend v5.23 - Bot WhatsApp + Claude + Catálogo + Function Calling",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -2992,6 +2992,94 @@ app.get("/api/bot/tratamientos", async (req, res) => {
     }
   }
   res.json({ ok: true, total: Object.keys(tratamientos).length, tratamientos: Object.values(tratamientos) });
+});
+
+// ENDPOINT DIAGNÓSTICO: prueba horarios_disponibles con distintos nombres de parámetro
+// Para descubrir cómo Reservo espera el uuid del tratamiento
+app.get("/api/bot/diag-horarios", async (req, res) => {
+  // Usamos la agenda sede2 general (la que tiene 36 tratamientos) y el primer tratamiento que tenga
+  const agenda = AGENDAS_BOT.find(a => a.tipo === 'general' && a.sede === 'sede2') || AGENDAS_BOT[0];
+
+  // Traer un tratamiento real de esa agenda
+  const trats = await reservoGetTratamientos(agenda.uuid, agenda.token);
+  if (trats.__error || !trats.__list || trats.__list.length === 0) {
+    return res.json({ ok: false, error: "No se pudieron traer tratamientos de prueba", detalle: trats });
+  }
+  const tratPrueba = trats.__list[0];
+  const uuidTrat = tratPrueba.uuid;
+
+  // Traer un profesional también por si lo pide
+  const profs = await reservoGetProfesionales(agenda.uuid, agenda.token);
+  const profPrueba = (!profs.__error && profs.__list && profs.__list[0]) ? profs.__list[0] : null;
+
+  const fecha = req.query.fecha || "2026-05-19";
+
+  // Distintos nombres de parámetro a probar
+  const variantes = [
+    { nombre: "tratamiento", params: { tratamiento: uuidTrat } },
+    { nombre: "uuid_tratamiento", params: { uuid_tratamiento: uuidTrat } },
+    { nombre: "tratamiento_uuid", params: { tratamiento_uuid: uuidTrat } },
+    { nombre: "id_tratamiento", params: { id_tratamiento: uuidTrat } },
+    { nombre: "tratamiento+fecha", params: { tratamiento: uuidTrat, fecha: fecha } },
+    { nombre: "uuid_tratamiento+fecha", params: { uuid_tratamiento: uuidTrat, fecha: fecha } },
+    { nombre: "tratamiento+profesional", params: profPrueba ? { tratamiento: uuidTrat, profesional: profPrueba.uuid } : null },
+    { nombre: "tratamiento+profesional+fecha", params: profPrueba ? { tratamiento: uuidTrat, profesional: profPrueba.uuid, fecha: fecha } : null }
+  ];
+
+  const resultados = [];
+  for (const v of variantes) {
+    if (!v.params) {
+      resultados.push({ variante: v.nombre, saltado: "sin profesional disponible" });
+      continue;
+    }
+    try {
+      const r = await axios.get(`${RESERVO_API}/agenda_online/${agenda.uuid}/horarios_disponibles/`, {
+        headers: { Authorization: RESERVO_AUTH(agenda.token) },
+        params: v.params,
+        timeout: 15000,
+        validateStatus: () => true
+      });
+      resultados.push({
+        variante: v.nombre,
+        params_enviados: v.params,
+        http: r.status,
+        respuesta: typeof r.data === 'object' ? JSON.stringify(r.data).substring(0, 400) : String(r.data).substring(0, 400)
+      });
+    } catch (err) {
+      resultados.push({ variante: v.nombre, error: err.message });
+    }
+  }
+
+  // También probar proxima_hora_disponible
+  const resultadosProxima = [];
+  for (const v of variantes.slice(0, 4)) {
+    if (!v.params) continue;
+    try {
+      const r = await axios.get(`${RESERVO_API}/agenda_online/${agenda.uuid}/proxima_hora_disponible/`, {
+        headers: { Authorization: RESERVO_AUTH(agenda.token) },
+        params: v.params,
+        timeout: 15000,
+        validateStatus: () => true
+      });
+      resultadosProxima.push({
+        variante: v.nombre,
+        http: r.status,
+        respuesta: typeof r.data === 'object' ? JSON.stringify(r.data).substring(0, 400) : String(r.data).substring(0, 400)
+      });
+    } catch (err) {
+      resultadosProxima.push({ variante: v.nombre, error: err.message });
+    }
+  }
+
+  res.json({
+    ok: true,
+    agenda_usada: { uuid: agenda.uuid, sede: agenda.sede, tipo: agenda.tipo },
+    tratamiento_prueba: { uuid: uuidTrat, nombre: tratPrueba.nombre },
+    profesional_prueba: profPrueba ? { uuid: profPrueba.uuid, nombre: profPrueba.nombre } : null,
+    fecha_usada: fecha,
+    horarios_disponibles: resultados,
+    proxima_hora_disponible: resultadosProxima
+  });
 });
 
 // ============================================
@@ -4292,7 +4380,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.22 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.23 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
