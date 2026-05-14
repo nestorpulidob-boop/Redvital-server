@@ -2154,7 +2154,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.19.2",
+    servidor: "Redvital Backend v5.20",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2381,11 +2381,26 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.19.2 - Bot WhatsApp + Claude + Catálogo",
+    servidor: "Redvital Backend v5.20 - Bot WhatsApp + Claude + Catálogo + Function Calling",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
-      bot: ["/api/bot/test-reservo", "/api/bot/debug-env", "/api/bot/tratamientos", "/webhook/whatsapp"]
+      bot_debug: ["/api/bot/debug-env", "/api/bot/test-reservo", "/api/bot/tratamientos"],
+      bot_catalogo: [
+        "/api/bot/catalogo/stats",
+        "/api/bot/catalogo/sync (POST)",
+        "/api/bot/catalogo/sync-log",
+        "/api/bot/catalogo/profesionales",
+        "/api/bot/catalogo/tratamientos",
+        "/api/bot/catalogo/categorias",
+        "/api/bot/catalogo/buscar?q="
+      ],
+      bot_conversacional: [
+        "/api/bot/chat-test (POST) - simulador SIN WhatsApp",
+        "/api/bot/conversaciones",
+        "/api/bot/pacientes",
+        "/webhook/whatsapp"
+      ]
     }
   });
 });
@@ -3063,39 +3078,279 @@ async function claudeMessage(messages, systemPrompt, tools) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT
+// ORQUESTADOR DEL BOT (Fase 2: Function Calling)
 // ============================================
-const SYSTEM_PROMPT_BOT = `Eres el asistente de WhatsApp del Centro Médico Redvital en Villa Alemana, Chile.
+
+// === DEFINICIÓN DE TOOLS PARA CLAUDE ===
+const BOT_TOOLS = [
+  {
+    name: "buscar_tratamientos",
+    description: "Busca tratamientos y exámenes médicos disponibles en el catálogo de Redvital. Usar cuando el paciente menciona un examen, especialidad o tipo de consulta (ej: 'eco abdominal', 'cardio', 'colonoscopia', 'consulta nutricionista'). Devuelve nombre, duración y agendas donde está disponible. NO devuelve precios — para precios derivar a secretaría.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Término de búsqueda. Mejor usar palabras clave cortas como 'cardio', 'eco abdominal', 'colono'. La búsqueda es fuzzy y no requiere acentos."
+        }
+      },
+      required: ["query"]
+    }
+  },
+  {
+    name: "buscar_profesionales",
+    description: "Busca profesionales (médicos, kinesiólogos, etc.) en el catálogo de Redvital. Usar cuando el paciente menciona un nombre específico o pregunta '¿con quién atiendo X?'. Devuelve nombre, cargo y agendas donde atiende.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Nombre del profesional o especialidad/cargo. Ej: 'gonzalez', 'cardiologo', 'kinesiologo'."
+        }
+      },
+      required: ["query"]
+    }
+  },
+  {
+    name: "consultar_disponibilidad",
+    description: "Consulta horarios disponibles en VIVO para un tratamiento específico. Usar SOLO después de haber identificado un tratamiento con buscar_tratamientos. Requiere el uuid_agenda del catálogo. Si la fecha no se especifica, busca la próxima hora disponible.",
+    input_schema: {
+      type: "object",
+      properties: {
+        uuid_agenda: {
+          type: "string",
+          description: "UUID de la agenda donde está el tratamiento (campo 'agendas' del resultado de buscar_tratamientos)"
+        },
+        uuid_tratamiento: {
+          type: "string",
+          description: "UUID del tratamiento (campo 'uuid_ejemplo' del resultado)"
+        },
+        fecha: {
+          type: "string",
+          description: "Fecha en formato YYYY-MM-DD. Opcional, si no se da busca la próxima disponible."
+        }
+      },
+      required: ["uuid_agenda", "uuid_tratamiento"]
+    }
+  },
+  {
+    name: "verificar_paciente_rut",
+    description: "Verifica si un paciente ya existe en el sistema buscando por RUT. Usar antes de pedir datos completos a un paciente nuevo. Si existe, devuelve datos; si no existe, indica que es nuevo.",
+    input_schema: {
+      type: "object",
+      properties: {
+        uuid_agenda: {
+          type: "string",
+          description: "UUID de la agenda donde se hará la reserva"
+        },
+        rut: {
+          type: "string",
+          description: "RUT del paciente en formato chileno (con o sin guión, ej: '12345678-9' o '123456789')"
+        }
+      },
+      required: ["uuid_agenda", "rut"]
+    }
+  },
+  {
+    name: "crear_reserva",
+    description: "Crea una reserva de cita en el sistema Reservo. Usar SOLO al final cuando ya se confirmó: tratamiento, fecha, hora y datos del paciente. Después de crear la reserva, confirmar al paciente con sede, dirección, fecha y hora.",
+    input_schema: {
+      type: "object",
+      properties: {
+        uuid_agenda: { type: "string", description: "UUID de la agenda" },
+        uuid_tratamiento: { type: "string", description: "UUID del tratamiento" },
+        uuid_profesional: { type: "string", description: "UUID del profesional (de los horarios disponibles)" },
+        fecha: { type: "string", description: "Fecha YYYY-MM-DD" },
+        hora: { type: "string", description: "Hora HH:MM" },
+        rut: { type: "string", description: "RUT del paciente" },
+        nombre: { type: "string", description: "Nombre del paciente (solo si es nuevo)" },
+        apellido_paterno: { type: "string", description: "Apellido paterno (solo si es nuevo)" },
+        apellido_materno: { type: "string", description: "Apellido materno (solo si es nuevo)" },
+        telefono: { type: "string", description: "Teléfono del paciente" },
+        mail: { type: "string", description: "Email del paciente (opcional)" }
+      },
+      required: ["uuid_agenda", "uuid_tratamiento", "uuid_profesional", "fecha", "hora", "rut"]
+    }
+  }
+];
+
+// === EJECUTOR DE TOOLS ===
+async function ejecutarTool(nombre, input) {
+  console.log(`[tool] ${nombre}`, JSON.stringify(input).substring(0, 200));
+  try {
+    if (nombre === "buscar_tratamientos") {
+      const resultado = await buscarTratamientos(input.query || "", { limit: 10 });
+      // Simplificar la respuesta para Claude: solo lo esencial
+      if (resultado.resultados && Array.isArray(resultado.resultados)) {
+        const simple = resultado.resultados.map(t => ({
+          nombre: t.nombre,
+          uuid_tratamiento: t.uuid_ejemplo,
+          duracion: t.duracion,
+          categoria: t.categoria,
+          sedes: t.sedes,
+          agendas_disponibles: t.agendas
+        }));
+        return { ok: true, total: simple.length, tratamientos: simple };
+      }
+      return resultado;
+    }
+
+    if (nombre === "buscar_profesionales") {
+      const resultado = await buscarProfesionales(input.query || "", { limit: 10 });
+      if (resultado.resultados && Array.isArray(resultado.resultados)) {
+        const simple = resultado.resultados.map(p => ({
+          nombre: p.nombre,
+          uuid_profesional: p.uuid_ejemplo,
+          cargo: p.cargo,
+          sedes: p.sedes,
+          agendas: p.agendas
+        }));
+        return { ok: true, total: simple.length, profesionales: simple };
+      }
+      return resultado;
+    }
+
+    if (nombre === "consultar_disponibilidad") {
+      const agenda = AGENDAS_BOT.find(a => a.uuid === input.uuid_agenda);
+      if (!agenda) return { ok: false, error: "Agenda no encontrada" };
+      const params = { tratamiento: input.uuid_tratamiento };
+      if (input.fecha) params.fecha = input.fecha;
+      const horarios = await reservoGetHorarios(agenda.uuid, agenda.token, params);
+      if (horarios.__error) {
+        return { ok: false, error: `Error Reservo http=${horarios.http}`, detalle: horarios.body };
+      }
+      // Si la respuesta es paginada, normalizar
+      let lista = Array.isArray(horarios) ? horarios :
+                  (horarios.resultados || horarios.results || []);
+      // Limitar a primeras 10 horas disponibles para no inundar a Claude
+      lista = lista.slice(0, 10);
+      return {
+        ok: true,
+        sede: agenda.sede,
+        sucursal: agenda.sede === "sede1" ? SEDES.sede1.direccion : SEDES.sede2.direccion,
+        total_horarios: lista.length,
+        horarios: lista
+      };
+    }
+
+    if (nombre === "verificar_paciente_rut") {
+      const agenda = AGENDAS_BOT.find(a => a.uuid === input.uuid_agenda);
+      if (!agenda) return { ok: false, error: "Agenda no encontrada" };
+      const rutLimpio = String(input.rut).replace(/[.\s-]/g, "");
+      const r = await reservoVerificarPaciente(agenda.uuid, agenda.token, rutLimpio);
+      if (r.__error) {
+        // 404 puede significar "no existe" — eso es válido
+        if (r.http === 404) {
+          return { ok: true, existe: false, mensaje: "Paciente no encontrado, es nuevo" };
+        }
+        return { ok: false, error: `Error Reservo http=${r.http}`, detalle: r.body };
+      }
+      return { ok: true, existe: true, datos: r };
+    }
+
+    if (nombre === "crear_reserva") {
+      const agenda = AGENDAS_BOT.find(a => a.uuid === input.uuid_agenda);
+      if (!agenda) return { ok: false, error: "Agenda no encontrada" };
+
+      // Construir body según formato Reservo
+      const rutLimpio = String(input.rut).replace(/[.\s-]/g, "");
+      const body = {
+        rut: rutLimpio,
+        tratamiento: input.uuid_tratamiento,
+        profesional: input.uuid_profesional,
+        fecha: input.fecha,
+        hora: input.hora,
+        nombre: input.nombre || undefined,
+        apellido_paterno: input.apellido_paterno || undefined,
+        apellido_materno: input.apellido_materno || undefined,
+        telefono_1: input.telefono || undefined,
+        mail: input.mail || undefined
+      };
+      // Eliminar campos undefined
+      Object.keys(body).forEach(k => body[k] === undefined && delete body[k]);
+
+      const r = await reservoCrearReserva(agenda.uuid, agenda.token, body);
+      if (r.__error) {
+        return { ok: false, error: `Error Reservo http=${r.http}`, detalle: r.body };
+      }
+      return { ok: true, reserva: r, sede: agenda.sede, sucursal: agenda.sede === "sede1" ? SEDES.sede1.direccion : SEDES.sede2.direccion };
+    }
+
+    return { ok: false, error: `Tool desconocida: ${nombre}` };
+  } catch (err) {
+    console.error(`[tool ${nombre}] error`, err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+// === SYSTEM PROMPT DINÁMICO ===
+async function construirSystemPrompt() {
+  // Traer categorías y conteo actual del catálogo para que Claude las conozca
+  let resumenCatalogo = "";
+  try {
+    const { rows: categorias } = await pool.query(`
+      SELECT categoria_nombre, COUNT(DISTINCT nombre)::int AS cantidad
+      FROM bot_catalogo_tratamientos
+      WHERE activo = TRUE AND categoria_nombre IS NOT NULL
+      GROUP BY categoria_nombre
+      ORDER BY cantidad DESC
+    `);
+    if (categorias.length > 0) {
+      resumenCatalogo = "\n\nCATEGORÍAS DISPONIBLES (úsalas como referencia, pero siempre verificá con buscar_tratamientos):\n" +
+        categorias.map(c => `- ${c.categoria_nombre} (${c.cantidad} servicios)`).join("\n");
+    }
+  } catch (e) {
+    console.warn("[bot] No se pudo cargar resumen de catálogo:", e.message);
+  }
+
+  return `Eres el asistente de WhatsApp del Centro Médico Redvital en Villa Alemana, Chile.
 Tu trabajo es ayudar a pacientes a agendar citas de manera amigable, rápida y clara.
 
-REDVITAL tiene 2 sedes (a una cuadra de distancia, no es relevante para el paciente cuál elige):
-- Centro Médico Redvital: Victoria 766, Villa Alemana (6 boxes)
-- Sede Maturana: Maturana 293, Villa Alemana (2 boxes)
-
-REGLAS:
-1. NO le preguntes al paciente la sede. Vos elegís donde haya disponibilidad antes.
-2. Al confirmar la cita al final, SIEMPRE menciona la sede y dirección.
-3. Sé breve, cálido y profesional. No uses bullets ni listas largas en respuestas.
-4. Si no entendés algo, preguntá amablemente.
-5. Si el paciente ya tiene una cita futura, recordásela en vez de crear otra duplicada.
-6. Si el paciente quiere cancelar/reagendar, decile que llame al centro porque eso requiere atención humana.
-7. NUNCA inventes nombres de profesionales, especialidades, fechas u horas. Solo usá info real de la base.
-8. Si te preguntan algo que no es agendar (precios, horarios generales, etc.), respondé brevemente y ofrece ayuda con agendar.
+REDVITAL tiene 2 sedes a una cuadra de distancia:
+- Centro Médico Redvital: Victoria 766, Villa Alemana (sede grande, 6 boxes)
+- Sede Maturana: Maturana 293, Villa Alemana (sede chica, 2 boxes)
 
 HORARIOS:
 - Lunes a Viernes: 8:00 - 20:00 (Victoria) / 8:00 - 19:00 (Maturana)
 - Sábados: 9:00 - 13:00 (solo Victoria)
-- Domingos: cerrado
+- Domingos: cerrado${resumenCatalogo}
 
-ESTILO DE RESPUESTAS:
-- Saludo inicial: "¡Hola! Soy el asistente de Redvital. ¿En qué te puedo ayudar?"
-- Tono: amable, cercano pero profesional. Tuteo (vos/usted depende del contexto, default tuteo).
-- Mensajes cortos, máx 3-4 oraciones.`;
+REGLAS CRÍTICAS:
+1. NO le preguntes al paciente la sede. Vos elegís donde haya disponibilidad antes. Solo se la informás al confirmar la cita final.
+2. **NO DAS PRECIOS** bajo ninguna circunstancia. Si te preguntan, decí: "Los valores varían según previsión (Fonasa, particular, isapres). Para el valor exacto te conecta secretaría al [número]". Y seguí con el agendamiento si quiere.
+3. NUNCA inventes nombres de profesionales, tratamientos, fechas u horas. Solo usá la info que devuelven las tools.
+4. Si la tool devuelve error o lista vacía, ofrecé alternativas o pedile al paciente que llame.
+5. Si el paciente quiere cancelar o reagendar una cita existente, decile que tiene que llamar al centro porque requiere atención humana.
+
+FLUJO TÍPICO DE AGENDAMIENTO:
+1. Paciente menciona un servicio → llamás buscar_tratamientos
+2. Confirmás con el paciente qué tratamiento (si hay varios matches similares)
+3. Llamás consultar_disponibilidad para ver horarios
+4. Paciente elige hora → pedís RUT
+5. Llamás verificar_paciente_rut para ver si existe
+6. Si NO existe: pedís nombre completo y teléfono
+7. Llamás crear_reserva
+8. Confirmás con sede + dirección + fecha + hora
+
+ESTILO:
+- Tono: amable, cercano, profesional. Tuteo (vos/usted depende del contexto, default tuteo amigable chileno).
+- Mensajes CORTOS: máximo 3-4 oraciones por respuesta.
+- Sin bullets ni listas largas en respuestas al paciente.
+- Saludo inicial si es la primera interacción: "¡Hola! Soy el asistente de Redvital 👋 ¿En qué te ayudo?"
+
+CASOS ESPECIALES:
+- Si te preguntan por horarios generales → respondé brevemente.
+- Si preguntan si atienden tal o cual cosa → llamá buscar_tratamientos para confirmar.
+- Si te insultan o tratan mal → mantenete profesional, ofrecé conectar con secretaría humana.
+- Si detectás emergencia médica → derivá inmediatamente a llamar al centro o 131.`;
+}
 
 async function obtenerHistorial(wa_id, limit = 10) {
+  // Solo traer texto plano (ignorar mensajes con tool_use/tool_result en formato Claude)
   const { rows } = await pool.query(
     `SELECT direccion, mensaje, timestamp FROM bot_conversaciones
-     WHERE wa_id = $1 ORDER BY timestamp DESC LIMIT $2`,
+     WHERE wa_id = $1 AND mensaje IS NOT NULL AND mensaje != ''
+     ORDER BY timestamp DESC LIMIT $2`,
     [wa_id, limit]
   );
   return rows.reverse().map(r => ({
@@ -3157,46 +3412,151 @@ async function upsertPaciente(wa_id, mensaje, referral) {
   }
 }
 
-// Procesador principal: recibe un mensaje y responde
+// === LOOP CONVERSACIONAL CON TOOL USE ===
+// Toma historial + mensaje nuevo, llama a Claude, ejecuta tools si hace falta, y devuelve respuesta final
+async function procesarConversacionConTools(historialTexto, mensajeUsuario, opciones = {}) {
+  const maxIter = opciones.maxIter || 5;
+  const system = await construirSystemPrompt();
+  const toolsLog = [];
+
+  // Mensajes para Claude: empezamos con historial texto + nuevo mensaje user
+  let messages = [...historialTexto, { role: 'user', content: mensajeUsuario }];
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    console.log(`[bot loop] iter ${iter + 1}/${maxIter}`);
+    const respuesta = await claudeMessage(messages, system, BOT_TOOLS);
+
+    if (respuesta.error) {
+      return {
+        ok: false,
+        error: respuesta.error,
+        tools_log: toolsLog,
+        texto: 'Disculpá, tuve un problema técnico. ¿Podés intentar de nuevo en un minuto? Si es urgente, llamanos al centro.'
+      };
+    }
+
+    const stopReason = respuesta.stop_reason;
+    const content = respuesta.content || [];
+
+    if (stopReason === 'tool_use') {
+      // Agregar la respuesta del assistant (incluye texto + tool_use blocks)
+      messages.push({ role: 'assistant', content: content });
+
+      // Ejecutar cada tool_use y armar tool_results
+      const toolResults = [];
+      for (const block of content) {
+        if (block.type === 'tool_use') {
+          const resultado = await ejecutarTool(block.name, block.input);
+          toolsLog.push({
+            nombre: block.name,
+            input: block.input,
+            output: resultado
+          });
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: JSON.stringify(resultado)
+          });
+        }
+      }
+
+      // Agregar los tool_results como mensaje user
+      messages.push({ role: 'user', content: toolResults });
+
+      // Continuar el loop
+      continue;
+    }
+
+    // end_turn, max_tokens, stop_sequence — extraer texto final y devolverlo
+    let textoFinal = '';
+    for (const block of content) {
+      if (block.type === 'text') textoFinal += block.text;
+    }
+    if (!textoFinal) textoFinal = 'Disculpá, no entendí. ¿Podés repetir?';
+
+    return {
+      ok: true,
+      texto: textoFinal,
+      tools_log: toolsLog,
+      iteraciones: iter + 1,
+      stop_reason: stopReason
+    };
+  }
+
+  // Si llegamos acá, agotamos las iteraciones
+  return {
+    ok: false,
+    texto: 'Disculpá, esta consulta se está complicando. ¿Querés hablar con secretaría?',
+    tools_log: toolsLog,
+    error: 'max_iteraciones'
+  };
+}
+
+// === ENTRADA PRINCIPAL DESDE WHATSAPP ===
 async function procesarMensajeBot(wa_id, texto, referral) {
   console.log(`[bot] mensaje IN ${wa_id}: ${texto ? texto.substring(0, 80) : '(sin texto)'}`);
 
   await upsertPaciente(wa_id, texto, referral);
   await guardarMensaje(wa_id, 'in', texto);
 
-  // Construir historial de conversación para Claude
+  // Historial: últimos 10 mensajes en formato texto plano
   const historial = await obtenerHistorial(wa_id, 10);
 
-  // Agregar el mensaje actual al final
-  historial.push({ role: 'user', content: texto || '(mensaje sin texto)' });
+  // Quitamos el último mensaje del historial porque ya lo guardamos y lo vamos a re-agregar manualmente
+  // (obtenerHistorial trae el que acabamos de guardar al final)
+  const historialSinUltimo = historial.slice(0, -1);
 
-  // Llamar a Claude (por ahora sin tools, después con function calling para Reservo)
-  const respuesta = await claudeMessage(historial, SYSTEM_PROMPT_BOT, null);
+  const resultado = await procesarConversacionConTools(historialSinUltimo, texto || '(mensaje sin texto)');
 
-  if (respuesta.error) {
-    const errMsg = 'Disculpá, tuve un problema técnico. ¿Podés intentar de nuevo en un minuto? Si es urgente, llamanos al centro.';
-    await whatsappEnviarTexto(wa_id, errMsg);
-    await guardarMensaje(wa_id, 'out', errMsg, { error: JSON.stringify(respuesta.error) });
-    return;
-  }
-
-  // Extraer texto de la respuesta de Claude
-  let textoRespuesta = '';
-  if (respuesta.content && Array.isArray(respuesta.content)) {
-    for (const bloque of respuesta.content) {
-      if (bloque.type === 'text') {
-        textoRespuesta += bloque.text;
-      }
-    }
-  }
-
-  if (!textoRespuesta) {
-    textoRespuesta = 'Disculpá, no entendí. ¿Podés repetir?';
-  }
-
-  await whatsappEnviarTexto(wa_id, textoRespuesta);
-  await guardarMensaje(wa_id, 'out', textoRespuesta);
+  // Enviar respuesta por WhatsApp
+  await whatsappEnviarTexto(wa_id, resultado.texto);
+  await guardarMensaje(wa_id, 'out', resultado.texto, {
+    datos: { tools_log: resultado.tools_log, iteraciones: resultado.iteraciones },
+    error: resultado.ok ? null : (resultado.error ? JSON.stringify(resultado.error).substring(0, 500) : null)
+  });
 }
+
+// === SIMULADOR: probar bot SIN WhatsApp ===
+app.post('/api/bot/chat-test', async (req, res) => {
+  try {
+    const { wa_id, mensaje, reset } = req.body || {};
+    if (!wa_id || !mensaje) {
+      return res.status(400).json({ ok: false, error: "Faltan wa_id y mensaje" });
+    }
+
+    // Si reset=true, borrar historial previo de ese wa_id de test
+    if (reset) {
+      await pool.query(`DELETE FROM bot_conversaciones WHERE wa_id = $1`, [wa_id]);
+      await pool.query(`DELETE FROM bot_pacientes WHERE wa_id = $1`, [wa_id]);
+    }
+
+    await upsertPaciente(wa_id, mensaje, null);
+    await guardarMensaje(wa_id, 'in', mensaje);
+
+    const historial = await obtenerHistorial(wa_id, 10);
+    const historialSinUltimo = historial.slice(0, -1);
+
+    const resultado = await procesarConversacionConTools(historialSinUltimo, mensaje);
+
+    await guardarMensaje(wa_id, 'out', resultado.texto, {
+      datos: { tools_log: resultado.tools_log, iteraciones: resultado.iteraciones, modo: 'chat-test' }
+    });
+
+    res.json({
+      ok: true,
+      wa_id,
+      mensaje_usuario: mensaje,
+      respuesta_bot: resultado.texto,
+      iteraciones: resultado.iteraciones,
+      tools_usadas: resultado.tools_log.map(t => ({ nombre: t.nombre, input: t.input, output_preview: JSON.stringify(t.output).substring(0, 300) })),
+      historial_completo: historial
+    });
+  } catch (err) {
+    console.error('[chat-test]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 
 // ============================================
 // WEBHOOK META WHATSAPP
@@ -3824,7 +4184,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.19.2 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.20 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
