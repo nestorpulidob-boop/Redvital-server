@@ -2154,7 +2154,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.26",
+    servidor: "Redvital Backend v5.27",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2381,7 +2381,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.26 - Bot WhatsApp + Claude + Catálogo + Function Calling",
+    servidor: "Redvital Backend v5.27 - Bot WhatsApp + Claude + Catálogo + Function Calling",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -2837,10 +2837,13 @@ async function reservoGetTratamientos(uuid, token) {
   }
 }
 
-async function reservoGetSucursales(uuid, token) {
+async function reservoGetSucursales(uuid, token, uuidTratamiento) {
   try {
+    const params = {};
+    if (uuidTratamiento) params.uuid_tratamiento = uuidTratamiento;
     const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/sucursales/`, {
       headers: { Authorization: RESERVO_AUTH(token) },
+      params: params,
       timeout: 15000,
       validateStatus: () => true
     });
@@ -2848,6 +2851,23 @@ async function reservoGetSucursales(uuid, token) {
       return { __error: true, http: r.status, body: r.data };
     }
     return { __raw: r.data, __list: normalizarRespuestaReservo(r.data) };
+  } catch (err) {
+    return { __error: true, http: 0, body: err.message };
+  }
+}
+
+// Obtiene el formulario de campos requeridos para registrar un paciente nuevo
+async function reservoGetForm(uuid, token) {
+  try {
+    const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/form/`, {
+      headers: { Authorization: RESERVO_AUTH(token) },
+      timeout: 15000,
+      validateStatus: () => true
+    });
+    if (r.status >= 400) {
+      return { __error: true, http: r.status, body: r.data };
+    }
+    return { __ok: true, campos: r.data };
   } catch (err) {
     return { __error: true, http: 0, body: err.message };
   }
@@ -2887,34 +2907,41 @@ async function reservoProximaHora(uuid, token, params) {
   }
 }
 
-async function reservoVerificarPaciente(uuid, token, rut) {
+// Verifica si un paciente existe por RUT
+// IMPORTANTE: es POST a /makereserva/existencia_rut_api/ (NO bajo agenda_online)
+// Body: { rut }. Respuestas: {existe:1, paciente:uuid, datos_faltantes} | {existe:0} | {marcado:1}
+async function reservoVerificarPaciente(token, rut) {
   try {
-    const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/makereserva/existencia_rut_api/`, {
-      headers: { Authorization: RESERVO_AUTH(token) },
-      params: { rut },
-      timeout: 15000,
-      validateStatus: () => true
-    });
+    const r = await axios.post(`${RESERVO_API}/makereserva/existencia_rut_api/`,
+      { rut: rut },
+      {
+        headers: { Authorization: RESERVO_AUTH(token), 'Content-Type': 'application/json' },
+        timeout: 15000,
+        validateStatus: () => true
+      }
+    );
     if (r.status >= 400) {
       return { __error: true, http: r.status, body: r.data };
     }
-    return r.data;
+    return { __ok: true, data: r.data };
   } catch (err) {
     return { __error: true, http: 0, body: err.message };
   }
 }
 
-async function reservoCrearReserva(uuid, token, body) {
+// Crea una reserva. POST a /makereserva/confirmApptAPI/
+// body debe tener: sucursal, url (uuid_agenda), tratamientos_uuid[], agendas_uuid[], calendario{hour,time_zone,date}, cliente{}
+// Respuesta válida: status_code 200 + {status:1, citas:[...]}
+// Respuesta inválida: status_code 400 + {status:-1, error:{}}
+async function reservoCrearReserva(token, body) {
   try {
-    const r = await axios.post(`${RESERVO_API}/agenda_online/${uuid}/makereserva/confirmApptAPI/`, body, {
+    const r = await axios.post(`${RESERVO_API}/makereserva/confirmApptAPI/`, body, {
       headers: { Authorization: RESERVO_AUTH(token), 'Content-Type': 'application/json' },
       timeout: 30000,
       validateStatus: () => true
     });
-    if (r.status >= 400) {
-      return { __error: true, http: r.status, body: r.data };
-    }
-    return r.data;
+    // status 200 = ok, status 400 = error de validación (cupo ocupado, datos mal, etc)
+    return { __http: r.status, data: r.data };
   } catch (err) {
     return { __error: true, http: 0, body: err.message };
   }
@@ -3310,17 +3337,17 @@ const BOT_TOOLS = [
   },
   {
     name: "verificar_paciente_rut",
-    description: "Verifica si un paciente ya existe en el sistema buscando por RUT. Usar antes de pedir datos completos a un paciente nuevo. Si existe, devuelve datos; si no existe, indica que es nuevo.",
+    description: "Verifica si un paciente ya existe en Reservo buscando por RUT. Usar SIEMPRE antes de crear una reserva. Si existe, devuelve uuid_paciente (usalo en crear_reserva, no pidas nombre/teléfono). Si no existe, es paciente nuevo (pedí nombre completo, email, teléfono). Si devuelve lista_negra:true, NO agendar, derivar a secretaría.",
     input_schema: {
       type: "object",
       properties: {
         uuid_agenda: {
           type: "string",
-          description: "UUID de la agenda donde se hará la reserva"
+          description: "UUID de la agenda donde se hará la reserva (el mismo que usaste en consultar_disponibilidad)"
         },
         rut: {
           type: "string",
-          description: "RUT del paciente en formato chileno (con o sin guión, ej: '12345678-9' o '123456789')"
+          description: "RUT del paciente, con o sin puntos/guión (ej: '12.345.678-9' o '123456789'). El sistema lo normaliza."
         }
       },
       required: ["uuid_agenda", "rut"]
@@ -3328,23 +3355,27 @@ const BOT_TOOLS = [
   },
   {
     name: "crear_reserva",
-    description: "Crea una reserva de cita en el sistema Reservo. Usar SOLO al final cuando ya se confirmó: tratamiento, fecha, hora y datos del paciente. Después de crear la reserva, confirmar al paciente con sede, dirección, fecha y hora.",
+    description: "Crea la cita REAL en Reservo. Usar al final, cuando ya se confirmó tratamiento, fecha, hora y datos del paciente. IMPORTANTE: los campos uuid_profesional, sucursal_uuid, hora_con_segundos, time_zone y fecha vienen del resultado de consultar_disponibilidad (del horario que el paciente eligió). Si el paciente YA existe, pasá uuid_paciente. Si es nuevo, pasá rut+nombre+apellidos+email. Si devuelve ok:false con error_validacion, el cupo puede haberse ocupado: consultá disponibilidad de nuevo y ofrecé otra hora.",
     input_schema: {
       type: "object",
       properties: {
-        uuid_agenda: { type: "string", description: "UUID de la agenda" },
+        uuid_agenda: { type: "string", description: "UUID de la agenda (mismo de consultar_disponibilidad)" },
         uuid_tratamiento: { type: "string", description: "UUID del tratamiento" },
-        uuid_profesional: { type: "string", description: "UUID del profesional (de los horarios disponibles)" },
-        fecha: { type: "string", description: "Fecha YYYY-MM-DD" },
-        hora: { type: "string", description: "Hora HH:MM" },
-        rut: { type: "string", description: "RUT del paciente" },
+        uuid_profesional: { type: "string", description: "uuid_profesional del horario elegido (viene de consultar_disponibilidad)" },
+        sucursal_uuid: { type: "string", description: "sucursal_uuid del horario elegido (viene de consultar_disponibilidad)" },
+        fecha: { type: "string", description: "Fecha YYYY-MM-DD del horario elegido" },
+        hora_con_segundos: { type: "string", description: "hora_con_segundos del horario elegido, formato HH:MM:SS (viene de consultar_disponibilidad)" },
+        time_zone: { type: "string", description: "time_zone del horario elegido, normalmente 'America/Santiago'" },
+        uuid_paciente: { type: "string", description: "UUID del paciente si YA existe (lo devuelve verificar_paciente_rut). Si lo pasás, NO hace falta rut/nombre/etc." },
+        rut: { type: "string", description: "RUT del paciente (solo si es paciente NUEVO, sin uuid_paciente)" },
         nombre: { type: "string", description: "Nombre del paciente (solo si es nuevo)" },
         apellido_paterno: { type: "string", description: "Apellido paterno (solo si es nuevo)" },
         apellido_materno: { type: "string", description: "Apellido materno (solo si es nuevo)" },
-        telefono: { type: "string", description: "Teléfono del paciente" },
-        mail: { type: "string", description: "Email del paciente (opcional)" }
+        email: { type: "string", description: "Email del paciente (solo si es nuevo)" },
+        telefono: { type: "string", description: "Teléfono del paciente (solo si es nuevo)" },
+        prevision_id: { type: "integer", description: "ID de previsión (solo si es nuevo). Fonasa=1, Banmedica=2, Cruz Blanca=3, Consalud=4, MasVida=5, Vida Tres=6, Colmena=7, Particular=10. Si no estás seguro, omitir." }
       },
-      required: ["uuid_agenda", "uuid_tratamiento", "uuid_profesional", "fecha", "hora", "rut"]
+      required: ["uuid_agenda", "uuid_tratamiento", "uuid_profesional", "sucursal_uuid", "fecha", "hora_con_segundos"]
     }
   }
 ];
@@ -3397,7 +3428,7 @@ async function ejecutarTool(nombre, input) {
         return { ok: false, error: `Error Reservo http=${resp.http}`, detalle: resp.body };
       }
 
-      // Formato Reservo: [{ fecha, sucursales: [{ nombre, direccion, profesionales: [{ agenda, nombre, horas_disponibles: [] }] }] }]
+      // Formato Reservo: [{ fecha, sucursales: [{ uuid, nombre, direccion, profesionales: [{ agenda, nombre, horas_disponibles: [] }] }] }]
       const data = resp.data;
       const horariosAplanados = [];
 
@@ -3409,12 +3440,16 @@ async function ejecutarTool(nombre, input) {
               for (const horaISO of (prof.horas_disponibles || [])) {
                 // horaISO ej: "2026-05-19T18:15:00-04:00"
                 const horaSolo = horaISO.substring(11, 16); // "18:15"
+                const horaConSeg = horaISO.substring(11, 19); // "18:15:00"
                 horariosAplanados.push({
                   fecha: fecha,
                   hora: horaSolo,
+                  hora_con_segundos: horaConSeg,
                   hora_iso: horaISO,
+                  time_zone: suc.time_zone || "America/Santiago",
                   profesional_nombre: prof.nombre,
-                  uuid_profesional: prof.agenda, // OJO: el campo 'agenda' es el uuid del profesional para reservar
+                  uuid_profesional: prof.agenda, // el campo 'agenda' es el uuid del profesional para reservar
+                  sucursal_uuid: suc.uuid,
                   sucursal_nombre: suc.nombre,
                   sucursal_direccion: suc.direccion
                 });
@@ -3439,44 +3474,115 @@ async function ejecutarTool(nombre, input) {
     if (nombre === "verificar_paciente_rut") {
       const agenda = AGENDAS_BOT.find(a => a.uuid === input.uuid_agenda);
       if (!agenda) return { ok: false, error: "Agenda no encontrada" };
-      const rutLimpio = String(input.rut).replace(/[.\s-]/g, "");
-      const r = await reservoVerificarPaciente(agenda.uuid, agenda.token, rutLimpio);
+      // RUT sin puntos, con guión (formato que pide Reservo)
+      let rutLimpio = String(input.rut).replace(/[.\s]/g, "");
+      if (!rutLimpio.includes("-") && rutLimpio.length > 1) {
+        rutLimpio = rutLimpio.slice(0, -1) + "-" + rutLimpio.slice(-1);
+      }
+
+      const r = await reservoVerificarPaciente(agenda.token, rutLimpio);
       if (r.__error) {
-        // 404 puede significar "no existe" — eso es válido
-        if (r.http === 404) {
-          return { ok: true, existe: false, mensaje: "Paciente no encontrado, es nuevo" };
-        }
         return { ok: false, error: `Error Reservo http=${r.http}`, detalle: r.body };
       }
-      return { ok: true, existe: true, datos: r };
+
+      const data = r.data || {};
+      // Respuestas posibles: {existe:1, paciente:uuid, datos_faltantes} | {existe:0} | {marcado:1}
+      if (data.marcado === 1) {
+        return { ok: true, existe: false, lista_negra: true, mensaje: "Paciente en lista negra. Derivar a secretaría, no agendar por bot." };
+      }
+      if (data.existe === 1) {
+        return {
+          ok: true,
+          existe: true,
+          uuid_paciente: data.paciente,
+          datos_faltantes: data.datos_faltantes || {},
+          rut_normalizado: rutLimpio,
+          mensaje: "Paciente ya registrado. Usar uuid_paciente para crear la reserva, no pedir nombre/teléfono de nuevo."
+        };
+      }
+      // existe: 0
+      return {
+        ok: true,
+        existe: false,
+        rut_normalizado: rutLimpio,
+        mensaje: "Paciente nuevo. Necesito nombre completo, email y teléfono para registrarlo al crear la reserva."
+      };
     }
 
     if (nombre === "crear_reserva") {
       const agenda = AGENDAS_BOT.find(a => a.uuid === input.uuid_agenda);
       if (!agenda) return { ok: false, error: "Agenda no encontrada" };
 
-      // Construir body según formato Reservo
-      const rutLimpio = String(input.rut).replace(/[.\s-]/g, "");
-      const body = {
-        rut: rutLimpio,
-        tratamiento: input.uuid_tratamiento,
-        profesional: input.uuid_profesional,
-        fecha: input.fecha,
-        hora: input.hora,
-        nombre: input.nombre || undefined,
-        apellido_paterno: input.apellido_paterno || undefined,
-        apellido_materno: input.apellido_materno || undefined,
-        telefono_1: input.telefono || undefined,
-        mail: input.mail || undefined
-      };
-      // Eliminar campos undefined
-      Object.keys(body).forEach(k => body[k] === undefined && delete body[k]);
-
-      const r = await reservoCrearReserva(agenda.uuid, agenda.token, body);
-      if (r.__error) {
-        return { ok: false, error: `Error Reservo http=${r.http}`, detalle: r.body };
+      // Construir el objeto cliente según si existe o es nuevo
+      let cliente;
+      if (input.uuid_paciente) {
+        // Paciente existente: solo uuid
+        cliente = { uuid: input.uuid_paciente };
+      } else {
+        // Paciente nuevo: campos del formulario
+        let rutLimpio = String(input.rut || "").replace(/[.\s]/g, "");
+        if (!rutLimpio.includes("-") && rutLimpio.length > 1) {
+          rutLimpio = rutLimpio.slice(0, -1) + "-" + rutLimpio.slice(-1);
+        }
+        cliente = {
+          rut: rutLimpio,
+          nombre: input.nombre || "",
+          apellido_paterno: input.apellido_paterno || "",
+          apellido_materno: input.apellido_materno || "",
+          email: input.email || ""
+        };
+        if (input.telefono) cliente.telefono = input.telefono;
+        if (input.prevision_id) cliente.prevision = input.prevision_id;
       }
-      return { ok: true, reserva: r, sede: agenda.sede, sucursal: agenda.sede === "sede1" ? SEDES.sede1.direccion : SEDES.sede2.direccion };
+
+      // Body según documentación de confirmApptAPI
+      const body = {
+        sucursal: input.sucursal_uuid,
+        url: agenda.uuid,
+        tratamientos_uuid: [input.uuid_tratamiento],
+        agendas_uuid: [input.uuid_profesional],
+        calendario: {
+          hour: input.hora_con_segundos || (input.hora && input.hora.length === 5 ? input.hora + ":00" : input.hora),
+          time_zone: input.time_zone || "America/Santiago",
+          date: input.fecha
+        },
+        cliente: cliente
+      };
+
+      const r = await reservoCrearReserva(agenda.token, body);
+
+      if (r.__error) {
+        return { ok: false, error: `Error de conexión con Reservo`, detalle: r.body };
+      }
+
+      const data = r.data || {};
+      // status 1 = éxito, status -1 = error de validación
+      if (r.__http === 200 && data.status === 1) {
+        const citaCreada = (data.citas && data.citas[0]) || {};
+        return {
+          ok: true,
+          cita_creada: true,
+          uuid_cita: citaCreada.uuid,
+          detalle_cita: {
+            inicio: citaCreada.inicio,
+            estado: citaCreada.estado ? citaCreada.estado.descripcion : null,
+            profesional: citaCreada.profesional ? citaCreada.profesional.nombre : null,
+            sucursal: citaCreada.sucursal ? citaCreada.sucursal.nombre : null,
+            tratamiento: (citaCreada.tratamientos && citaCreada.tratamientos[0]) ? citaCreada.tratamientos[0].nombre : null
+          },
+          body_enviado: body
+        };
+      }
+
+      // Error de validación (status -1, cupo ocupado, datos mal, etc)
+      return {
+        ok: false,
+        cita_creada: false,
+        error_validacion: data.error || data,
+        http: r.__http,
+        mensaje: "No se pudo crear la reserva. Puede que el cupo se haya ocupado recién o falten datos. Ofrecé al paciente consultar disponibilidad de nuevo.",
+        body_enviado: body
+      };
     }
 
     return { ok: false, error: `Tool desconocida: ${nombre}` };
@@ -3596,22 +3702,29 @@ FLUJO DE AGENDAMIENTO (seguilo en este orden)
 - Si esa no tiene → probá la siguiente
 - Mostrale máximo 4-5 opciones: "Tengo a las 10:00, 11:30 o 16:00. ¿Cuál preferís?"
 - Si no hay ningún horario ese día → ofrecé el siguiente día disponible (consultar_disponibilidad sin fecha)
+- GUARDÁ MENTALMENTE los datos del horario que el paciente elija: uuid_profesional, sucursal_uuid, fecha, hora_con_segundos, time_zone. Los vas a necesitar para crear_reserva.
 
 **PASO 4 — Pedir TODOS los datos juntos (cuando el paciente eligió hora):**
-"Genial. Para confirmar necesito: tu RUT, previsión (Fonasa, isapre o particular), y edad. Si es la primera vez, tu nombre completo y un teléfono."
+"Genial. Para confirmar necesito tu RUT."
+(Pedí primero solo el RUT. Con eso verificás si ya existe.)
 
 **PASO 5 — Verificar RUT:**
-- Llamá verificar_paciente_rut con el RUT que dio
-- Si EXISTE: usá los datos que devuelve, no pidas nombre/teléfono otra vez
-- Si NO EXISTE: pedí los datos faltantes (nombre completo, teléfono)
+- Llamá verificar_paciente_rut con uuid_agenda + rut
+- Si devuelve existe:true → tenés uuid_paciente. NO pidas nombre/teléfono, ya está registrado. Pasá directo al PASO 6.
+- Si devuelve existe:false → es paciente nuevo. Pedile: "Como es tu primera vez, necesito tu nombre completo, email y un teléfono."
+- Si devuelve lista_negra:true → "Para agendar necesito que llames directamente al centro." NO sigas con el bot.
 
 **PASO 6 — Crear reserva:**
-- Llamá crear_reserva con TODO
-- Si falla → decí que hubo problema y que llame al centro
+- Llamá crear_reserva con todos los datos del horario elegido (uuid_agenda, uuid_tratamiento, uuid_profesional, sucursal_uuid, fecha, hora_con_segundos, time_zone)
+- Si el paciente EXISTE: pasá uuid_paciente
+- Si el paciente es NUEVO: pasá rut, nombre, apellido_paterno, apellido_materno, email, telefono (y prevision_id si lo sabés)
+- Si devuelve ok:true → cita creada, andá al PASO 7
+- Si devuelve ok:false con error_validacion → el cupo puede haberse ocupado recién. Decile: "Uy, justo se ocupó esa hora. Dejame ver qué otras hay." y volvé al PASO 3 (consultar disponibilidad de nuevo)
 
 **PASO 7 — Confirmar:**
-"✅ Listo. Te agendé:
+"✅ Listo, te agendé:
 [Tratamiento] el [día fecha] a las [hora]
+con [profesional]
 en [sede], [dirección]
 ¡Te esperamos!"
 
@@ -3624,16 +3737,19 @@ en [sede], [dirección]
 DATOS NECESARIOS PARA AGENDAR
 ═══════════════════════════════════════════
 
-Mínimos obligatorios:
-- RUT
-- Previsión (Fonasa / Particular / Isapre)
-- Edad
+Para TODOS:
+- RUT (con eso verificás si existe)
 
-Si el paciente NO EXISTE en el sistema (verificar_paciente_rut devuelve existe:false):
-- Nombre completo
+Si el paciente YA EXISTE (verificar_paciente_rut devuelve existe:true):
+- Solo necesitás el uuid_paciente que te devuelve. NADA MÁS. No pidas nombre, teléfono ni previsión.
+
+Si el paciente es NUEVO (existe:false):
+- Nombre completo (nombre + apellido paterno + apellido materno)
+- Email
 - Teléfono
+- Previsión (opcional pero útil): Fonasa, Particular, o el nombre de la isapre
 
-Si EXISTE → no preguntar de nuevo, usar los datos del sistema.
+NUNCA pidas la edad — no es necesaria para agendar.
 
 ═══════════════════════════════════════════
 ESTILO DE RESPUESTAS
@@ -3727,6 +3843,7 @@ async function upsertPaciente(wa_id, mensaje, referral) {
 // Toma historial + mensaje nuevo, llama a Claude, ejecuta tools si hace falta, y devuelve respuesta final
 async function procesarConversacionConTools(historialTexto, mensajeUsuario, opciones = {}) {
   const maxIter = opciones.maxIter || 5;
+  const waId = opciones.waId || null;
   const system = await construirSystemPrompt();
   const toolsLog = [];
 
@@ -3763,6 +3880,40 @@ async function procesarConversacionConTools(historialTexto, mensajeUsuario, opci
             input: block.input,
             output: resultado
           });
+
+          // Si se creó una reserva exitosamente, guardarla en bot_citas
+          if (block.name === 'crear_reserva' && resultado.ok && resultado.cita_creada && waId) {
+            try {
+              const det = resultado.detalle_cita || {};
+              const inp = block.input || {};
+              const agenda = AGENDAS_BOT.find(a => a.uuid === inp.uuid_agenda);
+              await pool.query(
+                `INSERT INTO bot_citas
+                 (wa_id, uuid_cita, uuid_paciente, sede, sucursal, profesional, tratamiento, fecha, hora, estado)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'confirmada')`,
+                [
+                  waId,
+                  resultado.uuid_cita || null,
+                  inp.uuid_paciente || null,
+                  agenda ? agenda.sede : null,
+                  det.sucursal || null,
+                  det.profesional || null,
+                  det.tratamiento || null,
+                  inp.fecha || null,
+                  inp.hora_con_segundos || null
+                ]
+              );
+              // Incrementar contador de citas del paciente
+              await pool.query(
+                `UPDATE bot_pacientes SET total_citas_agendadas = total_citas_agendadas + 1 WHERE wa_id = $1`,
+                [waId]
+              );
+              console.log(`[bot] cita guardada en bot_citas para ${waId}, uuid=${resultado.uuid_cita}`);
+            } catch (e) {
+              console.error('[bot] error guardando cita en bot_citas:', e.message);
+            }
+          }
+
           toolResults.push({
             type: 'tool_result',
             tool_use_id: block.id,
@@ -3817,7 +3968,7 @@ async function procesarMensajeBot(wa_id, texto, referral) {
   // (obtenerHistorial trae el que acabamos de guardar al final)
   const historialSinUltimo = historial.slice(0, -1);
 
-  const resultado = await procesarConversacionConTools(historialSinUltimo, texto || '(mensaje sin texto)');
+  const resultado = await procesarConversacionConTools(historialSinUltimo, texto || '(mensaje sin texto)', { waId: wa_id });
 
   // Enviar respuesta por WhatsApp
   await whatsappEnviarTexto(wa_id, resultado.texto);
@@ -3847,7 +3998,7 @@ app.post('/api/bot/chat-test', async (req, res) => {
     const historial = await obtenerHistorial(wa_id, 10);
     const historialSinUltimo = historial.slice(0, -1);
 
-    const resultado = await procesarConversacionConTools(historialSinUltimo, mensaje);
+    const resultado = await procesarConversacionConTools(historialSinUltimo, mensaje, { waId: wa_id });
 
     await guardarMensaje(wa_id, 'out', resultado.texto, {
       datos: { tools_log: resultado.tools_log, iteraciones: resultado.iteraciones, modo: 'chat-test' }
@@ -3969,6 +4120,91 @@ app.get('/api/bot/pacientes', async (req, res) => {
       `SELECT * FROM bot_pacientes ORDER BY ultima_interaccion DESC LIMIT 100`
     );
     res.json({ ok: true, total: rows.length, pacientes: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Citas creadas por el bot — para mostrar en el dashboard
+app.get('/api/bot/citas', async (req, res) => {
+  try {
+    const { estado, desde, hasta } = req.query;
+    const params = [];
+    let where = '1=1';
+    if (estado) { params.push(estado); where += ` AND bc.estado = $${params.length}`; }
+    if (desde) { params.push(desde); where += ` AND bc.fecha >= $${params.length}::date`; }
+    if (hasta) { params.push(hasta); where += ` AND bc.fecha <= $${params.length}::date`; }
+
+    const { rows } = await pool.query(
+      `SELECT
+         bc.id, bc.wa_id, bc.uuid_cita, bc.sede, bc.sucursal,
+         bc.profesional, bc.tratamiento, bc.fecha, bc.hora, bc.estado,
+         bc.creada_en,
+         bp.nombre AS paciente_nombre, bp.rut AS paciente_rut,
+         bp.referral_source_type, bp.referral_source_id
+       FROM bot_citas bc
+       LEFT JOIN bot_pacientes bp ON bp.wa_id = bc.wa_id
+       WHERE ${where}
+       ORDER BY bc.creada_en DESC
+       LIMIT 200`,
+      params
+    );
+
+    // Resumen rápido
+    const resumen = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE estado = 'confirmada')::int AS confirmadas,
+        COUNT(*) FILTER (WHERE fecha >= CURRENT_DATE)::int AS futuras,
+        COUNT(*) FILTER (WHERE creada_en >= CURRENT_DATE)::int AS creadas_hoy
+      FROM bot_citas
+    `);
+
+    res.json({
+      ok: true,
+      resumen: resumen.rows[0],
+      total: rows.length,
+      citas: rows
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Métricas del bot — conversaciones, conversión, etc.
+app.get('/api/bot/metricas', async (req, res) => {
+  try {
+    const pacientes = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total_pacientes,
+        COUNT(*) FILTER (WHERE primera_interaccion >= CURRENT_DATE)::int AS nuevos_hoy,
+        COUNT(*) FILTER (WHERE primera_interaccion >= CURRENT_DATE - INTERVAL '7 days')::int AS nuevos_semana,
+        COUNT(*) FILTER (WHERE total_citas_agendadas > 0)::int AS pacientes_con_cita,
+        SUM(total_mensajes)::int AS total_mensajes,
+        SUM(total_citas_agendadas)::int AS total_citas
+      FROM bot_pacientes
+    `);
+    const conv = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total_mensajes,
+        COUNT(*) FILTER (WHERE direccion = 'in')::int AS mensajes_entrantes,
+        COUNT(*) FILTER (WHERE direccion = 'out')::int AS mensajes_salientes,
+        COUNT(*) FILTER (WHERE error IS NOT NULL)::int AS con_error,
+        COUNT(DISTINCT wa_id)::int AS conversaciones_unicas
+      FROM bot_conversaciones
+    `);
+    const p = pacientes.rows[0] || {};
+    const tasaConversion = p.total_pacientes > 0
+      ? +(100 * (p.pacientes_con_cita || 0) / p.total_pacientes).toFixed(1)
+      : 0;
+
+    res.json({
+      ok: true,
+      pacientes: p,
+      conversaciones: conv.rows[0],
+      tasa_conversion_pct: tasaConversion,
+      nota: "tasa_conversion = pacientes que agendaron al menos 1 cita / total pacientes que escribieron"
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -4495,7 +4731,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.26 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.27 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
