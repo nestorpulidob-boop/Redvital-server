@@ -2701,6 +2701,20 @@ const AGENDAS_BOT = [
   { sede: 'sede1', tipo: 'sucursales2', uuid: process.env.UUID_AGENDA_SEDE1_SUCURSALES2, token: process.env.TOKEN_SEDE1 }
 ].filter(a => a.uuid && a.token);
 
+// Normaliza la respuesta Reservo: si viene paginado {count,results}, extrae results.
+// Si viene array directo, lo deja. Si viene objeto único, lo envuelve.
+function normalizarRespuestaReservo(data) {
+  if (Array.isArray(data)) return data;
+  if (data && typeof data === 'object') {
+    if (Array.isArray(data.results)) return data.results;
+    if (Array.isArray(data.resultados)) return data.resultados;
+    if (Array.isArray(data.data)) return data.data;
+    // Si es un objeto pero no parece colección, devolverlo en array
+    return [data];
+  }
+  return [];
+}
+
 async function reservoGetProfesionales(uuid, token) {
   try {
     const r = await axios.get(`${RESERVO_API}/agenda_online/${uuid}/profesionales/`, {
@@ -2711,7 +2725,7 @@ async function reservoGetProfesionales(uuid, token) {
     if (r.status >= 400) {
       return { __error: true, http: r.status, body: r.data };
     }
-    return r.data || [];
+    return { __raw: r.data, __list: normalizarRespuestaReservo(r.data) };
   } catch (err) {
     return { __error: true, http: 0, body: err.message };
   }
@@ -2727,7 +2741,7 @@ async function reservoGetTratamientos(uuid, token) {
     if (r.status >= 400) {
       return { __error: true, http: r.status, body: r.data };
     }
-    return r.data || [];
+    return { __raw: r.data, __list: normalizarRespuestaReservo(r.data) };
   } catch (err) {
     return { __error: true, http: 0, body: err.message };
   }
@@ -2743,7 +2757,7 @@ async function reservoGetSucursales(uuid, token) {
     if (r.status >= 400) {
       return { __error: true, http: r.status, body: r.data };
     }
-    return r.data || [];
+    return { __raw: r.data, __list: normalizarRespuestaReservo(r.data) };
   } catch (err) {
     return { __error: true, http: 0, body: err.message };
   }
@@ -2848,16 +2862,22 @@ app.get("/api/bot/test-reservo", async (req, res) => {
     ]);
     const profsError = profs && profs.__error;
     const tratsError = trats && trats.__error;
+    const profsList = profsError ? null : (profs.__list || []);
+    const tratsList = tratsError ? null : (trats.__list || []);
     resultado.push({
       sede: agenda.sede,
       tipo: agenda.tipo,
       uuid: agenda.uuid,
-      profesionales: profsError ? `ERROR http=${profs.http}` : (Array.isArray(profs) ? profs.length : 'fmt'),
+      profesionales: profsError ? `ERROR http=${profs.http}` : profsList.length,
       profesionales_error_body: profsError ? profs.body : null,
-      tratamientos: tratsError ? `ERROR http=${trats.http}` : (Array.isArray(trats) ? trats.length : 'fmt'),
+      tratamientos: tratsError ? `ERROR http=${trats.http}` : tratsList.length,
       tratamientos_error_body: tratsError ? trats.body : null,
-      sample_profesional: !profsError && Array.isArray(profs) && profs[0] ? profs[0] : null,
-      sample_tratamiento: !tratsError && Array.isArray(trats) && trats[0] ? trats[0] : null
+      sample_profesional: profsList && profsList[0] ? profsList[0] : null,
+      sample_tratamiento: tratsList && tratsList[0] ? tratsList[0] : null,
+      raw_profesionales_keys: !profsError && profs.__raw && typeof profs.__raw === 'object' && !Array.isArray(profs.__raw)
+        ? Object.keys(profs.__raw) : null,
+      raw_tratamientos_keys: !tratsError && trats.__raw && typeof trats.__raw === 'object' && !Array.isArray(trats.__raw)
+        ? Object.keys(trats.__raw) : null
     });
   }
   res.json({ ok: true, total_agendas: AGENDAS_BOT.length, agendas: resultado });
@@ -2867,8 +2887,9 @@ app.get("/api/bot/tratamientos", async (req, res) => {
   const tratamientos = {};
   for (const agenda of AGENDAS_BOT) {
     const trats = await reservoGetTratamientos(agenda.uuid, agenda.token);
-    if (!Array.isArray(trats)) continue;
-    for (const t of trats) {
+    if (trats.__error) continue;
+    const lista = trats.__list || [];
+    for (const t of lista) {
       const key = t.nombre || t.descripcion || 'sin_nombre';
       if (!tratamientos[key]) {
         tratamientos[key] = { nombre: key, agendas: [] };
