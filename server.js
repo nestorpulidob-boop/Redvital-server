@@ -2683,7 +2683,81 @@ async function inicializarBotBD() {
       )
     `);
 
-    console.log("[bot BD] Tablas del bot verificadas");
+    // === CATÁLOGO DE PROFESIONALES (cache de Reservo) ===
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_catalogo_profesionales (
+        uuid TEXT NOT NULL,
+        agenda_uuid TEXT NOT NULL,
+        agenda_sede TEXT NOT NULL,
+        agenda_tipo TEXT NOT NULL,
+        nombre TEXT NOT NULL,
+        nombre_normalizado TEXT,
+        cargo TEXT,
+        identificador TEXT,
+        codigo_especialidad TEXT,
+        sucursal_uuid TEXT,
+        activo BOOLEAN DEFAULT TRUE,
+        sincronizado_en TIMESTAMPTZ DEFAULT NOW(),
+        creado_en TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (uuid, agenda_uuid)
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cat_prof_nombre_norm ON bot_catalogo_profesionales(nombre_normalizado)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cat_prof_cargo ON bot_catalogo_profesionales(cargo)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cat_prof_activo ON bot_catalogo_profesionales(activo)`);
+
+    // === CATÁLOGO DE TRATAMIENTOS (cache de Reservo) ===
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_catalogo_tratamientos (
+        uuid TEXT NOT NULL,
+        agenda_uuid TEXT NOT NULL,
+        agenda_sede TEXT NOT NULL,
+        agenda_tipo TEXT NOT NULL,
+        nombre TEXT NOT NULL,
+        nombre_normalizado TEXT,
+        codigo TEXT,
+        descripcion TEXT,
+        valor NUMERIC(10,2),
+        duracion TEXT,
+        categoria_uuid TEXT,
+        categoria_nombre TEXT,
+        indicacion TEXT,
+        activo BOOLEAN DEFAULT TRUE,
+        sincronizado_en TIMESTAMPTZ DEFAULT NOW(),
+        creado_en TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (uuid, agenda_uuid)
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cat_trat_nombre_norm ON bot_catalogo_tratamientos(nombre_normalizado)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cat_trat_categoria ON bot_catalogo_tratamientos(categoria_nombre)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_cat_trat_activo ON bot_catalogo_tratamientos(activo)`);
+
+    // === LOG DE SINCRONIZACIONES ===
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_sync_log (
+        id BIGSERIAL PRIMARY KEY,
+        iniciado_en TIMESTAMPTZ DEFAULT NOW(),
+        finalizado_en TIMESTAMPTZ,
+        duracion_ms INT,
+        tipo TEXT,
+        agendas_procesadas INT DEFAULT 0,
+        agendas_con_error INT DEFAULT 0,
+        profesionales_total INT DEFAULT 0,
+        profesionales_nuevos INT DEFAULT 0,
+        profesionales_actualizados INT DEFAULT 0,
+        profesionales_desactivados INT DEFAULT 0,
+        tratamientos_total INT DEFAULT 0,
+        tratamientos_nuevos INT DEFAULT 0,
+        tratamientos_actualizados INT DEFAULT 0,
+        tratamientos_desactivados INT DEFAULT 0,
+        detalle JSONB,
+        estado TEXT DEFAULT 'en_curso',
+        error TEXT
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_iniciado ON bot_sync_log(iniciado_en DESC)`);
+
+    console.log("[bot BD] Tablas del bot + catálogo verificadas");
   } catch (err) {
     console.error("[bot BD] Error inicializando:", err.message);
   }
@@ -3228,13 +3302,543 @@ app.get('/api/bot/pacientes', async (req, res) => {
   }
 });
 
+// =============================================================
+// FASE 1: CATÁLOGO + SINCRONIZACIÓN AUTOMÁTICA (v5.19)
+// =============================================================
+
+// Lista de agendas que SÍ funcionan (las otras 2 dieron 404)
+// Esto se construye dinámicamente filtrando solo las que responden bien
+const AGENDAS_ACTIVAS = AGENDAS_BOT; // se filtra en cada sync, las que dan 404 quedan logueadas
+
+// Normalizador para búsqueda fuzzy: minúsculas, sin acentos, sin espacios extras
+function normalizarTexto(texto) {
+  if (!texto) return '';
+  return String(texto)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Versión paginada: sigue pagina_siguiente hasta agotar
+async function reservoGetTodoPaginado(url, token) {
+  const todos = [];
+  let nextUrl = url;
+  let safety = 0;
+  while (nextUrl && safety < 50) {
+    safety++;
+    try {
+      const r = await axios.get(nextUrl, {
+        headers: { Authorization: RESERVO_AUTH(token) },
+        timeout: 30000,
+        validateStatus: () => true
+      });
+      if (r.status >= 400) {
+        return { __error: true, http: r.status, body: r.data, parcial: todos };
+      }
+      const data = r.data;
+      let items = [];
+      if (Array.isArray(data)) {
+        items = data;
+        nextUrl = null;
+      } else if (data && typeof data === 'object') {
+        items = Array.isArray(data.resultados) ? data.resultados
+              : Array.isArray(data.results) ? data.results
+              : Array.isArray(data.data) ? data.data
+              : [];
+        nextUrl = data.pagina_siguiente || data.next || null;
+      } else {
+        nextUrl = null;
+      }
+      todos.push(...items);
+    } catch (err) {
+      return { __error: true, http: 0, body: err.message, parcial: todos };
+    }
+  }
+  return todos;
+}
+
+// ============================================
+// SINCRONIZACIÓN DE CATÁLOGO
+// ============================================
+let SYNC_EN_CURSO = false;
+
+async function sincronizarCatalogo(tipo = 'auto') {
+  if (SYNC_EN_CURSO) {
+    console.log('[sync] Ya hay una sincronización en curso, saltando');
+    return { ok: false, razon: 'sync_en_curso' };
+  }
+  SYNC_EN_CURSO = true;
+  const inicio = Date.now();
+
+  // Crear registro de log
+  let logId = null;
+  try {
+    const r = await pool.query(
+      `INSERT INTO bot_sync_log (tipo, estado) VALUES ($1, 'en_curso') RETURNING id`,
+      [tipo]
+    );
+    logId = r.rows[0].id;
+  } catch (e) {
+    console.error('[sync] No se pudo crear log:', e.message);
+  }
+
+  const detalle = { agendas: [] };
+  let agendasOK = 0, agendasError = 0;
+  let profsNuevos = 0, profsActualizados = 0;
+  let tratsNuevos = 0, tratsActualizados = 0;
+
+  // UUIDs vistos en esta sync (para marcar como inactivos los que ya no aparezcan)
+  const profsVistos = new Set();
+  const tratsVistos = new Set();
+
+  try {
+    for (const agenda of AGENDAS_BOT) {
+      const detAgenda = {
+        sede: agenda.sede,
+        tipo: agenda.tipo,
+        uuid_agenda: agenda.uuid,
+        profesionales: 0,
+        tratamientos: 0,
+        errores: []
+      };
+
+      // === PROFESIONALES ===
+      const urlProfs = `${RESERVO_API}/agenda_online/${agenda.uuid}/profesionales/`;
+      const profs = await reservoGetTodoPaginado(urlProfs, agenda.token);
+
+      if (profs.__error) {
+        detAgenda.errores.push(`profesionales: http=${profs.http}`);
+        agendasError++;
+      } else {
+        detAgenda.profesionales = profs.length;
+        for (const p of profs) {
+          if (!p.uuid) continue;
+          profsVistos.add(`${p.uuid}|${agenda.uuid}`);
+          try {
+            const result = await pool.query(
+              `INSERT INTO bot_catalogo_profesionales
+               (uuid, agenda_uuid, agenda_sede, agenda_tipo, nombre, nombre_normalizado, cargo, identificador, codigo_especialidad, sucursal_uuid, activo, sincronizado_en)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,TRUE,NOW())
+               ON CONFLICT (uuid, agenda_uuid) DO UPDATE SET
+                 nombre = EXCLUDED.nombre,
+                 nombre_normalizado = EXCLUDED.nombre_normalizado,
+                 cargo = EXCLUDED.cargo,
+                 identificador = EXCLUDED.identificador,
+                 codigo_especialidad = EXCLUDED.codigo_especialidad,
+                 sucursal_uuid = EXCLUDED.sucursal_uuid,
+                 activo = TRUE,
+                 sincronizado_en = NOW()
+               RETURNING (xmax = 0) AS es_nuevo`,
+              [
+                p.uuid, agenda.uuid, agenda.sede, agenda.tipo,
+                p.nombre || '', normalizarTexto(p.nombre),
+                p.cargo || null, p.identificador || null,
+                p.codigo_especialidad || null, p.sucursal || null
+              ]
+            );
+            if (result.rows[0].es_nuevo) profsNuevos++;
+            else profsActualizados++;
+          } catch (e) {
+            detAgenda.errores.push(`prof ${p.uuid}: ${e.message}`);
+          }
+        }
+      }
+
+      // === TRATAMIENTOS ===
+      const urlTrats = `${RESERVO_API}/agenda_online/${agenda.uuid}/tratamientos/`;
+      const trats = await reservoGetTodoPaginado(urlTrats, agenda.token);
+
+      if (trats.__error) {
+        detAgenda.errores.push(`tratamientos: http=${trats.http}`);
+        // Si profesionales también falló no contamos doble
+        if (detAgenda.errores.length === 1) agendasError++;
+      } else {
+        detAgenda.tratamientos = trats.length;
+        for (const t of trats) {
+          if (!t.uuid) continue;
+          tratsVistos.add(`${t.uuid}|${agenda.uuid}`);
+          try {
+            const valor = t.valor ? parseFloat(t.valor) : null;
+            const result = await pool.query(
+              `INSERT INTO bot_catalogo_tratamientos
+               (uuid, agenda_uuid, agenda_sede, agenda_tipo, nombre, nombre_normalizado, codigo, descripcion, valor, duracion, categoria_uuid, categoria_nombre, indicacion, activo, sincronizado_en)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,TRUE,NOW())
+               ON CONFLICT (uuid, agenda_uuid) DO UPDATE SET
+                 nombre = EXCLUDED.nombre,
+                 nombre_normalizado = EXCLUDED.nombre_normalizado,
+                 codigo = EXCLUDED.codigo,
+                 descripcion = EXCLUDED.descripcion,
+                 valor = EXCLUDED.valor,
+                 duracion = EXCLUDED.duracion,
+                 categoria_uuid = EXCLUDED.categoria_uuid,
+                 categoria_nombre = EXCLUDED.categoria_nombre,
+                 indicacion = EXCLUDED.indicacion,
+                 activo = TRUE,
+                 sincronizado_en = NOW()
+               RETURNING (xmax = 0) AS es_nuevo`,
+              [
+                t.uuid, agenda.uuid, agenda.sede, agenda.tipo,
+                t.nombre || '', normalizarTexto(t.nombre),
+                t.codigo || null, t.descripcion || null,
+                valor, t.duracion || null,
+                t.categoria ? t.categoria.uuid : null,
+                t.categoria ? t.categoria.nombre : null,
+                t.indicacion || null
+              ]
+            );
+            if (result.rows[0].es_nuevo) tratsNuevos++;
+            else tratsActualizados++;
+          } catch (e) {
+            detAgenda.errores.push(`trat ${t.uuid}: ${e.message}`);
+          }
+        }
+      }
+
+      if (detAgenda.errores.length === 0 || (detAgenda.profesionales + detAgenda.tratamientos > 0)) {
+        agendasOK++;
+      }
+      detalle.agendas.push(detAgenda);
+    }
+
+    // === MARCAR COMO INACTIVOS LOS QUE NO APARECIERON ===
+    // Por seguridad, solo desactivamos si la sync trajo al menos algo (no si todo falló)
+    let profsDesactivados = 0, tratsDesactivados = 0;
+    if (profsVistos.size > 0) {
+      const r1 = await pool.query(
+        `UPDATE bot_catalogo_profesionales
+         SET activo = FALSE
+         WHERE activo = TRUE AND sincronizado_en < NOW() - INTERVAL '1 minute'
+         RETURNING uuid`
+      );
+      profsDesactivados = r1.rowCount;
+    }
+    if (tratsVistos.size > 0) {
+      const r2 = await pool.query(
+        `UPDATE bot_catalogo_tratamientos
+         SET activo = FALSE
+         WHERE activo = TRUE AND sincronizado_en < NOW() - INTERVAL '1 minute'
+         RETURNING uuid`
+      );
+      tratsDesactivados = r2.rowCount;
+    }
+
+    const duracion = Date.now() - inicio;
+    const resumen = {
+      ok: true,
+      duracion_ms: duracion,
+      agendas_procesadas: agendasOK,
+      agendas_con_error: agendasError,
+      profesionales: { nuevos: profsNuevos, actualizados: profsActualizados, desactivados: profsDesactivados, total: profsNuevos + profsActualizados },
+      tratamientos: { nuevos: tratsNuevos, actualizados: tratsActualizados, desactivados: tratsDesactivados, total: tratsNuevos + tratsActualizados }
+    };
+
+    if (logId) {
+      await pool.query(
+        `UPDATE bot_sync_log SET
+           finalizado_en = NOW(),
+           duracion_ms = $1,
+           agendas_procesadas = $2,
+           agendas_con_error = $3,
+           profesionales_total = $4,
+           profesionales_nuevos = $5,
+           profesionales_actualizados = $6,
+           profesionales_desactivados = $7,
+           tratamientos_total = $8,
+           tratamientos_nuevos = $9,
+           tratamientos_actualizados = $10,
+           tratamientos_desactivados = $11,
+           detalle = $12,
+           estado = 'ok'
+         WHERE id = $13`,
+        [
+          duracion, agendasOK, agendasError,
+          profsNuevos + profsActualizados, profsNuevos, profsActualizados, profsDesactivados,
+          tratsNuevos + tratsActualizados, tratsNuevos, tratsActualizados, tratsDesactivados,
+          JSON.stringify(detalle), logId
+        ]
+      );
+    }
+
+    console.log(`[sync] OK en ${duracion}ms - profs: ${profsNuevos}+${profsActualizados}/${profsDesactivados} desactivados, trats: ${tratsNuevos}+${tratsActualizados}/${tratsDesactivados} desactivados`);
+    return resumen;
+  } catch (err) {
+    console.error('[sync] ERROR:', err.message);
+    if (logId) {
+      await pool.query(
+        `UPDATE bot_sync_log SET finalizado_en = NOW(), estado = 'error', error = $1, detalle = $2 WHERE id = $3`,
+        [err.message, JSON.stringify(detalle), logId]
+      ).catch(() => {});
+    }
+    return { ok: false, error: err.message };
+  } finally {
+    SYNC_EN_CURSO = false;
+  }
+}
+
+// ============================================
+// BÚSQUEDA EN CATÁLOGO LOCAL
+// ============================================
+async function buscarTratamientos(query, opciones = {}) {
+  const q = normalizarTexto(query);
+  const limit = opciones.limit || 20;
+  if (!q || q.length < 2) {
+    // Sin query: devolver categorías agrupadas
+    const { rows } = await pool.query(
+      `SELECT categoria_nombre, COUNT(DISTINCT nombre)::int AS cantidad
+       FROM bot_catalogo_tratamientos
+       WHERE activo = TRUE AND categoria_nombre IS NOT NULL
+       GROUP BY categoria_nombre
+       ORDER BY cantidad DESC`
+    );
+    return { tipo: 'categorias', resultados: rows };
+  }
+  const { rows } = await pool.query(
+    `SELECT
+       MIN(uuid) AS uuid_ejemplo,
+       nombre,
+       MIN(codigo) AS codigo,
+       MIN(valor) AS valor,
+       MIN(duracion) AS duracion,
+       MIN(categoria_nombre) AS categoria,
+       array_agg(DISTINCT agenda_sede) AS sedes,
+       array_agg(DISTINCT agenda_uuid) AS agendas
+     FROM bot_catalogo_tratamientos
+     WHERE activo = TRUE
+       AND nombre_normalizado LIKE '%' || $1 || '%'
+     GROUP BY nombre
+     ORDER BY
+       CASE WHEN nombre_normalizado LIKE $1 || '%' THEN 0 ELSE 1 END,
+       nombre
+     LIMIT $2`,
+    [q, limit]
+  );
+  return { tipo: 'tratamientos', query: query, resultados: rows };
+}
+
+async function buscarProfesionales(query, opciones = {}) {
+  const q = normalizarTexto(query);
+  const limit = opciones.limit || 20;
+  if (!q || q.length < 2) {
+    // Sin query: devolver cargos agrupados
+    const { rows } = await pool.query(
+      `SELECT cargo, COUNT(DISTINCT nombre)::int AS cantidad
+       FROM bot_catalogo_profesionales
+       WHERE activo = TRUE AND cargo IS NOT NULL AND cargo != ''
+       GROUP BY cargo
+       ORDER BY cantidad DESC`
+    );
+    return { tipo: 'cargos', resultados: rows };
+  }
+  const { rows } = await pool.query(
+    `SELECT
+       MIN(uuid) AS uuid_ejemplo,
+       nombre,
+       MIN(cargo) AS cargo,
+       array_agg(DISTINCT agenda_sede) AS sedes,
+       array_agg(DISTINCT agenda_uuid) AS agendas
+     FROM bot_catalogo_profesionales
+     WHERE activo = TRUE
+       AND (nombre_normalizado LIKE '%' || $1 || '%'
+            OR LOWER(COALESCE(cargo, '')) LIKE '%' || $1 || '%')
+     GROUP BY nombre
+     ORDER BY
+       CASE WHEN nombre_normalizado LIKE $1 || '%' THEN 0 ELSE 1 END,
+       nombre
+     LIMIT $2`,
+    [q, limit]
+  );
+  return { tipo: 'profesionales', query: query, resultados: rows };
+}
+
+// ============================================
+// ENDPOINTS DEL CATÁLOGO
+// ============================================
+app.post('/api/bot/catalogo/sync', async (req, res) => {
+  console.log('[sync] disparado manualmente');
+  const resumen = await sincronizarCatalogo('manual');
+  res.json({ ok: true, resumen });
+});
+
+app.get('/api/bot/catalogo/stats', async (req, res) => {
+  try {
+    const profs = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE activo = TRUE)::int AS activos,
+        COUNT(DISTINCT nombre)::int AS unicos,
+        COUNT(DISTINCT cargo) FILTER (WHERE cargo IS NOT NULL AND cargo != '')::int AS cargos_distintos,
+        MAX(sincronizado_en)::text AS ultima_sync
+      FROM bot_catalogo_profesionales
+    `);
+    const trats = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE activo = TRUE)::int AS activos,
+        COUNT(DISTINCT nombre)::int AS unicos,
+        COUNT(DISTINCT categoria_nombre) FILTER (WHERE categoria_nombre IS NOT NULL)::int AS categorias,
+        MAX(sincronizado_en)::text AS ultima_sync
+      FROM bot_catalogo_tratamientos
+    `);
+    const porSede = await pool.query(`
+      SELECT
+        agenda_sede AS sede,
+        agenda_tipo AS tipo,
+        COUNT(DISTINCT nombre) FILTER (WHERE activo = TRUE)::int AS profesionales
+      FROM bot_catalogo_profesionales
+      GROUP BY agenda_sede, agenda_tipo
+      ORDER BY agenda_sede, agenda_tipo
+    `);
+    const ultimaSync = await pool.query(`
+      SELECT id, iniciado_en, finalizado_en, duracion_ms, tipo, estado,
+             agendas_procesadas, agendas_con_error,
+             profesionales_total, profesionales_nuevos, profesionales_actualizados,
+             tratamientos_total, tratamientos_nuevos, tratamientos_actualizados,
+             error
+      FROM bot_sync_log
+      ORDER BY iniciado_en DESC LIMIT 1
+    `);
+
+    res.json({
+      ok: true,
+      profesionales: profs.rows[0],
+      tratamientos: trats.rows[0],
+      por_sede: porSede.rows,
+      ultima_sincronizacion: ultimaSync.rows[0] || null,
+      sync_en_curso: SYNC_EN_CURSO
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/bot/catalogo/sync-log', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const { rows } = await pool.query(
+      `SELECT id, iniciado_en, finalizado_en, duracion_ms, tipo, estado,
+              agendas_procesadas, agendas_con_error,
+              profesionales_total, profesionales_nuevos, profesionales_actualizados, profesionales_desactivados,
+              tratamientos_total, tratamientos_nuevos, tratamientos_actualizados, tratamientos_desactivados,
+              error
+       FROM bot_sync_log
+       ORDER BY iniciado_en DESC
+       LIMIT $1`,
+      [limit]
+    );
+    res.json({ ok: true, total: rows.length, historial: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/bot/catalogo/profesionales', async (req, res) => {
+  try {
+    const { cargo, sede, activos } = req.query;
+    const params = [];
+    let where = '1=1';
+    if (activos !== 'false') where += ` AND activo = TRUE`;
+    if (cargo) { params.push(cargo); where += ` AND cargo ILIKE '%' || $${params.length} || '%'`; }
+    if (sede) { params.push(sede); where += ` AND agenda_sede = $${params.length}`; }
+    const sql = `
+      SELECT nombre, cargo,
+             array_agg(DISTINCT agenda_sede) AS sedes,
+             array_agg(DISTINCT agenda_tipo) AS tipos_agenda,
+             MIN(uuid) AS uuid_ejemplo
+      FROM bot_catalogo_profesionales
+      WHERE ${where}
+      GROUP BY nombre, cargo
+      ORDER BY nombre
+    `;
+    const { rows } = await pool.query(sql, params);
+    res.json({ ok: true, total: rows.length, profesionales: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/bot/catalogo/tratamientos', async (req, res) => {
+  try {
+    const { categoria, sede, activos } = req.query;
+    const params = [];
+    let where = '1=1';
+    if (activos !== 'false') where += ` AND activo = TRUE`;
+    if (categoria) { params.push(categoria); where += ` AND categoria_nombre ILIKE '%' || $${params.length} || '%'`; }
+    if (sede) { params.push(sede); where += ` AND agenda_sede = $${params.length}`; }
+    const sql = `
+      SELECT nombre,
+             MIN(codigo) AS codigo,
+             MIN(valor) AS valor,
+             MIN(duracion) AS duracion,
+             MIN(categoria_nombre) AS categoria,
+             array_agg(DISTINCT agenda_sede) AS sedes,
+             MIN(uuid) AS uuid_ejemplo
+      FROM bot_catalogo_tratamientos
+      WHERE ${where}
+      GROUP BY nombre
+      ORDER BY nombre
+    `;
+    const { rows } = await pool.query(sql, params);
+    res.json({ ok: true, total: rows.length, tratamientos: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/bot/catalogo/buscar', async (req, res) => {
+  try {
+    const q = req.query.q || '';
+    const [tratamientos, profesionales] = await Promise.all([
+      buscarTratamientos(q, { limit: 15 }),
+      buscarProfesionales(q, { limit: 15 })
+    ]);
+    res.json({ ok: true, query: q, tratamientos, profesionales });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/bot/catalogo/categorias', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        categoria_nombre AS categoria,
+        COUNT(DISTINCT nombre)::int AS cantidad_tratamientos,
+        array_agg(DISTINCT agenda_sede) AS sedes
+      FROM bot_catalogo_tratamientos
+      WHERE activo = TRUE AND categoria_nombre IS NOT NULL
+      GROUP BY categoria_nombre
+      ORDER BY cantidad_tratamientos DESC
+    `);
+    res.json({ ok: true, total: rows.length, categorias: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ============================================
 // START
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.18 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.19 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
+
+  // Primera sincronización 30 seg después del boot (deja que la BD se asiente)
+  setTimeout(() => {
+    console.log('[sync] Disparando primera sincronización de catálogo...');
+    sincronizarCatalogo('boot').catch(err => console.error('[sync boot]', err.message));
+  }, 30 * 1000);
+
+  // Sincronización automática cada 6 horas
+  setInterval(() => {
+    console.log('[sync] Disparando sincronización programada (6h)...');
+    sincronizarCatalogo('programada').catch(err => console.error('[sync programada]', err.message));
+  }, 6 * 60 * 60 * 1000);
+
+  console.log('[sync] Programada: primera sync en 30s, después cada 6h');
 });
