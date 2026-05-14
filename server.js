@@ -2154,7 +2154,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.25",
+    servidor: "Redvital Backend v5.26",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2381,7 +2381,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.25 - Bot WhatsApp + Claude + Catálogo + Function Calling",
+    servidor: "Redvital Backend v5.26 - Bot WhatsApp + Claude + Catálogo + Function Calling",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -3082,145 +3082,91 @@ app.get("/api/bot/diag-horarios", async (req, res) => {
   });
 });
 
-// ENDPOINT DIAGNÓSTICO: explora el flujo de makereserva de Reservo
-// modo=inspeccionar (default): explora endpoints auxiliares SIN crear citas
-// modo=probar: hace el POST real de crear reserva con datos de prueba (USA UN CUPO REAL)
-app.get("/api/bot/diag-crear-reserva", async (req, res) => {
-  const modo = req.query.modo || "inspeccionar";
+// ENDPOINT DIAGNÓSTICO: explora QUÉ RUTAS de makereserva existen en Reservo
+app.get("/api/bot/diag-rutas-reserva", async (req, res) => {
   const agenda = AGENDAS_BOT.find(a => a.tipo === 'general' && a.sede === 'sede2') || AGENDAS_BOT[0];
+  const base = `${RESERVO_API}/agenda_online/${agenda.uuid}`;
 
   // Traer un tratamiento real
   const trats = await reservoGetTratamientos(agenda.uuid, agenda.token);
-  if (trats.__error || !trats.__list || trats.__list.length === 0) {
-    return res.json({ ok: false, error: "No se pudieron traer tratamientos", detalle: trats });
-  }
-  const tratPrueba = trats.__list[0];
+  const tratPrueba = (trats.__list && trats.__list[0]) ? trats.__list[0] : null;
 
-  // Traer horarios disponibles reales para tener fecha/hora/profesional válidos
-  const respHorarios = await reservoGetHorarios(agenda.uuid, agenda.token, {
-    uuid_tratamiento: tratPrueba.uuid
-  });
+  // Rutas candidatas para verificar RUT (GET)
+  const rutasGET = [
+    `${base}/makereserva/existencia_rut_api/?rut=11111111-1`,
+    `${base}/makereserva/existencia_rut/?rut=11111111-1`,
+    `${base}/existencia_rut/?rut=11111111-1`,
+    `${base}/existencia_rut_api/?rut=11111111-1`,
+    `${base}/paciente/?rut=11111111-1`,
+    `${base}/pacientes/?rut=11111111-1`,
+    `${base}/verificar_rut/?rut=11111111-1`,
+    `${base}/cliente/?rut=11111111-1`,
+    `${base}/makereserva/`,
+    `${base}/reserva/`,
+    `${base}/reservas/`
+  ];
 
-  let horarioReal = null;
-  if (respHorarios.__ok && Array.isArray(respHorarios.data)) {
-    for (const dia of respHorarios.data) {
-      for (const suc of (dia.sucursales || [])) {
-        for (const prof of (suc.profesionales || [])) {
-          if (prof.horas_disponibles && prof.horas_disponibles.length > 0) {
-            horarioReal = {
-              fecha: dia.fecha,
-              hora_iso: prof.horas_disponibles[0],
-              hora: prof.horas_disponibles[0].substring(11, 16),
-              uuid_profesional: prof.agenda,
-              profesional_nombre: prof.nombre,
-              sucursal_uuid: suc.uuid,
-              sucursal_nombre: suc.nombre
-            };
-            break;
-          }
-        }
-        if (horarioReal) break;
-      }
-      if (horarioReal) break;
-    }
-  }
+  // Rutas candidatas para crear reserva (POST)
+  const rutasPOST = [
+    `${base}/makereserva/confirmApptAPI/`,
+    `${base}/makereserva/confirmar/`,
+    `${base}/makereserva/`,
+    `${base}/reserva/`,
+    `${base}/reservas/`,
+    `${base}/crear_reserva/`,
+    `${base}/agendar/`,
+    `${base}/cita/`,
+    `${base}/citas/`
+  ];
 
-  const info = {
-    ok: true,
-    modo: modo,
-    agenda_usada: { uuid: agenda.uuid, sede: agenda.sede, tipo: agenda.tipo },
-    tratamiento_prueba: { uuid: tratPrueba.uuid, nombre: tratPrueba.nombre },
-    horario_real_encontrado: horarioReal
-  };
-
-  // === MODO INSPECCIONAR: explora endpoints auxiliares ===
-  if (modo === "inspeccionar") {
-    const exploracion = {};
-
-    // 1. Probar el endpoint de verificación de RUT (ya sabemos que funciona) con un RUT de prueba
-    const rutPrueba = "11111111-1";
+  const resultadosGET = [];
+  for (const url of rutasGET) {
     try {
-      const r = await axios.get(`${RESERVO_API}/agenda_online/${agenda.uuid}/makereserva/existencia_rut_api/`, {
+      const r = await axios.get(url, {
         headers: { Authorization: RESERVO_AUTH(agenda.token) },
-        params: { rut: rutPrueba },
-        timeout: 15000,
+        timeout: 10000,
         validateStatus: () => true
       });
-      exploracion.existencia_rut = { http: r.status, respuesta: JSON.stringify(r.data).substring(0, 300) };
-    } catch (e) {
-      exploracion.existencia_rut = { error: e.message };
-    }
-
-    // 2. Hacer un POST a confirmApptAPI con body VACÍO para que Reservo nos diga qué campos faltan
-    try {
-      const r = await axios.post(`${RESERVO_API}/agenda_online/${agenda.uuid}/makereserva/confirmApptAPI/`, {}, {
-        headers: { Authorization: RESERVO_AUTH(agenda.token), 'Content-Type': 'application/json' },
-        timeout: 15000,
-        validateStatus: () => true
-      });
-      exploracion.post_body_vacio = {
+      const esHTML = typeof r.data === 'string' && r.data.includes('<!DOCTYPE');
+      resultadosGET.push({
+        url: url.replace(base, '...'),
         http: r.status,
-        respuesta: JSON.stringify(r.data).substring(0, 600),
-        nota: "Los errores de 'campo obligatorio' nos dicen qué campos espera Reservo"
-      };
-    } catch (e) {
-      exploracion.post_body_vacio = { error: e.message };
-    }
-
-    // 3. POST con campos parciales comunes para ver qué más pide
-    try {
-      const bodyParcial = {
-        uuid_tratamiento: tratPrueba.uuid,
-        rut: rutPrueba
-      };
-      const r = await axios.post(`${RESERVO_API}/agenda_online/${agenda.uuid}/makereserva/confirmApptAPI/`, bodyParcial, {
-        headers: { Authorization: RESERVO_AUTH(agenda.token), 'Content-Type': 'application/json' },
-        timeout: 15000,
-        validateStatus: () => true
+        tipo: esHTML ? 'HTML_404' : 'JSON/data',
+        respuesta: esHTML ? '(página HTML 404)' : JSON.stringify(r.data).substring(0, 250)
       });
-      exploracion.post_body_parcial = {
-        body_enviado: bodyParcial,
-        http: r.status,
-        respuesta: JSON.stringify(r.data).substring(0, 600)
-      };
     } catch (e) {
-      exploracion.post_body_parcial = { error: e.message };
+      resultadosGET.push({ url: url.replace(base, '...'), error: e.message });
     }
-
-    info.exploracion = exploracion;
-    info.siguiente_paso = "Revisar los errores de 'campo obligatorio' para saber el formato exacto. Cuando esté claro, llamar con ?modo=probar para hacer una reserva real de prueba.";
-    return res.json(info);
   }
 
-  // === MODO PROBAR: hace el POST real (ocupa un cupo) ===
-  if (modo === "probar") {
-    if (!horarioReal) {
-      return res.json({ ...info, error: "No hay horarios disponibles para hacer la prueba real" });
+  const resultadosPOST = [];
+  for (const url of rutasPOST) {
+    try {
+      const r = await axios.post(url, {}, {
+        headers: { Authorization: RESERVO_AUTH(agenda.token), 'Content-Type': 'application/json' },
+        timeout: 10000,
+        validateStatus: () => true
+      });
+      const esHTML = typeof r.data === 'string' && r.data.includes('<!DOCTYPE');
+      resultadosPOST.push({
+        url: url.replace(base, '...'),
+        http: r.status,
+        tipo: esHTML ? 'HTML_404' : 'JSON/data',
+        respuesta: esHTML ? '(página HTML 404)' : JSON.stringify(r.data).substring(0, 300)
+      });
+    } catch (e) {
+      resultadosPOST.push({ url: url.replace(base, '...'), error: e.message });
     }
-
-    // Body con datos de prueba — usando el formato que Reservo espera
-    // (se ajustará según lo que descubramos en modo inspeccionar)
-    const bodyPrueba = {
-      uuid_tratamiento: tratPrueba.uuid,
-      profesional: horarioReal.uuid_profesional,
-      fecha: horarioReal.fecha,
-      hora: horarioReal.hora,
-      rut: "11111111-1",
-      nombre: "PACIENTE",
-      apellido_paterno: "PRUEBA",
-      apellido_materno: "BOT",
-      telefono_1: "912345678",
-      mail: "prueba@test.cl"
-    };
-
-    const r = await reservoCrearReserva(agenda.uuid, agenda.token, bodyPrueba);
-    info.body_enviado = bodyPrueba;
-    info.resultado_creacion = r;
-    info.ADVERTENCIA = "Si la reserva se creó (no hay __error), BORRALA manualmente desde Reservo para no ocupar el cupo.";
-    return res.json(info);
   }
 
-  return res.json({ ...info, error: "modo inválido. Usar ?modo=inspeccionar o ?modo=probar" });
+  res.json({
+    ok: true,
+    nota: "Buscamos rutas que NO devuelvan HTML_404. Las que devuelven JSON (aunque sea error) son las rutas correctas.",
+    agenda_usada: agenda.uuid,
+    tratamiento_prueba: tratPrueba ? { uuid: tratPrueba.uuid, nombre: tratPrueba.nombre } : null,
+    rutas_GET_verificar_rut: resultadosGET,
+    rutas_POST_crear_reserva: resultadosPOST
+  });
 });
 
 // ============================================
@@ -4549,7 +4495,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.25 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.26 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
