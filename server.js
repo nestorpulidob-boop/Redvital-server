@@ -2154,7 +2154,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.23",
+    servidor: "Redvital Backend v5.24",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2381,7 +2381,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.23 - Bot WhatsApp + Claude + Catálogo + Function Calling",
+    servidor: "Redvital Backend v5.24 - Bot WhatsApp + Claude + Catálogo + Function Calling",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -2864,7 +2864,7 @@ async function reservoGetHorarios(uuid, token, params) {
     if (r.status >= 400) {
       return { __error: true, http: r.status, body: r.data };
     }
-    return r.data || [];
+    return { __ok: true, data: r.data };
   } catch (err) {
     return { __error: true, http: 0, body: err.message };
   }
@@ -2881,7 +2881,7 @@ async function reservoProximaHora(uuid, token, params) {
     if (r.status >= 400) {
       return { __error: true, http: r.status, body: r.data };
     }
-    return r.data;
+    return { __ok: true, data: r.data };
   } catch (err) {
     return { __error: true, http: 0, body: err.message };
   }
@@ -3201,21 +3201,21 @@ const BOT_TOOLS = [
   },
   {
     name: "consultar_disponibilidad",
-    description: "Consulta horarios disponibles en VIVO para un tratamiento específico. Usar SOLO después de haber identificado un tratamiento con buscar_tratamientos. Requiere el uuid_agenda del catálogo. Si la fecha no se especifica, busca la próxima hora disponible.",
+    description: "Consulta horarios disponibles en VIVO para un tratamiento. Usar después de identificar el tratamiento con buscar_tratamientos. Devuelve una lista de horarios con: fecha, hora, profesional_nombre, uuid_profesional (necesario para crear_reserva), y datos de sucursal. Si no pasás fecha, trae los próximos disponibles.",
     input_schema: {
       type: "object",
       properties: {
         uuid_agenda: {
           type: "string",
-          description: "UUID de la agenda donde está el tratamiento (campo 'agendas' del resultado de buscar_tratamientos)"
+          description: "UUID de la agenda (del campo 'agendas_disponibles' del resultado de buscar_tratamientos). Probá la primera; si no hay horarios, probá las otras."
         },
         uuid_tratamiento: {
           type: "string",
-          description: "UUID del tratamiento (campo 'uuid_ejemplo' del resultado)"
+          description: "UUID del tratamiento (campo 'uuid_tratamiento' del resultado de buscar_tratamientos)"
         },
         fecha: {
           type: "string",
-          description: "Fecha en formato YYYY-MM-DD. Opcional, si no se da busca la próxima disponible."
+          description: "Fecha en formato YYYY-MM-DD usando el año actual. Opcional. Si el paciente no especificó día, omitir para traer las próximas disponibles."
         }
       },
       required: ["uuid_agenda", "uuid_tratamiento"]
@@ -3301,23 +3301,51 @@ async function ejecutarTool(nombre, input) {
     if (nombre === "consultar_disponibilidad") {
       const agenda = AGENDAS_BOT.find(a => a.uuid === input.uuid_agenda);
       if (!agenda) return { ok: false, error: "Agenda no encontrada" };
-      const params = { tratamiento: input.uuid_tratamiento };
+
+      const params = { uuid_tratamiento: input.uuid_tratamiento };
       if (input.fecha) params.fecha = input.fecha;
-      const horarios = await reservoGetHorarios(agenda.uuid, agenda.token, params);
-      if (horarios.__error) {
-        return { ok: false, error: `Error Reservo http=${horarios.http}`, detalle: horarios.body };
+
+      const resp = await reservoGetHorarios(agenda.uuid, agenda.token, params);
+      if (resp.__error) {
+        return { ok: false, error: `Error Reservo http=${resp.http}`, detalle: resp.body };
       }
-      // Si la respuesta es paginada, normalizar
-      let lista = Array.isArray(horarios) ? horarios :
-                  (horarios.resultados || horarios.results || []);
-      // Limitar a primeras 10 horas disponibles para no inundar a Claude
-      lista = lista.slice(0, 10);
+
+      // Formato Reservo: [{ fecha, sucursales: [{ nombre, direccion, profesionales: [{ agenda, nombre, horas_disponibles: [] }] }] }]
+      const data = resp.data;
+      const horariosAplanados = [];
+
+      if (Array.isArray(data)) {
+        for (const dia of data) {
+          const fecha = dia.fecha;
+          for (const suc of (dia.sucursales || [])) {
+            for (const prof of (suc.profesionales || [])) {
+              for (const horaISO of (prof.horas_disponibles || [])) {
+                // horaISO ej: "2026-05-19T18:15:00-04:00"
+                const horaSolo = horaISO.substring(11, 16); // "18:15"
+                horariosAplanados.push({
+                  fecha: fecha,
+                  hora: horaSolo,
+                  hora_iso: horaISO,
+                  profesional_nombre: prof.nombre,
+                  uuid_profesional: prof.agenda, // OJO: el campo 'agenda' es el uuid del profesional para reservar
+                  sucursal_nombre: suc.nombre,
+                  sucursal_direccion: suc.direccion
+                });
+              }
+            }
+          }
+        }
+      }
+
+      // Limitar a 12 horarios para no inundar a Claude
+      const limitados = horariosAplanados.slice(0, 12);
+
       return {
         ok: true,
         sede: agenda.sede,
-        sucursal: agenda.sede === "sede1" ? SEDES.sede1.direccion : SEDES.sede2.direccion,
-        total_horarios: lista.length,
-        horarios: lista
+        total_horarios: horariosAplanados.length,
+        horarios: limitados,
+        nota: horariosAplanados.length === 0 ? "Sin horarios disponibles para esa fecha. Probá otra fecha o consultá sin fecha específica para la próxima disponible." : undefined
       };
     }
 
@@ -4380,7 +4408,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.23 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.24 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
