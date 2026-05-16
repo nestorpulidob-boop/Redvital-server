@@ -1,8 +1,8 @@
 // ============================================
-// REDVITAL BACKEND v5.31
+// REDVITAL BACKEND v5.32
 // Bot WhatsApp + Claude + Reservo Agendamiento
 // + Twilio WhatsApp Sandbox (paralelo a Meta)
-// + Elección de profesional por especialidad (NUEVO en v5.31)
+// + Optimizaciones rate limit Tier 1 (v5.32)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -102,7 +102,7 @@ const WEBHOOK_TO_SEDE = {
 const COSTO_FIJO_MENSUAL = 20637600;
 const PCT_REDVITAL_GLOBAL = 0.47;
 
-// v5.31: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
+// v5.32: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
 const WHATSAPP_SECRETARIAS = "+56 9 2246 7275";
 
 const CATEGORIAS_SERVICIO = [
@@ -1663,7 +1663,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.31",
+    ok: true, servidor: "Redvital Backend v5.32",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1828,7 +1828,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.31 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
+    servidor: "Redvital Backend v5.32 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -1841,7 +1841,7 @@ app.get("/", (req, res) => {
         "/api/bot/catalogo/tratamientos",
         "/api/bot/catalogo/categorias",
         "/api/bot/catalogo/buscar?q=",
-        "/api/bot/especialidades (v5.31)"
+        "/api/bot/especialidades (v5.32)"
       ],
       bot_conversacional: [
         "/api/bot/chat-test (POST) - simulador SIN WhatsApp",
@@ -2012,7 +2012,7 @@ app.get("/api/ads/summary", async (req, res) => {
 });
 
 // =============================================================
-// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.31)
+// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.32)
 // =============================================================
 async function inicializarBotBD() {
   try {
@@ -2107,7 +2107,7 @@ async function inicializarBotBD() {
       )`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_iniciado ON bot_sync_log(iniciado_en DESC)`);
 
-    // NUEVO en v5.31: tabla de mapeo profesional -> especialidad/grupo clínico
+    // NUEVO en v5.32: tabla de mapeo profesional -> especialidad/grupo clínico
     // (debe poblarse via SQL externo "cargar_especialidades.sql" la primera vez)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profesional_especialidad (
@@ -2366,22 +2366,36 @@ async function enviarMensajeWhatsApp(provider, to, texto) {
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_MODEL = 'claude-sonnet-4-5';
 
-async function claudeMessage(messages, systemPrompt, tools) {
+// v5.32: Reintento automático en rate_limit (429) con backoff exponencial
+// Esto evita que el paciente vea "tuve un problema técnico" cuando hay congestión.
+async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
   if (!CLAUDE_API_KEY) { console.warn('[claude] CLAUDE_API_KEY no configurada'); return { error: 'CLAUDE_API_KEY no configurada' }; }
   try {
-    const body = { model: CLAUDE_MODEL, max_tokens: 1024, messages: messages };
+    // v5.32: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
+    const body = { model: CLAUDE_MODEL, max_tokens: 600, messages: messages };
     if (systemPrompt) body.system = systemPrompt;
     if (tools && tools.length > 0) body.tools = tools;
     const r = await axios.post('https://api.anthropic.com/v1/messages', body, {
       headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 60000, validateStatus: () => true });
-    if (r.status >= 400) { console.error('[claude]', r.status, JSON.stringify(r.data)); return { error: r.data }; }
+
+    // v5.32: si es rate limit (429), esperar y reintentar hasta 3 veces
+    if (r.status === 429 && intento <= 3) {
+      // Intentar respetar header retry-after si viene; si no, backoff exponencial
+      const retryAfterSec = parseInt(r.headers && r.headers['retry-after']) || (15 * intento);
+      const espera = Math.min(retryAfterSec * 1000, 45000); // máx 45 segundos
+      console.warn(`[claude] 429 rate limit. Esperando ${espera/1000}s y reintentando (intento ${intento}/3)...`);
+      await new Promise(resolve => setTimeout(resolve, espera));
+      return claudeMessage(messages, systemPrompt, tools, intento + 1);
+    }
+
+    if (r.status >= 400) { console.error('[claude]', r.status, JSON.stringify(r.data).substring(0, 300)); return { error: r.data }; }
     return r.data;
   } catch (err) { console.error('[claude] error', err.message); return { error: err.message }; }
 }
 
 // ============================================
-// HELPERS v5.31: Lookup de especialidades por profesional
+// HELPERS v5.32: Lookup de especialidades por profesional
 // ============================================
 
 // Lee bot_profesional_especialidad para un nombre normalizado
@@ -2453,95 +2467,62 @@ function detectarServicioEspecial(query) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT (v5.31: Function Calling + Elección Profesional)
+// ORQUESTADOR DEL BOT (v5.32: Function Calling + Elección Profesional)
 // ============================================
 const BOT_TOOLS = [
   {
     name: "buscar_tratamientos",
-    description: "Busca tratamientos y exámenes médicos disponibles en el catálogo de Redvital. Usar cuando el paciente menciona un examen, especialidad o tipo de consulta. Devuelve nombre, duración, agendas y flags adicionales (es_examen, grupo_clinico_sugerido). NO devuelve precios — para precios derivar a secretaría.",
-    input_schema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "Término de búsqueda corto: 'cardio', 'eco abdominal', 'colono', 'medicina general'. La búsqueda es fuzzy y no requiere acentos." }
-      },
-      required: ["query"]
-    }
+    description: "Busca tratamientos/exámenes en catálogo Redvital. Devuelve nombre, uuid_tratamiento, agendas, flags es_examen/es_ecocardio/derivar_secretaria. No devuelve precios.",
+    input_schema: { type: "object", properties: { query: { type: "string", description: "Término corto sin acentos: 'cardio', 'eco abdominal', 'medicina general'." } }, required: ["query"] }
   },
   {
     name: "buscar_profesionales",
-    description: "Busca profesionales por nombre o cargo. Usar cuando el paciente menciona un nombre específico.",
-    input_schema: {
-      type: "object",
-      properties: { query: { type: "string", description: "Nombre o cargo. Ej: 'gonzalez', 'cardiologo', 'kinesiologo'." } },
-      required: ["query"]
-    }
+    description: "Busca profesional por nombre. Usar solo si paciente menciona nombre específico.",
+    input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
   },
   {
     name: "listar_profesionales_por_especialidad",
-    description: "NUEVO v5.31. Lista los profesionales reales que atienden una especialidad clínica concreta, usando el mapeo profesional → grupo_clinico. Devuelve nombre con wording correcto ('médica general con formación en cardiología' vs 'cardiólogo'), uuid_profesional, sedes y agendas. Usar cuando el paciente pide una especialidad y hay que mostrarle los profesionales (cardio, gastro, trauma, ginecología, neurología, etc.). NO usar para medicina general (medicina_general → ir directo a consultar disponibilidad sin profesional, mostrar horarios con nombres). NO usar para exámenes sin profesional (RX, Eco, ECG, Holter, etc.). Para salud mental hay tres grupos: salud_mental (médicos generales), psicologia (psicólogos), psiquiatria (médico con formación en psiquiatría) — el paciente elige.",
-    input_schema: {
-      type: "object",
-      properties: {
-        grupo_clinico: {
-          type: "string",
-          description: "Identificador del grupo clínico. Valores válidos: cardiologia, gastroenterologia, traumatologia, neurologia, ginecologia, broncopulmonar, dermatologia, otorrino, geriatria, pediatria, kinesiologia, nutricion, matrona, psicologia, psiquiatria, salud_mental, cirugia_endoscopia, medicina_general."
-        }
-      },
-      required: ["grupo_clinico"]
-    }
+    description: "Lista profesionales reales de una especialidad con wording correcto. Usar para especialidades (cardio, gastro, trauma, neuro, gineco, broncopulmonar, dermato, otorrino, geriatria, pediatria, kine, nutricion, matrona, psicologia, psiquiatria, salud_mental, cirugia_endoscopia). NO para medicina_general (ahí no listar) ni exámenes sin profesional.",
+    input_schema: { type: "object", properties: { grupo_clinico: { type: "string", description: "cardiologia | gastroenterologia | traumatologia | neurologia | ginecologia | broncopulmonar | dermatologia | otorrino | geriatria | pediatria | kinesiologia | nutricion | matrona | psicologia | psiquiatria | salud_mental | cirugia_endoscopia | medicina_general" } }, required: ["grupo_clinico"] }
   },
   {
     name: "consultar_disponibilidad",
-    description: "Consulta horarios disponibles en VIVO. Devuelve horarios con fecha, hora, profesional_nombre, uuid_profesional, sucursal_uuid, hora_con_segundos, time_zone. v5.31: ahora acepta uuid_profesional opcional para filtrar a un profesional específico (útil después de listar_profesionales_por_especialidad cuando el paciente eligió). Si no pasás uuid_profesional, devuelve horarios de todos los profesionales (útil para Medicina General).",
-    input_schema: {
-      type: "object",
-      properties: {
-        uuid_agenda: { type: "string", description: "UUID de la agenda (del array agendas del resultado de buscar_tratamientos o listar_profesionales_por_especialidad)." },
-        uuid_tratamiento: { type: "string", description: "UUID del tratamiento de buscar_tratamientos." },
-        fecha: { type: "string", description: "Fecha YYYY-MM-DD con año actual. Opcional." },
-        uuid_profesional: { type: "string", description: "Opcional. UUID del profesional para filtrar horarios. Solo usarlo después de que el paciente eligió un profesional específico via listar_profesionales_por_especialidad. Para medicina general, OMITIR." }
-      },
-      required: ["uuid_agenda", "uuid_tratamiento"]
-    }
+    description: "Consulta horarios en vivo. Devuelve horarios con uuid_profesional, sucursal_uuid, hora_con_segundos, time_zone. uuid_profesional opcional: pasarlo después de elegir profesional; omitir para medicina general.",
+    input_schema: { type: "object", properties: {
+      uuid_agenda: { type: "string" },
+      uuid_tratamiento: { type: "string" },
+      fecha: { type: "string", description: "YYYY-MM-DD año actual" },
+      uuid_profesional: { type: "string", description: "Opcional, solo si paciente eligió profesional" }
+    }, required: ["uuid_agenda", "uuid_tratamiento"] }
   },
   {
     name: "verificar_paciente_rut",
-    description: "Verifica si el paciente existe por RUT. Si existe → devuelve uuid_paciente (usalo en crear_reserva, no pidas nombre). Si no existe → es nuevo. Si lista_negra:true → derivar a secretaría.",
-    input_schema: {
-      type: "object",
-      properties: {
-        uuid_agenda: { type: "string", description: "UUID de la agenda donde se hará la reserva" },
-        rut: { type: "string", description: "RUT con o sin puntos/guión" }
-      },
-      required: ["uuid_agenda", "rut"]
-    }
+    description: "Verifica si paciente existe por RUT. existe:true → uuid_paciente (no pedir nombre). lista_negra:true → derivar.",
+    input_schema: { type: "object", properties: { uuid_agenda: { type: "string" }, rut: { type: "string" } }, required: ["uuid_agenda", "rut"] }
   },
   {
     name: "crear_reserva",
-    description: "Crea la cita REAL en Reservo. Los datos uuid_profesional, sucursal_uuid, fecha, hora_con_segundos, time_zone vienen del horario elegido en consultar_disponibilidad.",
-    input_schema: {
-      type: "object",
-      properties: {
-        uuid_agenda: { type: "string" },
-        uuid_tratamiento: { type: "string" },
-        uuid_profesional: { type: "string", description: "uuid_profesional del horario elegido" },
-        sucursal_uuid: { type: "string", description: "sucursal_uuid del horario elegido" },
-        fecha: { type: "string", description: "YYYY-MM-DD" },
-        hora_con_segundos: { type: "string", description: "HH:MM:SS" },
-        time_zone: { type: "string", description: "ej: America/Santiago" },
-        uuid_paciente: { type: "string", description: "Si el paciente YA existe (de verificar_paciente_rut). Si lo pasás, NO necesitás rut/nombre." },
-        rut: { type: "string", description: "Solo si paciente NUEVO" },
-        nombre: { type: "string" },
-        apellido_paterno: { type: "string" },
-        apellido_materno: { type: "string" },
-        email: { type: "string" },
-        telefono: { type: "string" },
-        prevision_id: { type: "integer", description: "Fonasa=1, Banmedica=2, Cruz Blanca=3, Consalud=4, MasVida=5, Vida Tres=6, Colmena=7, Particular=10" }
-      },
-      required: ["uuid_agenda", "uuid_tratamiento", "uuid_profesional", "sucursal_uuid", "fecha", "hora_con_segundos"]
-    }
+    description: "Crea cita real en Reservo. uuid_profesional/sucursal_uuid/fecha/hora_con_segundos/time_zone vienen del horario elegido. Si paciente ya existía pasá uuid_paciente; si es nuevo pasá rut+nombre+email+telefono.",
+    input_schema: { type: "object", properties: {
+      uuid_agenda: { type: "string" },
+      uuid_tratamiento: { type: "string" },
+      uuid_profesional: { type: "string" },
+      sucursal_uuid: { type: "string" },
+      fecha: { type: "string" },
+      hora_con_segundos: { type: "string" },
+      time_zone: { type: "string" },
+      uuid_paciente: { type: "string" },
+      rut: { type: "string" },
+      nombre: { type: "string" },
+      apellido_paterno: { type: "string" },
+      apellido_materno: { type: "string" },
+      email: { type: "string" },
+      telefono: { type: "string" },
+      prevision_id: { type: "integer" }
+    }, required: ["uuid_agenda", "uuid_tratamiento", "uuid_profesional", "sucursal_uuid", "fecha", "hora_con_segundos"] }
   }
 ];
+
 
 
 // === EJECUTOR DE TOOLS ===
@@ -2550,7 +2531,7 @@ async function ejecutarTool(nombre, input) {
   try {
     if (nombre === "buscar_tratamientos") {
       const flags = detectarServicioEspecial(input.query);
-      const resultado = await buscarTratamientos(input.query || "", { limit: 10 });
+      const resultado = await buscarTratamientos(input.query || "", { limit: 5 });
       if (resultado.resultados && Array.isArray(resultado.resultados)) {
         const simple = resultado.resultados.map(t => ({
           nombre: t.nombre, uuid_tratamiento: t.uuid_ejemplo,
@@ -2620,7 +2601,7 @@ async function ejecutarTool(nombre, input) {
           const fecha = dia.fecha;
           for (const suc of (dia.sucursales || [])) {
             for (const prof of (suc.profesionales || [])) {
-              // v5.31: si vino uuid_profesional, filtrar
+              // v5.32: si vino uuid_profesional, filtrar
               if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
               for (const horaISO of (prof.horas_disponibles || [])) {
                 horariosAplanados.push({
@@ -2636,11 +2617,22 @@ async function ejecutarTool(nombre, input) {
           }
         }
       }
-      const limitados = horariosAplanados.slice(0, 12);
+      // v5.32: reducir 12→6 horarios y simplificar campos para bajar tokens
+      const limitados = horariosAplanados.slice(0, 6).map(h => ({
+        fecha: h.fecha, hora: h.hora,
+        hora_con_segundos: h.hora_con_segundos,
+        time_zone: h.time_zone,
+        profesional_nombre: h.profesional_nombre,
+        uuid_profesional: h.uuid_profesional,
+        sucursal_uuid: h.sucursal_uuid,
+        sucursal_nombre: h.sucursal_nombre
+      }));
       return {
         ok: true, sede: agenda.sede, total_horarios: horariosAplanados.length,
         horarios: limitados, filtrado_por_profesional: input.uuid_profesional || null,
-        nota: horariosAplanados.length === 0 ? "Sin horarios disponibles." : undefined
+        nota: horariosAplanados.length === 0
+          ? "Sin horarios para esta fecha. Pedile al paciente otra fecha (puede que el profesional no atienda ese día)."
+          : undefined
       };
     }
 
@@ -2724,7 +2716,8 @@ async function ejecutarTool(nombre, input) {
 }
 
 
-// === SYSTEM PROMPT DINÁMICO v5.31 ===
+// === SYSTEM PROMPT DINÁMICO v5.32 ===
+// === SYSTEM PROMPT DINÁMICO v5.32 (COMPRIMIDO ~60% para Tier 1) ===
 async function construirSystemPrompt() {
   const ahora = new Date();
   const ahoraCL = new Date(ahora.getTime() - 4 * 3600000);
@@ -2738,171 +2731,91 @@ async function construirSystemPrompt() {
     d.setDate(d.getDate() + i);
     proximosDias.push(`${diasSemana[d.getUTCDay()]} ${d.toISOString().split('T')[0]}`);
   }
-  let resumenCatalogo = "";
-  try {
-    const { rows: categorias } = await pool.query(`
-      SELECT categoria_nombre, COUNT(DISTINCT nombre)::int AS cantidad
-      FROM bot_catalogo_tratamientos
-      WHERE activo = TRUE AND categoria_nombre IS NOT NULL
-      GROUP BY categoria_nombre ORDER BY cantidad DESC`);
-    if (categorias.length > 0) {
-      resumenCatalogo = "\n\nCATEGORÍAS DISPONIBLES:\n" +
-        categorias.map(c => `- ${c.categoria_nombre} (${c.cantidad} servicios)`).join("\n");
-    }
-  } catch (e) { console.warn("[bot] No se pudo cargar resumen:", e.message); }
+  const anio = ahoraCL.getUTCFullYear();
+  return `Asistente WhatsApp de Centro Médico Redvital (Villa Alemana, Chile). Agendás citas DIRECTO y EFICIENTE.
 
-  return `Eres el asistente de WhatsApp del Centro Médico Redvital en Villa Alemana, Chile.
-Tu trabajo es agendar citas de forma DIRECTA y EFICIENTE. El paciente sabe lo que quiere, vos ayudás a conseguirlo.
+HOY: ${diaHoy} ${fechaCL}, hora ${horaCL} (Chile). Año=${anio}.
+Próximos días: ${proximosDias.join(' / ')}
+"mañana"=${proximosDias[0].split(' ')[1]}. "el lunes" / "este martes"= el más próximo. Usar YYYY-MM-DD.
 
-═══════════════════════════════════════════
-CONTEXTO TEMPORAL (CRÍTICO)
-═══════════════════════════════════════════
-**HOY es ${diaHoy} ${fechaCL}, hora actual ${horaCL} (Chile)**
+SEDES: Victoria 766 (principal, 6 boxes), Maturana 293 (endo/colono). L-V 8-20, Sáb 9-13, Dom cerrado.
 
-Próximos días:
-${proximosDias.map(d => '- ' + d).join('\n')}
+═════ REGLAS GENERALES ═════
+1. UNA cita por conversación. Después preguntás "¿Algo más?".
+2. NO recomendás ni sugerís otros exámenes. Si pide cardio, solo cardio.
+3. NO das precios → "Valor según previsión, secretaría confirma al llegar".
+4. NUNCA inventés info ni UUIDs. Solo de tools. Si tool falla, "Tuvimos un problema, llamá al centro".
+5. Cancelar/reagendar → "Llamá al centro".
+6. MANTENÉ contexto. NO vuelvas a llamar buscar_tratamientos si ya tenés uuid_tratamiento.
+7. Si consultar_disponibilidad devuelve total_horarios:0 → decile al paciente que ese día no hay y pedile otro día. NO insistas con la misma fecha.
 
-Fechas relativas:
-- "mañana" → ${proximosDias[0].split(' ')[1]}
-- "el lunes" / "este lunes" → el lunes más cercano
-- Si dice solo "lunes" sin contexto → asumí el lunes más próximo y avanzá.
+═════ FLUJOS POR TIPO ═════
 
-USÁ SIEMPRE EL AÑO ${ahoraCL.getUTCFullYear()} en YYYY-MM-DD.
-
-═══════════════════════════════════════════
-SEDES Y HORARIOS
-═══════════════════════════════════════════
-- Centro Médico Redvital: Victoria 766, Villa Alemana (sede principal, 6 boxes)
-- Sede Maturana: Maturana 293, Villa Alemana (endoscopía/colonoscopía)
-
-Lun-Vie: 8:00-20:00 (Victoria), 8:00-19:00 (Maturana)
-Sábados: 9:00-13:00 (solo Victoria). Domingos cerrado.${resumenCatalogo}
-
-═══════════════════════════════════════════
-REGLAS GENERALES — SEGUIRLAS SIEMPRE
-═══════════════════════════════════════════
-
-**1. UNA CITA POR CONVERSACIÓN.** Agendás lo que pide, después preguntás "¿Algo más?".
-
-**2. NO RECOMIENDES NI SUGIERAS.** Si pide "cardiólogo", NO menciones ecocardio, holter ni ECG. Solo lo que pidió.
-
-**3. NO DAS PRECIOS.** "Los valores varían según tu previsión. La secretaría te confirma cuando llegues." Y seguís.
-
-**4. NUNCA INVENTES.** Solo info de tools. Si falla, "Tuvimos un problema, ¿podés llamar al centro?".
-
-**5. CANCELAR/REAGENDAR = derivar.** "Para cancelar o cambiar una cita existente, llamá al centro."
-
-**6. MANTENÉ CONTEXTO.** Una vez tenés uuid_tratamiento, NO vuelvas a llamar buscar_tratamientos. Reutilizá el de la conversación.
-
-**7. NUNCA INVENTES UUIDs.** Los UUIDs vienen siempre de tools. Guardá los del horario elegido para crear_reserva.
-
-═══════════════════════════════════════════
-REGLAS DE FLUJO POR TIPO DE SERVICIO (v5.31 — CRÍTICO)
-═══════════════════════════════════════════
-
-🔵 **MEDICINA GENERAL** (paciente pide "medicina general", "médico", "consulta general"):
+🔵 MEDICINA GENERAL ("medicina general", "médico", "consulta general"):
 - buscar_tratamientos("medicina general")
-- NO listes profesionales (son varios y son equivalentes)
-- Preguntá fecha directamente: "Dale, ¿para qué día?"
-- consultar_disponibilidad SIN uuid_profesional → trae horarios de TODOS los médicos generales
-- Mostrá horarios CON el nombre del médico al lado: "10:00 con Dra. Andrea Torres, 11:30 con Dr. Andrey Ceballos..."
-- El paciente elige hora (y queda asignado al profesional de ese horario)
-- Avanzar a RUT
+- NO listés profesionales. Preguntá día directo.
+- consultar_disponibilidad SIN uuid_profesional → muestra horarios con nombre del médico al lado: "10:00 con Dra. X, 11:30 con Dr. Y..."
+- Paciente elige hora → avanzá a RUT.
 
-🟢 **ESPECIALIDADES MÉDICAS** (cardio, gastro, trauma, neuro, gineco, broncopulmonar, dermato, otorrino, geriatria, pediatria, kine, nutricion, matrona, psiquiatría):
-- buscar_tratamientos(...) para confirmar que el tratamiento existe
-- listar_profesionales_por_especialidad(grupo_clinico) → trae los profesionales reales
-- Si hay 1 solo → "Tu opción es [wording_completo]. ¿Para qué día?" y avanzá
-- Si hay 2+ → "Tengo a [Dr. X, médica general con formación en cardiología] y [Dr. Y, ...]. ¿Con cuál preferís?"
-- USÁ EL CAMPO wording_completo DEL RESULTADO, no inventes wording
-- Cuando elija profesional: consultar_disponibilidad con uuid_profesional del elegido
-- Avanzar a horarios → RUT → crear_reserva
+🟢 ESPECIALIDADES (cardio, gastro, trauma, neuro, gineco, broncopulmonar, dermato, otorrino, geriatria, pediatria, kine, nutricion, matrona, psiquiatría):
+- buscar_tratamientos(...) para confirmar tratamiento.
+- listar_profesionales_por_especialidad(grupo_clinico) → trae profesionales reales.
+- Si 1 solo: "Tu opción es [wording_completo]. ¿Para qué día?" y avanzá.
+- Si 2+: "Tengo a [Dr.X wording] y [Dr.Y wording]. ¿Con cuál?" — USÁ el campo wording_completo del resultado, no inventes.
+- Cuando elija: consultar_disponibilidad con uuid_profesional del elegido.
+- Horarios → RUT → crear_reserva.
 
-🟣 **SALUD MENTAL** (tema delicado, hay 3 grupos distintos):
-- Si pide "psicólogo" → listar_profesionales_por_especialidad("psicologia") (3 disponibles, no recetan)
-- Si pide "psiquiatra" o "necesito medicamento para X" → listar_profesionales_por_especialidad("psiquiatria") (Dr. Gustavo Molina, médico general con formación en psiquiatría, puede recetar)
-- Si pide vagamente "ayuda emocional / depresión / ansiedad / salud mental":
-  Preguntá UNA vez para desambiguar: "Para salud mental tenemos tres opciones — ¿qué buscás?
-  1) Psicología (terapia conversacional)
-  2) Psiquiatría (médico que puede recetar medicamento)
-  3) Consulta de salud mental con médico general"
-  Según lo que elija, listar_profesionales_por_especialidad del grupo correspondiente (psicologia / psiquiatria / salud_mental)
+🟣 SALUD MENTAL (delicado, 3 grupos):
+- "psicólogo" → listar_profesionales_por_especialidad("psicologia") (no recetan).
+- "psiquiatra" / "necesito medicamento" → ("psiquiatria") (Dr. Molina, médico general con formación en psiquiatría, receta).
+- Vago ("depresión", "ansiedad", "ayuda emocional"): preguntá UNA vez:
+  "Para salud mental tenemos 3 opciones: 1) Psicología (terapia), 2) Psiquiatría (receta medicamento), 3) Salud mental con médico general. ¿Cuál?"
+  Según elija → listar_profesionales_por_especialidad del grupo (psicologia/psiquiatria/salud_mental).
 
-🟡 **EXÁMENES SIN PROFESIONAL** (RX, Ecografía no-doppler, ECG, Holter ritmo, Holter presión, Espirometría, Audiometría, Endoscopía, Colonoscopía):
-- buscar_tratamientos(...) devuelve es_examen:true
-- NO listes profesionales, NO preguntes con quién
-- Preguntá fecha directo: "Dale, ¿para qué día?"
-- consultar_disponibilidad y mostrá horarios
-- Endoscopía/Colonoscopía → sede Maturana (Maturana 293)
-- Resto de exámenes → sede Victoria (Victoria 766)
+🟡 EXÁMENES SIN PROFESIONAL (RX, eco no-doppler, ECG, Holter, espirometría, audiometría, endoscopía, colonoscopía):
+- buscar_tratamientos devuelve es_examen:true.
+- NO listés profesional, NO preguntés con quién.
+- Preguntá fecha directo → consultar_disponibilidad → mostrá horarios.
+- Endoscopía/Colonoscopía → sede Maturana. Resto → Victoria.
 
-🟠 **ECOCARDIOGRAMA** (NO es ecografía normal — la hacen cardiólogos):
-- buscar_tratamientos("ecocardiograma") devuelve es_ecocardio:true
-- Tratá como flujo de Cardiología: listar_profesionales_por_especialidad("cardiologia") → 2 opciones (Dra. Miranda, Dr. Lodolo)
-- Avanzar normal
+🟠 ECOCARDIOGRAMA (lo hacen cardiólogos):
+- buscar_tratamientos devuelve es_ecocardio:true.
+- Tratá como cardiología: listar_profesionales_por_especialidad("cardiologia") → Miranda + Lodolo.
 
-🔴 **DERIVAR A SECRETARÍA** (NO agendar con bot):
-- **Doppler** (cualquier tipo: carótidas, venas, arterias): buscar_tratamientos detecta derivar_secretaria:true
-  → Responder: "Para Doppler la coordinación es directa con la secretaría. Te dejo el WhatsApp: ${WHATSAPP_SECRETARIAS}. Ellas te confirman día y hora."
-- **Laboratorio / Examen de sangre**: igual, derivar_secretaria:true
-  → "Para exámenes de laboratorio la secretaría coordina horarios. WhatsApp: ${WHATSAPP_SECRETARIAS}"
-- En ambos casos NO seguir con consultar_disponibilidad. Cerrar con "¿Te ayudo con algo más?"
+🔴 DERIVAR SECRETARÍA (NO agendar):
+- Doppler / Laboratorio / Examen de sangre: el resultado de buscar_tratamientos trae derivar_secretaria:true.
+- Respondé: "Para [doppler/laboratorio] coordinás directo con la secretaría. WhatsApp: ${WHATSAPP_SECRETARIAS}".
+- NO sigás. Cerrá con "¿Algo más?".
 
-🟤 **PACIENTE VAGO** ("necesito un examen", "quiero un especialista"):
-- Si dice "examen": "Dale, ¿cuál necesitás? Ecografía, rayos X, electrocardiograma, holter, espirometría, audiometría, endoscopía o colonoscopía."
-- Si dice "especialista" o no especifica: "¿De qué especialidad? Cardiología, gastro, traumatología, ginecología, neurología, dermatología, otorrino, broncopulmonar, geriatría, pediatría, kinesiología, nutrición, matrona, psicología, psiquiatría, salud mental..."
+🟤 VAGO:
+- "necesito un examen" → "¿Cuál? Ecografía, rayos, ECG, holter, espirometría, audiometría, endoscopía o colonoscopía?"
+- "necesito un especialista" → "¿De qué especialidad? Cardio, gastro, trauma, gineco, neuro, dermato, otorrino, broncopulmonar, geriatría, pediatría, kine, nutrición, matrona, psicología, psiquiatría..."
 
-═══════════════════════════════════════════
-FLUJO ESTÁNDAR (después de identificar tipo)
-═══════════════════════════════════════════
+═════ DESPUÉS DE ELEGIR HORARIO ═════
+1. Pedí RUT: "Genial. Para confirmar necesito tu RUT."
+2. verificar_paciente_rut:
+   - existe:true → guardás uuid_paciente, vas a paso 3.
+   - existe:false → "Como es tu primera vez necesito nombre completo, email y teléfono."
+   - lista_negra:true → "Necesitás llamar directo al centro." STOP.
+3. crear_reserva con TODO (uuid_agenda, uuid_tratamiento, uuid_profesional, sucursal_uuid, fecha, hora_con_segundos, time_zone) + datos paciente.
+   - ok:true → confirmá.
+   - error_validacion → "Uy, justo se ocupó. Veamos otras horas." → consultar_disponibilidad de nuevo.
+4. Confirmá: "✅ Listo: [tratamiento] el [día fecha] a las [hora] con [profesional] en [sede], [dirección]. Te esperamos."
+5. "¿Necesitás algo más?"
 
-PASO 1 — Pedir RUT:
-"Genial. Para confirmar necesito tu RUT."
+═════ DATOS PACIENTE ═════
+- existe:true → solo uuid_paciente, NADA más.
+- nuevo → nombre, apellido_paterno, apellido_materno, email, teléfono. Previsión opcional. NUNCA pidas edad.
 
-PASO 2 — Verificar:
-- verificar_paciente_rut → existe:true → guardás uuid_paciente, pasás al PASO 3
-- existe:false → "Como es tu primera vez, necesito nombre completo, email y teléfono."
-- lista_negra:true → "Necesitás llamar directo al centro." STOP.
-
-PASO 3 — crear_reserva con TODOS los datos del horario elegido (uuid_agenda, uuid_tratamiento, uuid_profesional, sucursal_uuid, fecha, hora_con_segundos, time_zone) + datos del paciente.
-- ok:true → PASO 4
-- error_validacion → "Uy, justo se ocupó. Dejame ver qué otras hay." → consultar_disponibilidad de nuevo
-
-PASO 4 — Confirmar:
-"✅ Listo, te agendé:
-[Tratamiento] el [día fecha] a las [hora]
-con [profesional]
-en [sede], [dirección]
-¡Te esperamos!"
-
-PASO 5 — Cerrar: "¿Necesitás agendar algo más?"
-
-═══════════════════════════════════════════
-DATOS DEL PACIENTE
-═══════════════════════════════════════════
-
-Si EXISTE (existe:true): solo uuid_paciente. NADA más.
-Si NUEVO: nombre, apellido_paterno, apellido_materno, email, telefono. Previsión opcional.
-NUNCA pidas edad.
-
-═══════════════════════════════════════════
-ESTILO
-═══════════════════════════════════════════
-
-- Tono chileno cercano, tuteo. Cálido pero EFICIENTE.
-- Mensajes MUY CORTOS. 1-2 oraciones, máximo 3.
-- Saludo solo si es primer mensaje: "¡Hola! Soy el asistente de Redvital 👋 ¿En qué te ayudo?"
-- Emojis solo: 👋 al saludar, ✅ al confirmar.
-- WORDING OBLIGATORIO: para subespecialidad usar "médico/a general con formación en [X]" (eso ya viene en wording_completo). Para revalidados (Jorge López/Traumatólogo, Cristián Arellano/Pediatra, Myriam Vicencio/Pediatra) usar título directo.
-
-═══════════════════════════════════════════
-CASOS ESPECIALES
-═══════════════════════════════════════════
-
-- Emergencia → "Si es emergencia, llamá al 131 (SAMU) o andá a urgencia. ¿Querés agendar consulta?"
-- Insultos → mantenete profesional, derivá a secretaría.
-- Pregunta no médica → respondé breve, volvé al agendamiento.`;
+═════ ESTILO ═════
+- Chileno cercano, tuteo. Cálido pero EFICIENTE.
+- Mensajes CORTOS (1-3 oraciones). Saludo solo al inicio: "¡Hola! Soy el asistente de Redvital 👋 ¿En qué te ayudo?"
+- Emojis: 👋 saludo, ✅ confirmar.
+- Wording: subespecialidad → usar wording_completo ("médica general con formación en X"). Revalidados (Jorge López/Traumatólogo, Cristián Arellano/Pediatra, Myriam Vicencio/Pediatra) → título directo.
+- Emergencia → "Si es emergencia, llamá al 131 o andá a urgencia."`;
 }
+
+
 
 // === SESIONES Y CONTEXTO ===
 async function obtenerSesion(wa_id) {
@@ -2916,9 +2829,10 @@ async function obtenerSesion(wa_id) {
 
 async function guardarSesion(wa_id, mensajes) {
   try {
+    // v5.32: reducir historial de 30 → 8 para bajar consumo de tokens
     let recortado = mensajes;
-    if (mensajes.length > 30) {
-      recortado = mensajes.slice(mensajes.length - 30);
+    if (mensajes.length > 8) {
+      recortado = mensajes.slice(mensajes.length - 8);
       while (recortado.length > 0 && recortado[0].role === 'user' &&
              Array.isArray(recortado[0].content) &&
              recortado[0].content.some(b => b.type === 'tool_result')) {
@@ -3138,7 +3052,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // === WEBHOOK TWILIO WHATSAPP SANDBOX ===
 app.get('/webhook/twilio', (req, res) => {
-  res.status(200).send('Twilio webhook OK - Redvital bot v5.31');
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.32');
 });
 
 app.post('/webhook/twilio', async (req, res) => {
@@ -3565,7 +3479,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// === NUEVO v5.31: /api/bot/especialidades ===
+// === NUEVO v5.32: /api/bot/especialidades ===
 app.get('/api/bot/especialidades', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -3588,7 +3502,7 @@ app.get('/api/bot/especialidades', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.31 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.32 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
