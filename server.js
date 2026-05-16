@@ -1,6 +1,7 @@
 // ============================================
-// REDVITAL BACKEND v5.18
+// REDVITAL BACKEND v5.30
 // Bot WhatsApp + Claude + Reservo Agendamiento
+// + Twilio WhatsApp Sandbox (paralelo a Meta)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -11,6 +12,8 @@ const { Pool } = require("pg");
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
+// v5.30: Twilio manda webhooks como form-urlencoded, no JSON
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 // ============================================
 // CONEXION A POSTGRESQL
@@ -2155,7 +2158,7 @@ app.get("/api/status", async (req, res) => {
   } catch (e) {}
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.29",
+    servidor: "Redvital Backend v5.30",
     timestamp: new Date().toISOString(),
     bd_conectada: bdConectada,
     total_citas_bd: totalCitas,
@@ -2382,7 +2385,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.29 - Bot WhatsApp + Claude + Catálogo + Function Calling",
+    servidor: "Redvital Backend v5.30 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -2400,7 +2403,8 @@ app.get("/", (req, res) => {
         "/api/bot/chat-test (POST) - simulador SIN WhatsApp",
         "/api/bot/conversaciones",
         "/api/bot/pacientes",
-        "/webhook/whatsapp"
+        "/webhook/whatsapp (Meta)",
+        "/webhook/twilio (Twilio Sandbox)"
       ]
     }
   });
@@ -2623,7 +2627,7 @@ app.get("/api/ads/summary", async (req, res) => {
 
 // ============================================
 // =============================================================
-// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.18)
+// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.30)
 // =============================================================
 // ============================================
 
@@ -2967,6 +2971,9 @@ app.get("/api/bot/debug-env", (req, res) => {
     whatsapp_verify_token: fmt(process.env.WHATSAPP_VERIFY_TOKEN),
     whatsapp_access_token: fmt(process.env.WHATSAPP_ACCESS_TOKEN),
     whatsapp_phone_number_id: fmt(process.env.WHATSAPP_PHONE_NUMBER_ID),
+    twilio_account_sid: fmt(process.env.TWILIO_ACCOUNT_SID),
+    twilio_auth_token: fmt(process.env.TWILIO_AUTH_TOKEN),
+    twilio_from: fmt(process.env.TWILIO_FROM),
     agendas_bot_filtradas: AGENDAS_BOT.length
   });
 });
@@ -3023,12 +3030,9 @@ app.get("/api/bot/tratamientos", async (req, res) => {
 });
 
 // ENDPOINT DIAGNÓSTICO: prueba horarios_disponibles con distintos nombres de parámetro
-// Para descubrir cómo Reservo espera el uuid del tratamiento
 app.get("/api/bot/diag-horarios", async (req, res) => {
-  // Usamos la agenda sede2 general (la que tiene 36 tratamientos) y el primer tratamiento que tenga
   const agenda = AGENDAS_BOT.find(a => a.tipo === 'general' && a.sede === 'sede2') || AGENDAS_BOT[0];
 
-  // Traer un tratamiento real de esa agenda
   const trats = await reservoGetTratamientos(agenda.uuid, agenda.token);
   if (trats.__error || !trats.__list || trats.__list.length === 0) {
     return res.json({ ok: false, error: "No se pudieron traer tratamientos de prueba", detalle: trats });
@@ -3036,13 +3040,11 @@ app.get("/api/bot/diag-horarios", async (req, res) => {
   const tratPrueba = trats.__list[0];
   const uuidTrat = tratPrueba.uuid;
 
-  // Traer un profesional también por si lo pide
   const profs = await reservoGetProfesionales(agenda.uuid, agenda.token);
   const profPrueba = (!profs.__error && profs.__list && profs.__list[0]) ? profs.__list[0] : null;
 
   const fecha = req.query.fecha || "2026-05-19";
 
-  // Distintos nombres de parámetro a probar
   const variantes = [
     { nombre: "tratamiento", params: { tratamiento: uuidTrat } },
     { nombre: "uuid_tratamiento", params: { uuid_tratamiento: uuidTrat } },
@@ -3078,7 +3080,6 @@ app.get("/api/bot/diag-horarios", async (req, res) => {
     }
   }
 
-  // También probar proxima_hora_disponible
   const resultadosProxima = [];
   for (const v of variantes.slice(0, 4)) {
     if (!v.params) continue;
@@ -3110,16 +3111,13 @@ app.get("/api/bot/diag-horarios", async (req, res) => {
   });
 });
 
-// ENDPOINT DIAGNÓSTICO: explora QUÉ RUTAS de makereserva existen en Reservo
 app.get("/api/bot/diag-rutas-reserva", async (req, res) => {
   const agenda = AGENDAS_BOT.find(a => a.tipo === 'general' && a.sede === 'sede2') || AGENDAS_BOT[0];
   const base = `${RESERVO_API}/agenda_online/${agenda.uuid}`;
 
-  // Traer un tratamiento real
   const trats = await reservoGetTratamientos(agenda.uuid, agenda.token);
   const tratPrueba = (trats.__list && trats.__list[0]) ? trats.__list[0] : null;
 
-  // Rutas candidatas para verificar RUT (GET)
   const rutasGET = [
     `${base}/makereserva/existencia_rut_api/?rut=11111111-1`,
     `${base}/makereserva/existencia_rut/?rut=11111111-1`,
@@ -3134,7 +3132,6 @@ app.get("/api/bot/diag-rutas-reserva", async (req, res) => {
     `${base}/reservas/`
   ];
 
-  // Rutas candidatas para crear reserva (POST)
   const rutasPOST = [
     `${base}/makereserva/confirmApptAPI/`,
     `${base}/makereserva/confirmar/`,
@@ -3241,6 +3238,54 @@ async function whatsappEnviarTexto(to, texto) {
 }
 
 // ============================================
+// CLIENTE TWILIO WHATSAPP SANDBOX (v5.30)
+// Funciona en paralelo a Meta. No reemplaza nada.
+// ============================================
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_FROM = process.env.TWILIO_FROM; // ej: whatsapp:+14155238886
+
+async function twilioEnviarTexto(to, texto) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM) {
+    console.warn('[twilio] credenciales no configuradas, no envio mensaje');
+    return { ok: false, error: 'credenciales twilio no configuradas' };
+  }
+  try {
+    // Twilio espera el "to" en formato "whatsapp:+56XXXXXXXXX"
+    const toFormat = to.startsWith('whatsapp:') ? to : `whatsapp:+${String(to).replace(/^\+/, '')}`;
+    const params = new URLSearchParams();
+    params.append('From', TWILIO_FROM);
+    params.append('To', toFormat);
+    params.append('Body', texto);
+
+    const r = await axios.post(
+      `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
+      params.toString(),
+      {
+        auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 15000,
+        validateStatus: () => true
+      }
+    );
+    if (r.status >= 400) {
+      console.error('[twilio enviar]', r.status, JSON.stringify(r.data));
+      return { ok: false, status: r.status, data: r.data };
+    }
+    return { ok: true, sid: r.data.sid, data: r.data };
+  } catch (err) {
+    console.error('[twilio enviar] error', err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+// Wrapper: envía por el provider correcto según de dónde vino el mensaje
+async function enviarMensajeWhatsApp(provider, to, texto) {
+  if (provider === 'twilio') return twilioEnviarTexto(to, texto);
+  return whatsappEnviarTexto(to, texto);
+}
+
+// ============================================
 // CLIENTE CLAUDE API
 // ============================================
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
@@ -3279,7 +3324,6 @@ async function claudeMessage(messages, systemPrompt, tools) {
     return { error: err.message };
   }
 }
-
 // ============================================
 // ORQUESTADOR DEL BOT (Fase 2: Function Calling)
 // ============================================
@@ -3387,7 +3431,6 @@ async function ejecutarTool(nombre, input) {
   try {
     if (nombre === "buscar_tratamientos") {
       const resultado = await buscarTratamientos(input.query || "", { limit: 10 });
-      // Simplificar la respuesta para Claude: solo lo esencial
       if (resultado.resultados && Array.isArray(resultado.resultados)) {
         const simple = resultado.resultados.map(t => ({
           nombre: t.nombre,
@@ -3429,7 +3472,6 @@ async function ejecutarTool(nombre, input) {
         return { ok: false, error: `Error Reservo http=${resp.http}`, detalle: resp.body };
       }
 
-      // Formato Reservo: [{ fecha, sucursales: [{ uuid, nombre, direccion, profesionales: [{ agenda, nombre, horas_disponibles: [] }] }] }]
       const data = resp.data;
       const horariosAplanados = [];
 
@@ -3439,9 +3481,8 @@ async function ejecutarTool(nombre, input) {
           for (const suc of (dia.sucursales || [])) {
             for (const prof of (suc.profesionales || [])) {
               for (const horaISO of (prof.horas_disponibles || [])) {
-                // horaISO ej: "2026-05-19T18:15:00-04:00"
-                const horaSolo = horaISO.substring(11, 16); // "18:15"
-                const horaConSeg = horaISO.substring(11, 19); // "18:15:00"
+                const horaSolo = horaISO.substring(11, 16);
+                const horaConSeg = horaISO.substring(11, 19);
                 horariosAplanados.push({
                   fecha: fecha,
                   hora: horaSolo,
@@ -3449,7 +3490,7 @@ async function ejecutarTool(nombre, input) {
                   hora_iso: horaISO,
                   time_zone: suc.time_zone || "America/Santiago",
                   profesional_nombre: prof.nombre,
-                  uuid_profesional: prof.agenda, // el campo 'agenda' es el uuid del profesional para reservar
+                  uuid_profesional: prof.agenda,
                   sucursal_uuid: suc.uuid,
                   sucursal_nombre: suc.nombre,
                   sucursal_direccion: suc.direccion
@@ -3460,7 +3501,6 @@ async function ejecutarTool(nombre, input) {
         }
       }
 
-      // Limitar a 12 horarios para no inundar a Claude
       const limitados = horariosAplanados.slice(0, 12);
 
       return {
@@ -3475,7 +3515,6 @@ async function ejecutarTool(nombre, input) {
     if (nombre === "verificar_paciente_rut") {
       const agenda = AGENDAS_BOT.find(a => a.uuid === input.uuid_agenda);
       if (!agenda) return { ok: false, error: "Agenda no encontrada" };
-      // RUT sin puntos, con guión (formato que pide Reservo)
       let rutLimpio = String(input.rut).replace(/[.\s]/g, "");
       if (!rutLimpio.includes("-") && rutLimpio.length > 1) {
         rutLimpio = rutLimpio.slice(0, -1) + "-" + rutLimpio.slice(-1);
@@ -3487,7 +3526,6 @@ async function ejecutarTool(nombre, input) {
       }
 
       const data = r.data || {};
-      // Respuestas posibles: {existe:1, paciente:uuid, datos_faltantes} | {existe:0} | {marcado:1}
       if (data.marcado === 1) {
         return { ok: true, existe: false, lista_negra: true, mensaje: "Paciente en lista negra. Derivar a secretaría, no agendar por bot." };
       }
@@ -3501,7 +3539,6 @@ async function ejecutarTool(nombre, input) {
           mensaje: "Paciente ya registrado. Usar uuid_paciente para crear la reserva, no pedir nombre/teléfono de nuevo."
         };
       }
-      // existe: 0
       return {
         ok: true,
         existe: false,
@@ -3514,13 +3551,10 @@ async function ejecutarTool(nombre, input) {
       const agenda = AGENDAS_BOT.find(a => a.uuid === input.uuid_agenda);
       if (!agenda) return { ok: false, error: "Agenda no encontrada" };
 
-      // Construir el objeto cliente según si existe o es nuevo
       let cliente;
       if (input.uuid_paciente) {
-        // Paciente existente: solo uuid
         cliente = { uuid: input.uuid_paciente };
       } else {
-        // Paciente nuevo: campos del formulario
         let rutLimpio = String(input.rut || "").replace(/[.\s]/g, "");
         if (!rutLimpio.includes("-") && rutLimpio.length > 1) {
           rutLimpio = rutLimpio.slice(0, -1) + "-" + rutLimpio.slice(-1);
@@ -3536,7 +3570,6 @@ async function ejecutarTool(nombre, input) {
         if (input.prevision_id) cliente.prevision = input.prevision_id;
       }
 
-      // Body según documentación de confirmApptAPI
       const body = {
         sucursal: input.sucursal_uuid,
         url: agenda.uuid,
@@ -3557,7 +3590,6 @@ async function ejecutarTool(nombre, input) {
       }
 
       const data = r.data || {};
-      // status 1 = éxito, status -1 = error de validación
       if (r.__http === 200 && data.status === 1) {
         const citaCreada = (data.citas && data.citas[0]) || {};
         return {
@@ -3575,7 +3607,6 @@ async function ejecutarTool(nombre, input) {
         };
       }
 
-      // Error de validación (status -1, cupo ocupado, datos mal, etc)
       return {
         ok: false,
         cita_creada: false,
@@ -3595,15 +3626,13 @@ async function ejecutarTool(nombre, input) {
 
 // === SYSTEM PROMPT DINÁMICO ===
 async function construirSystemPrompt() {
-  // Fecha y hora actual de Chile para que Claude sepa cuándo es "lunes", "mañana", etc.
   const ahora = new Date();
-  const ahoraCL = new Date(ahora.getTime() - 4 * 3600000); // UTC-4 Chile
+  const ahoraCL = new Date(ahora.getTime() - 4 * 3600000);
   const fechaCL = ahoraCL.toISOString().split('T')[0];
   const horaCL = ahoraCL.toISOString().split('T')[1].substring(0, 5);
   const diasSemana = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
   const diaHoy = diasSemana[ahoraCL.getUTCDay()];
 
-  // Calcular próximos días útiles para que Claude tenga referencias claras
   const proximosDias = [];
   for (let i = 1; i <= 7; i++) {
     const d = new Date(ahoraCL);
@@ -3611,7 +3640,6 @@ async function construirSystemPrompt() {
     proximosDias.push(`${diasSemana[d.getUTCDay()]} ${d.toISOString().split('T')[0]}`);
   }
 
-  // Traer categorías y conteo actual del catálogo para que Claude las conozca
   let resumenCatalogo = "";
   try {
     const { rows: categorias } = await pool.query(`
@@ -3775,10 +3803,11 @@ CASOS ESPECIALES
 - Si el paciente abandona a mitad → no insistas, dejá la conversación abierta.`;
 }
 
-// === HISTORIAL COMPLETO (con bloques de tool) en bot_sesiones ===
-// En vez de solo texto, guardamos el array de mensajes Claude completo (incluye tool_use/tool_result)
-// Así Claude "ve" los UUIDs reales que devolvieron las tools y no los inventa.
+// ============================================
+// ORQUESTADOR DEL BOT (Fase 2: Function Calling)
+// ============================================
 
+// === DEFINICIÓN DE TOOLS PARA CLAUDE ===
 async function obtenerSesion(wa_id) {
   try {
     const { rows } = await pool.query(
@@ -3796,11 +3825,9 @@ async function obtenerSesion(wa_id) {
 
 async function guardarSesion(wa_id, mensajes) {
   try {
-    // Limitar el historial a los últimos 30 mensajes para no crecer infinito
     let recortado = mensajes;
     if (mensajes.length > 30) {
       recortado = mensajes.slice(mensajes.length - 30);
-      // Asegurar que no empiece con un tool_result huérfano
       while (recortado.length > 0 && recortado[0].role === 'user' &&
              Array.isArray(recortado[0].content) &&
              recortado[0].content.some(b => b.type === 'tool_result')) {
@@ -3826,7 +3853,6 @@ async function resetSesion(wa_id) {
   }
 }
 
-// Mantenemos obtenerHistorial por compatibilidad (lo usa el endpoint de admin de conversaciones)
 async function obtenerHistorial(wa_id, limit = 10) {
   const { rows } = await pool.query(
     `SELECT direccion, mensaje, timestamp FROM bot_conversaciones
@@ -3894,14 +3920,12 @@ async function upsertPaciente(wa_id, mensaje, referral) {
 }
 
 // === LOOP CONVERSACIONAL CON TOOL USE ===
-// Toma historial + mensaje nuevo, llama a Claude, ejecuta tools si hace falta, y devuelve respuesta final
 async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
   const maxIter = opciones.maxIter || 6;
   const waId = opciones.waId || null;
   const system = await construirSystemPrompt();
   const toolsLog = [];
 
-  // Cargar el historial completo de la sesión (incluye bloques tool_use/tool_result)
   const sesion = await obtenerSesion(waId);
   let messages = [...sesion.mensajes, { role: 'user', content: mensajeUsuario }];
 
@@ -3910,7 +3934,6 @@ async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
     const respuesta = await claudeMessage(messages, system, BOT_TOOLS);
 
     if (respuesta.error) {
-      // No guardamos la sesión si hubo error de Claude (dejamos el estado anterior)
       return {
         ok: false,
         error: respuesta.error,
@@ -3923,10 +3946,8 @@ async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
     const content = respuesta.content || [];
 
     if (stopReason === 'tool_use') {
-      // Agregar la respuesta del assistant (incluye texto + tool_use blocks)
       messages.push({ role: 'assistant', content: content });
 
-      // Ejecutar cada tool_use y armar tool_results
       const toolResults = [];
       for (const block of content) {
         if (block.type === 'tool_use') {
@@ -3937,7 +3958,6 @@ async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
             output: resultado
           });
 
-          // Si se creó una reserva exitosamente, guardarla en bot_citas
           if (block.name === 'crear_reserva' && resultado.ok && resultado.cita_creada && waId) {
             try {
               const det = resultado.detalle_cita || {};
@@ -3981,14 +4001,12 @@ async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
       continue;
     }
 
-    // end_turn — extraer texto final
     let textoFinal = '';
     for (const block of content) {
       if (block.type === 'text') textoFinal += block.text;
     }
     if (!textoFinal) textoFinal = 'Disculpá, no entendí. ¿Podés repetir?';
 
-    // Guardar la respuesta del assistant en el historial y persistir la sesión
     messages.push({ role: 'assistant', content: content });
     if (waId) await guardarSesion(waId, messages);
 
@@ -4001,7 +4019,6 @@ async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
     };
   }
 
-  // Agotamos iteraciones — guardamos igual el estado para no perder contexto
   if (waId) await guardarSesion(waId, messages);
   return {
     ok: false,
@@ -4011,20 +4028,20 @@ async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
   };
 }
 
-// === ENTRADA PRINCIPAL DESDE WHATSAPP ===
-async function procesarMensajeBot(wa_id, texto, referral) {
-  console.log(`[bot] mensaje IN ${wa_id}: ${texto ? texto.substring(0, 80) : '(sin texto)'}`);
+// === ENTRADA PRINCIPAL DESDE WHATSAPP (v5.30 - soporta Meta y Twilio) ===
+async function procesarMensajeBot(wa_id, texto, referral, provider) {
+  provider = provider || 'meta';
+  console.log(`[bot] mensaje IN [${provider}] ${wa_id}: ${texto ? texto.substring(0, 80) : '(sin texto)'}`);
 
   await upsertPaciente(wa_id, texto, referral);
   await guardarMensaje(wa_id, 'in', texto);
 
-  // El historial ahora lo maneja la sesión (bot_sesiones) dentro de procesarConversacionConTools
   const resultado = await procesarConversacionConTools(texto || '(mensaje sin texto)', { waId: wa_id });
 
-  // Enviar respuesta por WhatsApp
-  await whatsappEnviarTexto(wa_id, resultado.texto);
+  // Enviar respuesta por el provider correcto (meta o twilio)
+  await enviarMensajeWhatsApp(provider, wa_id, resultado.texto);
   await guardarMensaje(wa_id, 'out', resultado.texto, {
-    datos: { tools_log: resultado.tools_log, iteraciones: resultado.iteraciones },
+    datos: { tools_log: resultado.tools_log, iteraciones: resultado.iteraciones, provider: provider },
     error: resultado.ok ? null : (resultado.error ? JSON.stringify(resultado.error).substring(0, 500) : null)
   });
 }
@@ -4037,7 +4054,6 @@ app.post('/api/bot/chat-test', async (req, res) => {
       return res.status(400).json({ ok: false, error: "Faltan wa_id y mensaje" });
     }
 
-    // Si reset=true, borrar historial previo de ese wa_id de test (incluida la sesión)
     if (reset) {
       await pool.query(`DELETE FROM bot_conversaciones WHERE wa_id = $1`, [wa_id]);
       await pool.query(`DELETE FROM bot_pacientes WHERE wa_id = $1`, [wa_id]);
@@ -4067,11 +4083,9 @@ app.post('/api/bot/chat-test', async (req, res) => {
   }
 });
 
-
 // ============================================
 // WEBHOOK META WHATSAPP
 // ============================================
-// GET: handshake de verificación
 app.get('/webhook/whatsapp', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -4086,9 +4100,7 @@ app.get('/webhook/whatsapp', (req, res) => {
   }
 });
 
-// POST: recepción de mensajes
 app.post('/webhook/whatsapp', async (req, res) => {
-  // SIEMPRE responder 200 rápido (Meta reintenta si no es 200 en 20s)
   res.status(200).send('EVENT_RECEIVED');
 
   try {
@@ -4108,18 +4120,15 @@ app.post('/webhook/whatsapp', async (req, res) => {
           if (tipo === 'text') {
             texto = msg.text ? msg.text.body : '';
           } else if (tipo === 'interactive') {
-            // botones / listas
             if (msg.interactive && msg.interactive.button_reply) {
               texto = msg.interactive.button_reply.title;
             } else if (msg.interactive && msg.interactive.list_reply) {
               texto = msg.interactive.list_reply.title;
             }
           } else {
-            // audio / imagen / video / sticker → respuesta default
             texto = `[mensaje de tipo ${tipo} no soportado]`;
           }
 
-          // Extraer referral (ad click) si viene
           let referral = null;
           if (msg.referral) {
             referral = {
@@ -4133,15 +4142,51 @@ app.post('/webhook/whatsapp', async (req, res) => {
             };
           }
 
-          // Procesar el mensaje (async, no bloquea)
-          procesarMensajeBot(wa_id, texto, referral).catch(err => {
-            console.error('[bot] procesarMensajeBot error', err.message);
+          procesarMensajeBot(wa_id, texto, referral, 'meta').catch(err => {
+            console.error('[bot] procesarMensajeBot (meta) error', err.message);
           });
         }
       }
     }
   } catch (err) {
     console.error('[wa webhook POST]', err.message);
+  }
+});
+
+// ============================================
+// WEBHOOK TWILIO WHATSAPP SANDBOX (v5.30)
+// ============================================
+// GET de prueba (Twilio no hace handshake, pero útil para verificar)
+app.get('/webhook/twilio', (req, res) => {
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.30');
+});
+
+// POST: recepción de mensajes de Twilio (form-urlencoded)
+app.post('/webhook/twilio', async (req, res) => {
+  // Responder 200 con TwiML vacío (Twilio espera XML; el mensaje real lo enviamos por API)
+  res.set('Content-Type', 'text/xml');
+  res.status(200).send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+
+  try {
+    const from = req.body.From || '';          // "whatsapp:+56920577848"
+    const body = req.body.Body || '';          // texto del mensaje
+    const profileName = req.body.ProfileName || '';
+
+    if (!from) return;
+
+    // Normalizar el wa_id al mismo formato que usa Meta (sin "whatsapp:" ni "+")
+    const wa_id = from.replace('whatsapp:', '').replace(/^\+/, '');
+
+    console.log(`[twilio IN] de ${wa_id} (${profileName}): "${String(body).substring(0, 80)}"`);
+
+    if (!body || !wa_id) return;
+
+    // Procesar igual que Meta, pero indicando provider=twilio para que la respuesta vaya por Twilio
+    procesarMensajeBot(wa_id, body, null, 'twilio').catch(err => {
+      console.error('[bot] procesarMensajeBot (twilio) error', err.message);
+    });
+  } catch (err) {
+    console.error('[twilio webhook POST]', err.message);
   }
 });
 
@@ -4173,7 +4218,6 @@ app.get('/api/bot/pacientes', async (req, res) => {
   }
 });
 
-// Citas creadas por el bot — para mostrar en el dashboard
 app.get('/api/bot/citas', async (req, res) => {
   try {
     const { estado, desde, hasta } = req.query;
@@ -4198,7 +4242,6 @@ app.get('/api/bot/citas', async (req, res) => {
       params
     );
 
-    // Resumen rápido
     const resumen = await pool.query(`
       SELECT
         COUNT(*)::int AS total,
@@ -4219,7 +4262,6 @@ app.get('/api/bot/citas', async (req, res) => {
   }
 });
 
-// Métricas del bot — conversaciones, conversión, etc.
 app.get('/api/bot/metricas', async (req, res) => {
   try {
     const pacientes = await pool.query(`
@@ -4258,15 +4300,12 @@ app.get('/api/bot/metricas', async (req, res) => {
   }
 });
 
-// =============================================================
-// FASE 1: CATÁLOGO + SINCRONIZACIÓN AUTOMÁTICA (v5.19)
+// === SYSTEM PROMPT DINÁMICO ===
+// FASE 1: CATÁLOGO + SINCRONIZACIÓN AUTOMÁTICA
 // =============================================================
 
-// Lista de agendas que SÍ funcionan (las otras 2 dieron 404)
-// Esto se construye dinámicamente filtrando solo las que responden bien
-const AGENDAS_ACTIVAS = AGENDAS_BOT; // se filtra en cada sync, las que dan 404 quedan logueadas
+const AGENDAS_ACTIVAS = AGENDAS_BOT;
 
-// Normalizador para búsqueda fuzzy: minúsculas, sin acentos, sin espacios extras
 function normalizarTexto(texto) {
   if (!texto) return '';
   return String(texto)
@@ -4278,7 +4317,6 @@ function normalizarTexto(texto) {
     .trim();
 }
 
-// Versión paginada: sigue pagina_siguiente hasta agotar
 async function reservoGetTodoPaginado(url, token) {
   const todos = [];
   let nextUrl = url;
@@ -4329,7 +4367,6 @@ async function sincronizarCatalogo(tipo = 'auto') {
   SYNC_EN_CURSO = true;
   const inicio = Date.now();
 
-  // Crear registro de log
   let logId = null;
   try {
     const r = await pool.query(
@@ -4346,7 +4383,6 @@ async function sincronizarCatalogo(tipo = 'auto') {
   let profsNuevos = 0, profsActualizados = 0;
   let tratsNuevos = 0, tratsActualizados = 0;
 
-  // UUIDs vistos en esta sync (para marcar como inactivos los que ya no aparezcan)
   const profsVistos = new Set();
   const tratsVistos = new Set();
 
@@ -4361,7 +4397,6 @@ async function sincronizarCatalogo(tipo = 'auto') {
         errores: []
       };
 
-      // === PROFESIONALES ===
       const urlProfs = `${RESERVO_API}/agenda_online/${agenda.uuid}/profesionales/`;
       const profs = await reservoGetTodoPaginado(urlProfs, agenda.token);
 
@@ -4403,13 +4438,11 @@ async function sincronizarCatalogo(tipo = 'auto') {
         }
       }
 
-      // === TRATAMIENTOS ===
       const urlTrats = `${RESERVO_API}/agenda_online/${agenda.uuid}/tratamientos/`;
       const trats = await reservoGetTodoPaginado(urlTrats, agenda.token);
 
       if (trats.__error) {
         detAgenda.errores.push(`tratamientos: http=${trats.http}`);
-        // Si profesionales también falló no contamos doble
         if (detAgenda.errores.length === 1) agendasError++;
       } else {
         detAgenda.tratamientos = trats.length;
@@ -4459,8 +4492,6 @@ async function sincronizarCatalogo(tipo = 'auto') {
       detalle.agendas.push(detAgenda);
     }
 
-    // === MARCAR COMO INACTIVOS LOS QUE NO APARECIERON ===
-    // Por seguridad, solo desactivamos si la sync trajo al menos algo (no si todo falló)
     let profsDesactivados = 0, tratsDesactivados = 0;
     if (profsVistos.size > 0) {
       const r1 = await pool.query(
@@ -4541,7 +4572,6 @@ async function buscarTratamientos(query, opciones = {}) {
   const q = normalizarTexto(query);
   const limit = opciones.limit || 20;
   if (!q || q.length < 2) {
-    // Sin query: devolver categorías agrupadas
     const { rows } = await pool.query(
       `SELECT categoria_nombre, COUNT(DISTINCT nombre)::int AS cantidad
        FROM bot_catalogo_tratamientos
@@ -4578,7 +4608,6 @@ async function buscarProfesionales(query, opciones = {}) {
   const q = normalizarTexto(query);
   const limit = opciones.limit || 20;
   if (!q || q.length < 2) {
-    // Sin query: devolver cargos agrupados
     const { rows } = await pool.query(
       `SELECT cargo, COUNT(DISTINCT nombre)::int AS cantidad
        FROM bot_catalogo_profesionales
@@ -4779,12 +4808,12 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.29 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.30 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
 
-  // Primera sincronización 30 seg después del boot (deja que la BD se asiente)
+  // Primera sincronización 30 seg después del boot
   setTimeout(() => {
     console.log('[sync] Disparando primera sincronización de catálogo...');
     sincronizarCatalogo('boot').catch(err => console.error('[sync boot]', err.message));
