@@ -1,8 +1,9 @@
 // ============================================
-// REDVITAL BACKEND v5.32
+// REDVITAL BACKEND v5.33
 // Bot WhatsApp + Claude + Reservo Agendamiento
 // + Twilio WhatsApp Sandbox (paralelo a Meta)
 // + Optimizaciones rate limit Tier 1 (v5.32)
+// + Endpoint diagnóstico de suspensiones (v5.33)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -102,7 +103,7 @@ const WEBHOOK_TO_SEDE = {
 const COSTO_FIJO_MENSUAL = 20637600;
 const PCT_REDVITAL_GLOBAL = 0.47;
 
-// v5.32: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
+// v5.33: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
 const WHATSAPP_SECRETARIAS = "+56 9 2246 7275";
 
 const CATEGORIAS_SERVICIO = [
@@ -1663,7 +1664,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.32",
+    ok: true, servidor: "Redvital Backend v5.33",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1828,7 +1829,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.32 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
+    servidor: "Redvital Backend v5.33 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -1841,7 +1842,7 @@ app.get("/", (req, res) => {
         "/api/bot/catalogo/tratamientos",
         "/api/bot/catalogo/categorias",
         "/api/bot/catalogo/buscar?q=",
-        "/api/bot/especialidades (v5.32)"
+        "/api/bot/especialidades (v5.33)"
       ],
       bot_conversacional: [
         "/api/bot/chat-test (POST) - simulador SIN WhatsApp",
@@ -2012,7 +2013,7 @@ app.get("/api/ads/summary", async (req, res) => {
 });
 
 // =============================================================
-// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.32)
+// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.33)
 // =============================================================
 async function inicializarBotBD() {
   try {
@@ -2107,7 +2108,7 @@ async function inicializarBotBD() {
       )`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_iniciado ON bot_sync_log(iniciado_en DESC)`);
 
-    // NUEVO en v5.32: tabla de mapeo profesional -> especialidad/grupo clínico
+    // NUEVO en v5.33: tabla de mapeo profesional -> especialidad/grupo clínico
     // (debe poblarse via SQL externo "cargar_especialidades.sql" la primera vez)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profesional_especialidad (
@@ -2366,12 +2367,12 @@ async function enviarMensajeWhatsApp(provider, to, texto) {
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_MODEL = 'claude-sonnet-4-5';
 
-// v5.32: Reintento automático en rate_limit (429) con backoff exponencial
+// v5.33: Reintento automático en rate_limit (429) con backoff exponencial
 // Esto evita que el paciente vea "tuve un problema técnico" cuando hay congestión.
 async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
   if (!CLAUDE_API_KEY) { console.warn('[claude] CLAUDE_API_KEY no configurada'); return { error: 'CLAUDE_API_KEY no configurada' }; }
   try {
-    // v5.32: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
+    // v5.33: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
     const body = { model: CLAUDE_MODEL, max_tokens: 600, messages: messages };
     if (systemPrompt) body.system = systemPrompt;
     if (tools && tools.length > 0) body.tools = tools;
@@ -2379,7 +2380,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
       headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 60000, validateStatus: () => true });
 
-    // v5.32: si es rate limit (429), esperar y reintentar hasta 3 veces
+    // v5.33: si es rate limit (429), esperar y reintentar hasta 3 veces
     if (r.status === 429 && intento <= 3) {
       // Intentar respetar header retry-after si viene; si no, backoff exponencial
       const retryAfterSec = parseInt(r.headers && r.headers['retry-after']) || (15 * intento);
@@ -2395,7 +2396,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
 }
 
 // ============================================
-// HELPERS v5.32: Lookup de especialidades por profesional
+// HELPERS v5.33: Lookup de especialidades por profesional
 // ============================================
 
 // Lee bot_profesional_especialidad para un nombre normalizado
@@ -2467,7 +2468,7 @@ function detectarServicioEspecial(query) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT (v5.32: Function Calling + Elección Profesional)
+// ORQUESTADOR DEL BOT (v5.33: Function Calling + Elección Profesional)
 // ============================================
 const BOT_TOOLS = [
   {
@@ -2601,7 +2602,7 @@ async function ejecutarTool(nombre, input) {
           const fecha = dia.fecha;
           for (const suc of (dia.sucursales || [])) {
             for (const prof of (suc.profesionales || [])) {
-              // v5.32: si vino uuid_profesional, filtrar
+              // v5.33: si vino uuid_profesional, filtrar
               if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
               for (const horaISO of (prof.horas_disponibles || [])) {
                 horariosAplanados.push({
@@ -2617,7 +2618,7 @@ async function ejecutarTool(nombre, input) {
           }
         }
       }
-      // v5.32: reducir 12→6 horarios y simplificar campos para bajar tokens
+      // v5.33: reducir 12→6 horarios y simplificar campos para bajar tokens
       const limitados = horariosAplanados.slice(0, 6).map(h => ({
         fecha: h.fecha, hora: h.hora,
         hora_con_segundos: h.hora_con_segundos,
@@ -2716,8 +2717,8 @@ async function ejecutarTool(nombre, input) {
 }
 
 
-// === SYSTEM PROMPT DINÁMICO v5.32 ===
-// === SYSTEM PROMPT DINÁMICO v5.32 (COMPRIMIDO ~60% para Tier 1) ===
+// === SYSTEM PROMPT DINÁMICO v5.33 ===
+// === SYSTEM PROMPT DINÁMICO v5.33 (COMPRIMIDO ~60% para Tier 1) ===
 async function construirSystemPrompt() {
   const ahora = new Date();
   const ahoraCL = new Date(ahora.getTime() - 4 * 3600000);
@@ -2829,7 +2830,7 @@ async function obtenerSesion(wa_id) {
 
 async function guardarSesion(wa_id, mensajes) {
   try {
-    // v5.32: reducir historial de 30 → 8 para bajar consumo de tokens
+    // v5.33: reducir historial de 30 → 8 para bajar consumo de tokens
     let recortado = mensajes;
     if (mensajes.length > 8) {
       recortado = mensajes.slice(mensajes.length - 8);
@@ -3052,7 +3053,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // === WEBHOOK TWILIO WHATSAPP SANDBOX ===
 app.get('/webhook/twilio', (req, res) => {
-  res.status(200).send('Twilio webhook OK - Redvital bot v5.32');
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.33');
 });
 
 app.post('/webhook/twilio', async (req, res) => {
@@ -3479,7 +3480,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// === NUEVO v5.32: /api/bot/especialidades ===
+// === NUEVO v5.33: /api/bot/especialidades ===
 app.get('/api/bot/especialidades', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -3497,12 +3498,394 @@ app.get('/api/bot/especialidades', async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
+// ============================================================
+// ENDPOINT: GET /api/suspensiones/diagnostico (v5.33)
+// ============================================================
+// Análisis completo de citas perdidas: Suspendió + Eliminado + No llegó
+// Cruza tabla `citas` con `ventas` para ingresos reales y plata perdida.
+//
+// Query params:
+//   desde   YYYY-MM-DD (default: primer día mes Redvital actual = 26 mes pasado)
+//   hasta   YYYY-MM-DD (default: hoy)
+//   sucursal "Centro Médico Redvital" | "Redvital Sede Maturana" | null (todas)
+// ============================================================
+
+app.get("/api/suspensiones/diagnostico", async (req, res) => {
+  try {
+    const { desde, hasta, sucursal } = req.query;
+
+    // Defaults: mes Redvital actual (26 mes pasado → 25 mes actual)
+    const hoy = new Date();
+    const dia26pasado = new Date(hoy.getFullYear(), hoy.getMonth() - (hoy.getDate() < 26 ? 1 : 0), 26);
+    const fechaDesde = desde || dia26pasado.toISOString().slice(0,10);
+    const fechaHasta = hasta || hoy.toISOString().slice(0,10);
+    const filtroSucursal = sucursal && sucursal !== 'Ambas' ? sucursal : null;
+
+    const params = [fechaDesde, fechaHasta];
+    let whereSucursal = '';
+    if (filtroSucursal) {
+      params.push(filtroSucursal);
+      whereSucursal = ` AND sucursal = $3`;
+    }
+
+    // Estado: clasificación canónica
+    // PERDIDA_GRAVE = Suspendió + Eliminado (lo que tu app llama "suspensiones": 454)
+    // NO_SHOW = No llegó (no avisó)
+    // ATENDIDA = Atendido + Llegó
+    // FUTURA = Confirmado + No Confirmado + Lista de Espera
+    const ESTADOS_PERDIDA_GRAVE = ['Suspendió', 'Eliminado'];
+    const ESTADOS_NO_SHOW = ['No llegó'];
+    const ESTADOS_ATENDIDA = ['Atendido', 'Llegó'];
+
+    // ====================================================
+    // QUERY 1: RESUMEN GENERAL
+    // ====================================================
+    const resumenQ = `
+      WITH base AS (
+        SELECT estado_cita, profesional, tratamiento
+        FROM citas
+        WHERE fecha BETWEEN $1 AND $2 ${whereSucursal}
+      ),
+      tickets AS (
+        SELECT profesional,
+               COALESCE(AVG(v.monto_total)::int, 28000) AS ticket_prom
+        FROM citas c
+        LEFT JOIN ventas v ON v.id_venta = c.venta_id
+        WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
+          AND c.estado_cita IN ('Atendido', 'Llegó')
+          AND v.monto_total IS NOT NULL
+        GROUP BY profesional
+      ),
+      ticket_global AS (
+        SELECT COALESCE(AVG(v.monto_total)::int, 28000) AS prom
+        FROM citas c
+        LEFT JOIN ventas v ON v.id_venta = c.venta_id
+        WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
+          AND c.estado_cita IN ('Atendido', 'Llegó')
+          AND v.monto_total IS NOT NULL
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE estado_cita IN ('Atendido','Llegó'))::int AS atendidas,
+        COUNT(*) FILTER (WHERE estado_cita = 'Suspendió')::int AS suspendio,
+        COUNT(*) FILTER (WHERE estado_cita = 'Eliminado')::int AS eliminado,
+        COUNT(*) FILTER (WHERE estado_cita = 'No llegó')::int AS no_llego,
+        COUNT(*) FILTER (WHERE estado_cita = 'Confirmado')::int AS confirmado,
+        COUNT(*) FILTER (WHERE estado_cita = 'No Confirmado')::int AS no_confirmado,
+        COUNT(*) FILTER (WHERE estado_cita = 'Lista de Espera')::int AS lista_espera,
+        COUNT(*)::int AS total,
+        (SELECT prom FROM ticket_global) AS ticket_promedio
+      FROM base;
+    `;
+
+    // ====================================================
+    // QUERY 2: POR DÍA DE LA SEMANA (3 estados separados)
+    // ====================================================
+    const porDiaQ = `
+      SELECT
+        EXTRACT(DOW FROM fecha)::int AS dow,
+        TO_CHAR(fecha, 'TMDay') AS dia_nombre,
+        COUNT(*) FILTER (WHERE estado_cita = 'Suspendió')::int AS suspendio,
+        COUNT(*) FILTER (WHERE estado_cita = 'Eliminado')::int AS eliminado,
+        COUNT(*) FILTER (WHERE estado_cita = 'No llegó')::int AS no_llego,
+        COUNT(*) FILTER (WHERE estado_cita IN ('Suspendió','Eliminado','No llegó'))::int AS total_perdidas,
+        COUNT(*) FILTER (WHERE estado_cita IN ('Atendido','Llegó'))::int AS atendidas,
+        COUNT(*)::int AS total_citas
+      FROM citas
+      WHERE fecha BETWEEN $1 AND $2 ${whereSucursal}
+      GROUP BY EXTRACT(DOW FROM fecha), TO_CHAR(fecha, 'TMDay')
+      ORDER BY dow;
+    `;
+
+    // ====================================================
+    // QUERY 3: POR HORA DEL DÍA
+    // ====================================================
+    const porHoraQ = `
+      SELECT
+        EXTRACT(HOUR FROM hora_inicio)::int AS hora,
+        COUNT(*) FILTER (WHERE estado_cita = 'Suspendió')::int AS suspendio,
+        COUNT(*) FILTER (WHERE estado_cita = 'Eliminado')::int AS eliminado,
+        COUNT(*) FILTER (WHERE estado_cita = 'No llegó')::int AS no_llego,
+        COUNT(*) FILTER (WHERE estado_cita IN ('Suspendió','Eliminado','No llegó'))::int AS total_perdidas,
+        COUNT(*) FILTER (WHERE estado_cita IN ('Atendido','Llegó'))::int AS atendidas,
+        COUNT(*)::int AS total_citas
+      FROM citas
+      WHERE fecha BETWEEN $1 AND $2 ${whereSucursal}
+        AND hora_inicio IS NOT NULL
+      GROUP BY EXTRACT(HOUR FROM hora_inicio)
+      ORDER BY hora;
+    `;
+
+    // ====================================================
+    // QUERY 4: POR PROFESIONAL (con plata perdida real)
+    // ====================================================
+    const porProfQ = `
+      WITH ticket_prof AS (
+        SELECT c.profesional,
+               AVG(v.monto_total)::int AS ticket
+        FROM citas c
+        LEFT JOIN ventas v ON v.id_venta = c.venta_id
+        WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
+          AND c.estado_cita IN ('Atendido','Llegó')
+          AND v.monto_total IS NOT NULL
+        GROUP BY c.profesional
+      ),
+      ticket_global AS (
+        SELECT AVG(v.monto_total)::int AS prom
+        FROM citas c
+        LEFT JOIN ventas v ON v.id_venta = c.venta_id
+        WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
+          AND c.estado_cita IN ('Atendido','Llegó')
+          AND v.monto_total IS NOT NULL
+      )
+      SELECT
+        c.profesional,
+        COUNT(*)::int AS total_citas,
+        COUNT(*) FILTER (WHERE c.estado_cita IN ('Atendido','Llegó'))::int AS atendidas,
+        COUNT(*) FILTER (WHERE c.estado_cita = 'Suspendió')::int AS suspendio,
+        COUNT(*) FILTER (WHERE c.estado_cita = 'Eliminado')::int AS eliminado,
+        COUNT(*) FILTER (WHERE c.estado_cita = 'No llegó')::int AS no_llego,
+        COUNT(*) FILTER (WHERE c.estado_cita IN ('Suspendió','Eliminado','No llegó'))::int AS perdidas,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE c.estado_cita IN ('Suspendió','Eliminado','No llegó'))
+              / NULLIF(COUNT(*),0), 1) AS pct_perdidas,
+        COALESCE(tp.ticket, (SELECT prom FROM ticket_global), 28000) AS ticket_prom,
+        COUNT(*) FILTER (WHERE c.estado_cita IN ('Suspendió','Eliminado','No llegó'))
+          * COALESCE(tp.ticket, (SELECT prom FROM ticket_global), 28000) AS plata_perdida
+      FROM citas c
+      LEFT JOIN ticket_prof tp ON tp.profesional = c.profesional
+      WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
+        AND c.profesional IS NOT NULL
+      GROUP BY c.profesional, tp.ticket
+      HAVING COUNT(*) >= 5
+      ORDER BY plata_perdida DESC NULLS LAST
+      LIMIT 30;
+    `;
+
+    // ====================================================
+    // QUERY 5: POR ESPECIALIDAD / TRATAMIENTO
+    // ====================================================
+    const porTratQ = `
+      WITH ticket_trat AS (
+        SELECT c.tratamiento,
+               AVG(v.monto_total)::int AS ticket
+        FROM citas c
+        LEFT JOIN ventas v ON v.id_venta = c.venta_id
+        WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
+          AND c.estado_cita IN ('Atendido','Llegó')
+          AND v.monto_total IS NOT NULL
+        GROUP BY c.tratamiento
+      )
+      SELECT
+        c.tratamiento,
+        COUNT(*)::int AS total_citas,
+        COUNT(*) FILTER (WHERE c.estado_cita = 'Suspendió')::int AS suspendio,
+        COUNT(*) FILTER (WHERE c.estado_cita = 'Eliminado')::int AS eliminado,
+        COUNT(*) FILTER (WHERE c.estado_cita = 'No llegó')::int AS no_llego,
+        COUNT(*) FILTER (WHERE c.estado_cita IN ('Suspendió','Eliminado','No llegó'))::int AS perdidas,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE c.estado_cita IN ('Suspendió','Eliminado','No llegó'))
+              / NULLIF(COUNT(*),0), 1) AS pct_perdidas,
+        COALESCE(tt.ticket, 28000) AS ticket_prom,
+        COUNT(*) FILTER (WHERE c.estado_cita IN ('Suspendió','Eliminado','No llegó'))
+          * COALESCE(tt.ticket, 28000) AS plata_perdida
+      FROM citas c
+      LEFT JOIN ticket_trat tt ON tt.tratamiento = c.tratamiento
+      WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
+        AND c.tratamiento IS NOT NULL
+      GROUP BY c.tratamiento, tt.ticket
+      HAVING COUNT(*) >= 5
+      ORDER BY plata_perdida DESC NULLS LAST
+      LIMIT 25;
+    `;
+
+    // ====================================================
+    // QUERY 6: POR CANAL (online vs mostrador vs Reservo online)
+    // ====================================================
+    const porCanalQ = `
+      SELECT
+        CASE
+          WHEN LOWER(COALESCE(online,'')) IN ('si','sí','1','true','online') THEN 'Online'
+          WHEN LOWER(COALESCE(origen,'')) LIKE '%online%' THEN 'Online'
+          WHEN LOWER(COALESCE(comentario,'')) LIKE '%reserva online%' THEN 'Online'
+          WHEN LOWER(COALESCE(origen,'')) LIKE '%reservo%' THEN 'Reservo agenda'
+          WHEN LOWER(COALESCE(origen,'')) LIKE '%tel%' THEN 'Teléfono'
+          WHEN LOWER(COALESCE(origen,'')) LIKE '%mostrador%' THEN 'Mostrador'
+          ELSE COALESCE(origen, 'Sin especificar')
+        END AS canal,
+        COUNT(*)::int AS total_citas,
+        COUNT(*) FILTER (WHERE estado_cita IN ('Atendido','Llegó'))::int AS atendidas,
+        COUNT(*) FILTER (WHERE estado_cita = 'Suspendió')::int AS suspendio,
+        COUNT(*) FILTER (WHERE estado_cita = 'Eliminado')::int AS eliminado,
+        COUNT(*) FILTER (WHERE estado_cita = 'No llegó')::int AS no_llego,
+        COUNT(*) FILTER (WHERE estado_cita IN ('Suspendió','Eliminado','No llegó'))::int AS perdidas,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ('Suspendió','Eliminado','No llegó'))
+              / NULLIF(COUNT(*),0), 1) AS pct_perdidas
+      FROM citas
+      WHERE fecha BETWEEN $1 AND $2 ${whereSucursal}
+      GROUP BY canal
+      ORDER BY perdidas DESC;
+    `;
+
+    // ====================================================
+    // QUERY 7: POR PREVISIÓN (FONASA / Isapre / Particular)
+    // ====================================================
+    const porPrevQ = `
+      SELECT
+        COALESCE(NULLIF(TRIM(prevision),''), 'Sin especificar') AS prevision,
+        COUNT(*)::int AS total_citas,
+        COUNT(*) FILTER (WHERE estado_cita = 'Suspendió')::int AS suspendio,
+        COUNT(*) FILTER (WHERE estado_cita = 'Eliminado')::int AS eliminado,
+        COUNT(*) FILTER (WHERE estado_cita = 'No llegó')::int AS no_llego,
+        COUNT(*) FILTER (WHERE estado_cita IN ('Suspendió','Eliminado','No llegó'))::int AS perdidas,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ('Suspendió','Eliminado','No llegó'))
+              / NULLIF(COUNT(*),0), 1) AS pct_perdidas
+      FROM citas
+      WHERE fecha BETWEEN $1 AND $2 ${whereSucursal}
+      GROUP BY prevision
+      ORDER BY perdidas DESC;
+    `;
+
+    // ====================================================
+    // QUERY 8: POR PERFIL PACIENTE (edad + sexo)
+    // ====================================================
+    const porPerfilQ = `
+      SELECT
+        CASE
+          WHEN edad < 18 THEN '0-17'
+          WHEN edad BETWEEN 18 AND 30 THEN '18-30'
+          WHEN edad BETWEEN 31 AND 45 THEN '31-45'
+          WHEN edad BETWEEN 46 AND 60 THEN '46-60'
+          WHEN edad BETWEEN 61 AND 75 THEN '61-75'
+          WHEN edad > 75 THEN '76+'
+          ELSE 'Sin edad'
+        END AS rango_edad,
+        COALESCE(NULLIF(TRIM(sexo),''), 'Sin esp.') AS sexo,
+        COUNT(*)::int AS total_citas,
+        COUNT(*) FILTER (WHERE estado_cita IN ('Suspendió','Eliminado','No llegó'))::int AS perdidas,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ('Suspendió','Eliminado','No llegó'))
+              / NULLIF(COUNT(*),0), 1) AS pct_perdidas
+      FROM citas
+      WHERE fecha BETWEEN $1 AND $2 ${whereSucursal}
+      GROUP BY rango_edad, sexo
+      HAVING COUNT(*) >= 10
+      ORDER BY rango_edad, sexo;
+    `;
+
+    // ====================================================
+    // QUERY 9: TOP PACIENTES "TÓXICOS" + RECUPERABLES
+    // ====================================================
+    const topToxicosQ = `
+      SELECT
+        c.paciente,
+        c.rut,
+        MAX(c.telefonos) AS telefono,
+        COUNT(*)::int AS total_citas,
+        COUNT(*) FILTER (WHERE c.estado_cita IN ('Suspendió','Eliminado','No llegó'))::int AS perdidas,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE c.estado_cita IN ('Suspendió','Eliminado','No llegó'))
+              / NULLIF(COUNT(*),0), 1) AS pct_perdidas
+      FROM citas c
+      WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
+        AND c.paciente IS NOT NULL
+        AND c.id_paciente IS NOT NULL
+      GROUP BY c.paciente, c.rut
+      HAVING COUNT(*) >= 2
+         AND COUNT(*) FILTER (WHERE c.estado_cita IN ('Suspendió','Eliminado','No llegó')) >= 2
+      ORDER BY pct_perdidas DESC, perdidas DESC
+      LIMIT 50;
+    `;
+
+    // Recuperables: suspendieron 1 vez, antes tenían historial bueno o son recientes
+    const recuperablesQ = `
+      WITH historico_paciente AS (
+        SELECT
+          id_paciente,
+          paciente,
+          rut,
+          MAX(telefonos) AS telefono,
+          COUNT(*) FILTER (WHERE estado_cita IN ('Atendido','Llegó')) AS atendidas_total,
+          COUNT(*) FILTER (WHERE estado_cita IN ('Suspendió','Eliminado','No llegó')) AS perdidas_total
+        FROM citas
+        WHERE id_paciente IS NOT NULL
+        GROUP BY id_paciente, paciente, rut
+      ),
+      ultimas_perdidas AS (
+        SELECT DISTINCT ON (c.id_paciente)
+          c.id_paciente, c.paciente, c.rut, c.telefonos, c.profesional, c.tratamiento,
+          c.fecha, c.estado_cita, c.sucursal
+        FROM citas c
+        WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
+          AND c.estado_cita IN ('Suspendió','Eliminado','No llegó')
+          AND c.id_paciente IS NOT NULL
+        ORDER BY c.id_paciente, c.fecha DESC
+      )
+      SELECT
+        u.paciente, u.rut, u.telefonos AS telefono,
+        u.profesional, u.tratamiento, u.fecha, u.estado_cita, u.sucursal,
+        h.atendidas_total, h.perdidas_total
+      FROM ultimas_perdidas u
+      LEFT JOIN historico_paciente h ON h.id_paciente = u.id_paciente
+      WHERE h.atendidas_total >= 1
+        AND h.perdidas_total <= 2
+      ORDER BY u.fecha DESC
+      LIMIT 200;
+    `;
+
+    // Ejecutar todas en paralelo
+    const [resumen, porDia, porHora, porProf, porTrat, porCanal, porPrev, porPerfil, toxicos, recuperables] = await Promise.all([
+      pool.query(resumenQ, params),
+      pool.query(porDiaQ, params),
+      pool.query(porHoraQ, params),
+      pool.query(porProfQ, params),
+      pool.query(porTratQ, params),
+      pool.query(porCanalQ, params),
+      pool.query(porPrevQ, params),
+      pool.query(porPerfilQ, params),
+      pool.query(topToxicosQ, params),
+      pool.query(recuperablesQ, params)
+    ]);
+
+    const r = resumen.rows[0];
+    const totalPerdidas = (r.suspendio || 0) + (r.eliminado || 0) + (r.no_llego || 0);
+    const plataPerdidaEstimada = totalPerdidas * (r.ticket_promedio || 28000);
+
+    res.json({
+      ok: true,
+      periodo: { desde: fechaDesde, hasta: fechaHasta, sucursal: filtroSucursal || 'Ambas' },
+      resumen: {
+        total_citas: r.total,
+        atendidas: r.atendidas,
+        suspendio: r.suspendio,
+        eliminado: r.eliminado,
+        no_llego: r.no_llego,
+        confirmado: r.confirmado,
+        no_confirmado: r.no_confirmado,
+        lista_espera: r.lista_espera,
+        total_perdidas: totalPerdidas,
+        pct_perdidas: r.total > 0 ? Math.round(1000 * totalPerdidas / r.total) / 10 : 0,
+        ticket_promedio: r.ticket_promedio,
+        plata_perdida_estimada: plataPerdidaEstimada
+      },
+      por_dia_semana: porDia.rows,
+      por_hora: porHora.rows,
+      por_profesional: porProf.rows,
+      por_tratamiento: porTrat.rows,
+      por_canal: porCanal.rows,
+      por_prevision: porPrev.rows,
+      por_perfil_paciente: porPerfil.rows,
+      top_pacientes_toxicos: toxicos.rows,
+      recuperables: recuperables.rows
+    });
+
+  } catch (err) {
+    console.error('[suspensiones/diagnostico]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ============================================
 // START
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.32 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.33 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
