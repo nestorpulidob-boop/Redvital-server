@@ -1,9 +1,9 @@
 // ============================================
-// REDVITAL BACKEND v5.33
+// REDVITAL BACKEND v5.33.1
 // Bot WhatsApp + Claude + Reservo Agendamiento
 // + Twilio WhatsApp Sandbox (paralelo a Meta)
 // + Optimizaciones rate limit Tier 1 (v5.32)
-// + Endpoint diagnóstico de suspensiones (v5.33)
+// + Endpoint diagnóstico de suspensiones (v5.33.1)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -103,7 +103,7 @@ const WEBHOOK_TO_SEDE = {
 const COSTO_FIJO_MENSUAL = 20637600;
 const PCT_REDVITAL_GLOBAL = 0.47;
 
-// v5.33: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
+// v5.33.1: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
 const WHATSAPP_SECRETARIAS = "+56 9 2246 7275";
 
 const CATEGORIAS_SERVICIO = [
@@ -1664,7 +1664,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.33",
+    ok: true, servidor: "Redvital Backend v5.33.1",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1829,7 +1829,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.33 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
+    servidor: "Redvital Backend v5.33.1 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -1842,7 +1842,7 @@ app.get("/", (req, res) => {
         "/api/bot/catalogo/tratamientos",
         "/api/bot/catalogo/categorias",
         "/api/bot/catalogo/buscar?q=",
-        "/api/bot/especialidades (v5.33)"
+        "/api/bot/especialidades (v5.33.1)"
       ],
       bot_conversacional: [
         "/api/bot/chat-test (POST) - simulador SIN WhatsApp",
@@ -2013,7 +2013,7 @@ app.get("/api/ads/summary", async (req, res) => {
 });
 
 // =============================================================
-// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.33)
+// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.33.1)
 // =============================================================
 async function inicializarBotBD() {
   try {
@@ -2108,7 +2108,7 @@ async function inicializarBotBD() {
       )`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_iniciado ON bot_sync_log(iniciado_en DESC)`);
 
-    // NUEVO en v5.33: tabla de mapeo profesional -> especialidad/grupo clínico
+    // NUEVO en v5.33.1: tabla de mapeo profesional -> especialidad/grupo clínico
     // (debe poblarse via SQL externo "cargar_especialidades.sql" la primera vez)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profesional_especialidad (
@@ -2367,12 +2367,12 @@ async function enviarMensajeWhatsApp(provider, to, texto) {
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_MODEL = 'claude-sonnet-4-5';
 
-// v5.33: Reintento automático en rate_limit (429) con backoff exponencial
+// v5.33.1: Reintento automático en rate_limit (429) con backoff exponencial
 // Esto evita que el paciente vea "tuve un problema técnico" cuando hay congestión.
 async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
   if (!CLAUDE_API_KEY) { console.warn('[claude] CLAUDE_API_KEY no configurada'); return { error: 'CLAUDE_API_KEY no configurada' }; }
   try {
-    // v5.33: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
+    // v5.33.1: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
     const body = { model: CLAUDE_MODEL, max_tokens: 600, messages: messages };
     if (systemPrompt) body.system = systemPrompt;
     if (tools && tools.length > 0) body.tools = tools;
@@ -2380,7 +2380,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
       headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 60000, validateStatus: () => true });
 
-    // v5.33: si es rate limit (429), esperar y reintentar hasta 3 veces
+    // v5.33.1: si es rate limit (429), esperar y reintentar hasta 3 veces
     if (r.status === 429 && intento <= 3) {
       // Intentar respetar header retry-after si viene; si no, backoff exponencial
       const retryAfterSec = parseInt(r.headers && r.headers['retry-after']) || (15 * intento);
@@ -2396,7 +2396,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
 }
 
 // ============================================
-// HELPERS v5.33: Lookup de especialidades por profesional
+// HELPERS v5.33.1: Lookup de especialidades por profesional
 // ============================================
 
 // Lee bot_profesional_especialidad para un nombre normalizado
@@ -2468,7 +2468,7 @@ function detectarServicioEspecial(query) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT (v5.33: Function Calling + Elección Profesional)
+// ORQUESTADOR DEL BOT (v5.33.1: Function Calling + Elección Profesional)
 // ============================================
 const BOT_TOOLS = [
   {
@@ -2602,7 +2602,7 @@ async function ejecutarTool(nombre, input) {
           const fecha = dia.fecha;
           for (const suc of (dia.sucursales || [])) {
             for (const prof of (suc.profesionales || [])) {
-              // v5.33: si vino uuid_profesional, filtrar
+              // v5.33.1: si vino uuid_profesional, filtrar
               if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
               for (const horaISO of (prof.horas_disponibles || [])) {
                 horariosAplanados.push({
@@ -2618,7 +2618,7 @@ async function ejecutarTool(nombre, input) {
           }
         }
       }
-      // v5.33: reducir 12→6 horarios y simplificar campos para bajar tokens
+      // v5.33.1: reducir 12→6 horarios y simplificar campos para bajar tokens
       const limitados = horariosAplanados.slice(0, 6).map(h => ({
         fecha: h.fecha, hora: h.hora,
         hora_con_segundos: h.hora_con_segundos,
@@ -2717,8 +2717,8 @@ async function ejecutarTool(nombre, input) {
 }
 
 
-// === SYSTEM PROMPT DINÁMICO v5.33 ===
-// === SYSTEM PROMPT DINÁMICO v5.33 (COMPRIMIDO ~60% para Tier 1) ===
+// === SYSTEM PROMPT DINÁMICO v5.33.1 ===
+// === SYSTEM PROMPT DINÁMICO v5.33.1 (COMPRIMIDO ~60% para Tier 1) ===
 async function construirSystemPrompt() {
   const ahora = new Date();
   const ahoraCL = new Date(ahora.getTime() - 4 * 3600000);
@@ -2830,7 +2830,7 @@ async function obtenerSesion(wa_id) {
 
 async function guardarSesion(wa_id, mensajes) {
   try {
-    // v5.33: reducir historial de 30 → 8 para bajar consumo de tokens
+    // v5.33.1: reducir historial de 30 → 8 para bajar consumo de tokens
     let recortado = mensajes;
     if (mensajes.length > 8) {
       recortado = mensajes.slice(mensajes.length - 8);
@@ -3053,7 +3053,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // === WEBHOOK TWILIO WHATSAPP SANDBOX ===
 app.get('/webhook/twilio', (req, res) => {
-  res.status(200).send('Twilio webhook OK - Redvital bot v5.33');
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.33.1');
 });
 
 app.post('/webhook/twilio', async (req, res) => {
@@ -3480,7 +3480,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// === NUEVO v5.33: /api/bot/especialidades ===
+// === NUEVO v5.33.1: /api/bot/especialidades ===
 app.get('/api/bot/especialidades', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -3499,7 +3499,7 @@ app.get('/api/bot/especialidades', async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/suspensiones/diagnostico (v5.33)
+// ENDPOINT: GET /api/suspensiones/diagnostico (v5.33.1)
 // ============================================================
 // Análisis completo de citas perdidas: Suspendió + Eliminado + No llegó
 // Cruza tabla `citas` con `ventas` para ingresos reales y plata perdida.
@@ -3548,21 +3548,21 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       ),
       tickets AS (
         SELECT profesional,
-               COALESCE(AVG(v.monto_total)::int, 28000) AS ticket_prom
+               COALESCE(AVG(v.valor_pagado)::int, 28000) AS ticket_prom
         FROM citas c
         LEFT JOIN ventas v ON v.id_venta = c.venta_id
         WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
           AND c.estado_cita IN ('Atendido', 'Llegó')
-          AND v.monto_total IS NOT NULL
+          AND v.valor_pagado IS NOT NULL
         GROUP BY profesional
       ),
       ticket_global AS (
-        SELECT COALESCE(AVG(v.monto_total)::int, 28000) AS prom
+        SELECT COALESCE(AVG(v.valor_pagado)::int, 28000) AS prom
         FROM citas c
         LEFT JOIN ventas v ON v.id_venta = c.venta_id
         WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
           AND c.estado_cita IN ('Atendido', 'Llegó')
-          AND v.monto_total IS NOT NULL
+          AND v.valor_pagado IS NOT NULL
       )
       SELECT
         COUNT(*) FILTER (WHERE estado_cita IN ('Atendido','Llegó'))::int AS atendidas,
@@ -3621,21 +3621,21 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
     const porProfQ = `
       WITH ticket_prof AS (
         SELECT c.profesional,
-               AVG(v.monto_total)::int AS ticket
+               AVG(v.valor_pagado)::int AS ticket
         FROM citas c
         LEFT JOIN ventas v ON v.id_venta = c.venta_id
         WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
           AND c.estado_cita IN ('Atendido','Llegó')
-          AND v.monto_total IS NOT NULL
+          AND v.valor_pagado IS NOT NULL
         GROUP BY c.profesional
       ),
       ticket_global AS (
-        SELECT AVG(v.monto_total)::int AS prom
+        SELECT AVG(v.valor_pagado)::int AS prom
         FROM citas c
         LEFT JOIN ventas v ON v.id_venta = c.venta_id
         WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
           AND c.estado_cita IN ('Atendido','Llegó')
-          AND v.monto_total IS NOT NULL
+          AND v.valor_pagado IS NOT NULL
       )
       SELECT
         c.profesional,
@@ -3666,12 +3666,12 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
     const porTratQ = `
       WITH ticket_trat AS (
         SELECT c.tratamiento,
-               AVG(v.monto_total)::int AS ticket
+               AVG(v.valor_pagado)::int AS ticket
         FROM citas c
         LEFT JOIN ventas v ON v.id_venta = c.venta_id
         WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
           AND c.estado_cita IN ('Atendido','Llegó')
-          AND v.monto_total IS NOT NULL
+          AND v.valor_pagado IS NOT NULL
         GROUP BY c.tratamiento
       )
       SELECT
@@ -3885,7 +3885,7 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.33 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.33.1 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
