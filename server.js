@@ -1,9 +1,9 @@
 // ============================================
-// REDVITAL BACKEND v5.33.2
+// REDVITAL BACKEND v5.34 - Endpoint diario
 // Bot WhatsApp + Claude + Reservo Agendamiento
 // + Twilio WhatsApp Sandbox (paralelo a Meta)
 // + Optimizaciones rate limit Tier 1 (v5.32)
-// + Endpoint diagnóstico de suspensiones (v5.33.2)
+// + Endpoint diagnóstico de suspensiones (v5.34)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -103,7 +103,7 @@ const WEBHOOK_TO_SEDE = {
 const COSTO_FIJO_MENSUAL = 21537600;
 const PCT_REDVITAL_GLOBAL = 0.47;
 
-// v5.33.2: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
+// v5.34: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
 const WHATSAPP_SECRETARIAS = "+56 9 2246 7275";
 
 const CATEGORIAS_SERVICIO = [
@@ -1664,7 +1664,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.33.2",
+    ok: true, servidor: "Redvital Backend v5.34",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1829,7 +1829,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.33.2 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
+    servidor: "Redvital Backend v5.34 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -1842,7 +1842,7 @@ app.get("/", (req, res) => {
         "/api/bot/catalogo/tratamientos",
         "/api/bot/catalogo/categorias",
         "/api/bot/catalogo/buscar?q=",
-        "/api/bot/especialidades (v5.33.2)"
+        "/api/bot/especialidades (v5.34)"
       ],
       bot_conversacional: [
         "/api/bot/chat-test (POST) - simulador SIN WhatsApp",
@@ -2013,7 +2013,7 @@ app.get("/api/ads/summary", async (req, res) => {
 });
 
 // =============================================================
-// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.33.2)
+// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.34)
 // =============================================================
 async function inicializarBotBD() {
   try {
@@ -2108,7 +2108,7 @@ async function inicializarBotBD() {
       )`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_iniciado ON bot_sync_log(iniciado_en DESC)`);
 
-    // NUEVO en v5.33.2: tabla de mapeo profesional -> especialidad/grupo clínico
+    // NUEVO en v5.34: tabla de mapeo profesional -> especialidad/grupo clínico
     // (debe poblarse via SQL externo "cargar_especialidades.sql" la primera vez)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profesional_especialidad (
@@ -2367,12 +2367,12 @@ async function enviarMensajeWhatsApp(provider, to, texto) {
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_MODEL = 'claude-sonnet-4-5';
 
-// v5.33.2: Reintento automático en rate_limit (429) con backoff exponencial
+// v5.34: Reintento automático en rate_limit (429) con backoff exponencial
 // Esto evita que el paciente vea "tuve un problema técnico" cuando hay congestión.
 async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
   if (!CLAUDE_API_KEY) { console.warn('[claude] CLAUDE_API_KEY no configurada'); return { error: 'CLAUDE_API_KEY no configurada' }; }
   try {
-    // v5.33.2: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
+    // v5.34: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
     const body = { model: CLAUDE_MODEL, max_tokens: 600, messages: messages };
     if (systemPrompt) body.system = systemPrompt;
     if (tools && tools.length > 0) body.tools = tools;
@@ -2380,7 +2380,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
       headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 60000, validateStatus: () => true });
 
-    // v5.33.2: si es rate limit (429), esperar y reintentar hasta 3 veces
+    // v5.34: si es rate limit (429), esperar y reintentar hasta 3 veces
     if (r.status === 429 && intento <= 3) {
       // Intentar respetar header retry-after si viene; si no, backoff exponencial
       const retryAfterSec = parseInt(r.headers && r.headers['retry-after']) || (15 * intento);
@@ -2396,7 +2396,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
 }
 
 // ============================================
-// HELPERS v5.33.2: Lookup de especialidades por profesional
+// HELPERS v5.34: Lookup de especialidades por profesional
 // ============================================
 
 // Lee bot_profesional_especialidad para un nombre normalizado
@@ -2468,7 +2468,7 @@ function detectarServicioEspecial(query) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT (v5.33.2: Function Calling + Elección Profesional)
+// ORQUESTADOR DEL BOT (v5.34: Function Calling + Elección Profesional)
 // ============================================
 const BOT_TOOLS = [
   {
@@ -2602,7 +2602,7 @@ async function ejecutarTool(nombre, input) {
           const fecha = dia.fecha;
           for (const suc of (dia.sucursales || [])) {
             for (const prof of (suc.profesionales || [])) {
-              // v5.33.2: si vino uuid_profesional, filtrar
+              // v5.34: si vino uuid_profesional, filtrar
               if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
               for (const horaISO of (prof.horas_disponibles || [])) {
                 horariosAplanados.push({
@@ -2618,7 +2618,7 @@ async function ejecutarTool(nombre, input) {
           }
         }
       }
-      // v5.33.2: reducir 12→6 horarios y simplificar campos para bajar tokens
+      // v5.34: reducir 12→6 horarios y simplificar campos para bajar tokens
       const limitados = horariosAplanados.slice(0, 6).map(h => ({
         fecha: h.fecha, hora: h.hora,
         hora_con_segundos: h.hora_con_segundos,
@@ -2717,8 +2717,8 @@ async function ejecutarTool(nombre, input) {
 }
 
 
-// === SYSTEM PROMPT DINÁMICO v5.33.2 ===
-// === SYSTEM PROMPT DINÁMICO v5.33.2 (COMPRIMIDO ~60% para Tier 1) ===
+// === SYSTEM PROMPT DINÁMICO v5.34 ===
+// === SYSTEM PROMPT DINÁMICO v5.34 (COMPRIMIDO ~60% para Tier 1) ===
 async function construirSystemPrompt() {
   const ahora = new Date();
   const ahoraCL = new Date(ahora.getTime() - 4 * 3600000);
@@ -2830,7 +2830,7 @@ async function obtenerSesion(wa_id) {
 
 async function guardarSesion(wa_id, mensajes) {
   try {
-    // v5.33.2: reducir historial de 30 → 8 para bajar consumo de tokens
+    // v5.34: reducir historial de 30 → 8 para bajar consumo de tokens
     let recortado = mensajes;
     if (mensajes.length > 8) {
       recortado = mensajes.slice(mensajes.length - 8);
@@ -3053,7 +3053,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // === WEBHOOK TWILIO WHATSAPP SANDBOX ===
 app.get('/webhook/twilio', (req, res) => {
-  res.status(200).send('Twilio webhook OK - Redvital bot v5.33.2');
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.34');
 });
 
 app.post('/webhook/twilio', async (req, res) => {
@@ -3480,7 +3480,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// === NUEVO v5.33.2: /api/bot/especialidades ===
+// === NUEVO v5.34: /api/bot/especialidades ===
 app.get('/api/bot/especialidades', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -3499,7 +3499,7 @@ app.get('/api/bot/especialidades', async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/suspensiones/diagnostico (v5.33.2)
+// ENDPOINT: GET /api/suspensiones/diagnostico (v5.34)
 // ============================================================
 // Análisis completo de citas perdidas: Suspendió + Eliminado + No llegó
 // Cruza tabla `citas` con `ventas` para ingresos reales y plata perdida.
@@ -3880,12 +3880,191 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
   }
 });
 
+// ============================================================
+// ENDPOINT: GET /api/diario (v5.34)
+// ============================================================
+// Comparativa de hoy vs ayer:
+//   - Agendadas + Atendidas
+//   - Por 8 categorías: Consultas, RX, Ecografía, Laboratorio, Endoscopía, Holter, ECG, Otros
+//   - Plata bruta facturada del día (de tabla ventas)
+//
+// Query params:
+//   hoy   YYYY-MM-DD (default: hoy del servidor)
+//   ayer  YYYY-MM-DD (default: ayer del servidor)
+// ============================================================
+
+app.get("/api/diario", async (req, res) => {
+  try {
+    // Calcular fechas default
+    const ahora = new Date();
+    const fechaHoy = req.query.hoy || ahora.toISOString().slice(0,10);
+    const ayer = new Date(ahora);
+    ayer.setDate(ayer.getDate() - 1);
+    const fechaAyer = req.query.ayer || ayer.toISOString().slice(0,10);
+
+    // Regex de cada categoría (case insensitive, busca en tratamiento O profesional)
+    const CATS = [
+      { id: 'consultas',   nombre: 'Consultas',    regex: '^CONSULTA |CONSULTA MEDIC|CONSULTA ' },
+      { id: 'rx',          nombre: 'Rayos X',      regex: 'RADIOGRAF|RX |RAYOS X|RAYOS-X' },
+      { id: 'ecografia',   nombre: 'Ecografía',    regex: 'ECOGRAF|ECO ABDOM|ECO MAMA|ECO PELV|ECOTOMOGR|SONOC|ECOCARDIOG' },
+      { id: 'laboratorio', nombre: 'Laboratorio',  regex: 'LABORATORIO|EXAMEN DE SANGRE|HEMOGRAMA|GLICEMIA|UREMIA' },
+      { id: 'endoscopia',  nombre: 'Endoscopía',   regex: 'ENDOSCO|COLONOSCOP|GASTROSCOP' },
+      { id: 'holter',      nombre: 'Holter',       regex: 'HOLTER' },
+      { id: 'ecg',         nombre: 'ECG',          regex: 'ELECTROCARDIO|EKG| ECG' }
+    ];
+
+    // Query: cuenta citas por estado y categoría para un día específico
+    // Devuelve: { dia, agendadas_total, atendidas_total, plata_bruta, por_categoria: [...] }
+    async function statsDia(fecha) {
+      // Resumen del día
+      const resumenQ = `
+        SELECT
+          COUNT(*)::int AS agendadas,
+          COUNT(*) FILTER (WHERE estado_cita IN ('Atendido','Llegó'))::int AS atendidas
+        FROM citas
+        WHERE fecha = $1
+      `;
+      const resumen = (await pool.query(resumenQ, [fecha])).rows[0];
+
+      // Plata bruta del día (de tabla ventas)
+      const plataQ = `
+        SELECT COALESCE(SUM(valor_pagado), 0)::bigint AS bruto
+        FROM ventas
+        WHERE fecha = $1
+      `;
+      const plata = (await pool.query(plataQ, [fecha])).rows[0];
+
+      // Categorías: contar agendadas + atendidas en citas, y plata bruta de ventas, por cada categoría
+      const porCategoria = [];
+      let totalClasificadas = 0;
+
+      for (const cat of CATS) {
+        // Construir condición regex
+        const cond = cat.regex;
+        
+        // Citas (agendadas y atendidas) que matchean
+        const citasQ = `
+          SELECT
+            COUNT(*)::int AS agendadas,
+            COUNT(*) FILTER (WHERE estado_cita IN ('Atendido','Llegó'))::int AS atendidas
+          FROM citas
+          WHERE fecha = $1
+            AND UPPER(COALESCE(tratamiento,'') || ' ' || COALESCE(profesional,'')) ~ $2
+        `;
+        const c = (await pool.query(citasQ, [fecha, cond])).rows[0];
+
+        // Plata bruta de esa categoría
+        const plataCatQ = `
+          SELECT COALESCE(SUM(valor_pagado), 0)::bigint AS bruto
+          FROM ventas
+          WHERE fecha = $1
+            AND UPPER(COALESCE(productos_venta,'') || ' ' || COALESCE(profesional_atencion,'') || ' ' || COALESCE(medico_tratante,'')) ~ $2
+        `;
+        const p = (await pool.query(plataCatQ, [fecha, cond])).rows[0];
+
+        porCategoria.push({
+          id: cat.id,
+          nombre: cat.nombre,
+          agendadas: c.agendadas,
+          atendidas: c.atendidas,
+          bruto: parseInt(p.bruto) || 0
+        });
+        totalClasificadas += c.agendadas;
+      }
+
+      // "Otros" = lo que no cayó en ninguna categoría
+      const otrosAgendadas = Math.max(0, resumen.agendadas - totalClasificadas);
+      // Para "atendidas" y "bruto" de otros, restamos lo clasificado del total
+      const totalAtendidasClasif = porCategoria.reduce((s, c) => s + c.atendidas, 0);
+      const totalBrutoClasif = porCategoria.reduce((s, c) => s + c.bruto, 0);
+      
+      porCategoria.push({
+        id: 'otros',
+        nombre: 'Otros',
+        agendadas: otrosAgendadas,
+        atendidas: Math.max(0, resumen.atendidas - totalAtendidasClasif),
+        bruto: Math.max(0, parseInt(plata.bruto) - totalBrutoClasif)
+      });
+
+      return {
+        fecha,
+        agendadas_total: resumen.agendadas,
+        atendidas_total: resumen.atendidas,
+        plata_bruta_total: parseInt(plata.bruto) || 0,
+        por_categoria: porCategoria
+      };
+    }
+
+    const [statsHoy, statsAyer] = await Promise.all([
+      statsDia(fechaHoy),
+      statsDia(fechaAyer)
+    ]);
+
+    // Calcular variaciones
+    const variacion = (hoy, ayer) => {
+      if (ayer === 0) return hoy > 0 ? 100 : 0;
+      return Math.round((hoy - ayer) / ayer * 100);
+    };
+
+    // Combinar categorías hoy + ayer
+    const categoriasComparadas = statsHoy.por_categoria.map(catH => {
+      const catA = statsAyer.por_categoria.find(c => c.id === catH.id) || { agendadas: 0, atendidas: 0, bruto: 0 };
+      return {
+        id: catH.id,
+        nombre: catH.nombre,
+        hoy: {
+          agendadas: catH.agendadas,
+          atendidas: catH.atendidas,
+          bruto: catH.bruto
+        },
+        ayer: {
+          agendadas: catA.agendadas,
+          atendidas: catA.atendidas,
+          bruto: catA.bruto
+        },
+        var_agendadas: variacion(catH.agendadas, catA.agendadas),
+        var_atendidas: variacion(catH.atendidas, catA.atendidas),
+        var_bruto: variacion(catH.bruto, catA.bruto)
+      };
+    });
+
+    // Ordenar por plata bruta de hoy (la más rentable arriba)
+    categoriasComparadas.sort((a, b) => b.hoy.bruto - a.hoy.bruto);
+
+    res.json({
+      ok: true,
+      hoy: {
+        fecha: fechaHoy,
+        agendadas: statsHoy.agendadas_total,
+        atendidas: statsHoy.atendidas_total,
+        bruto: statsHoy.plata_bruta_total
+      },
+      ayer: {
+        fecha: fechaAyer,
+        agendadas: statsAyer.agendadas_total,
+        atendidas: statsAyer.atendidas_total,
+        bruto: statsAyer.plata_bruta_total
+      },
+      variaciones: {
+        agendadas: variacion(statsHoy.agendadas_total, statsAyer.agendadas_total),
+        atendidas: variacion(statsHoy.atendidas_total, statsAyer.atendidas_total),
+        bruto: variacion(statsHoy.plata_bruta_total, statsAyer.plata_bruta_total)
+      },
+      categorias: categoriasComparadas
+    });
+
+  } catch (err) {
+    console.error('[diario]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ============================================
 // START
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.33.2 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.34 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
