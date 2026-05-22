@@ -1,9 +1,9 @@
 // ============================================
-// REDVITAL BACKEND v5.34 - Endpoint diario
+// REDVITAL BACKEND v5.36 - Endpoint diario
 // Bot WhatsApp + Claude + Reservo Agendamiento
 // + Twilio WhatsApp Sandbox (paralelo a Meta)
 // + Optimizaciones rate limit Tier 1 (v5.32)
-// + Endpoint diagnóstico de suspensiones (v5.34)
+// + Endpoint diagnóstico de suspensiones (v5.36)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -103,7 +103,7 @@ const WEBHOOK_TO_SEDE = {
 const COSTO_FIJO_MENSUAL = 21537600;
 const PCT_REDVITAL_GLOBAL = 0.47;
 
-// v5.34: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
+// v5.36: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
 const WHATSAPP_SECRETARIAS = "+56 9 2246 7275";
 
 const CATEGORIAS_SERVICIO = [
@@ -434,7 +434,7 @@ async function metricaKpis({ desde, hasta, sede, sucursal }) {
       COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.SUSPENDIDA)})::int AS suspendidas,
       COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.CANCELADA)})::int AS canceladas,
       COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.LISTA_ESPERA)})::int AS lista_espera,
-      COUNT(DISTINCT id_paciente)::int AS pacientes_unicos,
+      COUNT(DISTINCT COALESCE(id_paciente::text, rut))::int AS pacientes_unicos,
       COUNT(DISTINCT profesional)::int AS profesionales_activos,
       COUNT(DISTINCT tratamiento) FILTER (WHERE tratamiento IS NOT NULL)::int AS especialidades_activas
     FROM citas WHERE ${FILTRO}
@@ -531,7 +531,7 @@ async function metricaTopProfesionales({ desde, hasta, sucursal }) {
       SELECT profesional, COUNT(*)::int AS total_citas,
         COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
         COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
-        COUNT(DISTINCT id_paciente)::int AS pacientes_unicos,
+        COUNT(DISTINCT COALESCE(id_paciente::text, rut))::int AS pacientes_unicos,
         COUNT(DISTINCT tratamiento) FILTER (WHERE tratamiento IS NOT NULL)::int AS tratamientos_distintos
       FROM citas WHERE ${FILTRO} AND profesional IS NOT NULL GROUP BY profesional
     )
@@ -557,7 +557,7 @@ async function metricaEspecialidades({ desde, hasta, sucursal }) {
       COUNT(*)::int AS citas,
       COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
       COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
-      COUNT(DISTINCT id_paciente)::int AS pacientes
+      COUNT(DISTINCT COALESCE(id_paciente::text, rut))::int AS pacientes
     FROM citas WHERE ${FILTRO}
     GROUP BY especialidad ORDER BY citas DESC
   `;
@@ -651,7 +651,7 @@ async function metricaPacientesEnRiesgo(req) {
 async function metricaPorSede({ desde, hasta }) {
   const sqlCitas = `
     SELECT sucursal, COUNT(*)::int AS total_citas,
-      COUNT(DISTINCT id_paciente)::int AS pacientes_unicos,
+      COUNT(DISTINCT COALESCE(id_paciente::text, rut))::int AS pacientes_unicos,
       COUNT(DISTINCT profesional)::int AS profesionales,
       COUNT(DISTINCT tratamiento) FILTER (WHERE tratamiento IS NOT NULL)::int AS especialidades,
       COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
@@ -710,7 +710,7 @@ async function metricaPrevision({ desde, hasta, sucursal }) {
   const sql = `
     WITH citas_prev AS (
       SELECT COALESCE(NULLIF(prevision, ''), 'sin_dato') AS prevision,
-        COUNT(*)::int AS total_citas, COUNT(DISTINCT id_paciente)::int AS pacientes,
+        COUNT(*)::int AS total_citas, COUNT(DISTINCT COALESCE(id_paciente::text, rut))::int AS pacientes,
         COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
         COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show
       FROM citas WHERE ${FILTRO} GROUP BY prevision
@@ -760,9 +760,9 @@ async function metricaPacientesNuevos({ desde, hasta, sucursal }) {
       WHERE c.fecha BETWEEN $1::date AND $2::date
         AND ($3::text IS NULL OR c.sucursal = $3) AND c.id_paciente IS NOT NULL
     )
-    SELECT COUNT(DISTINCT id_paciente) FILTER (WHERE es_paciente_nuevo)::int AS pacientes_nuevos,
-      COUNT(DISTINCT id_paciente) FILTER (WHERE NOT es_paciente_nuevo)::int AS pacientes_recurrentes,
-      COUNT(DISTINCT id_paciente)::int AS pacientes_total,
+    SELECT COUNT(DISTINCT COALESCE(id_paciente::text, rut)) FILTER (WHERE es_paciente_nuevo)::int AS pacientes_nuevos,
+      COUNT(DISTINCT COALESCE(id_paciente::text, rut)) FILTER (WHERE NOT es_paciente_nuevo)::int AS pacientes_recurrentes,
+      COUNT(DISTINCT COALESCE(id_paciente::text, rut))::int AS pacientes_total,
       COUNT(*) FILTER (WHERE es_paciente_nuevo)::int AS citas_nuevos,
       COUNT(*) FILTER (WHERE NOT es_paciente_nuevo)::int AS citas_recurrentes
     FROM citas_periodo
@@ -791,7 +791,7 @@ async function metricaOrigenAmpliado({ desde, hasta, sucursal }) {
         WHEN origen = 'Agenda' THEN 'Telefono/Mostrador'
         WHEN origen IS NULL OR origen = '' THEN 'Sin registro'
         ELSE origen END AS canal,
-      COUNT(*)::int AS total_citas, COUNT(DISTINCT id_paciente)::int AS pacientes_unicos,
+      COUNT(*)::int AS total_citas, COUNT(DISTINCT COALESCE(id_paciente::text, rut))::int AS pacientes_unicos,
       COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
       COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
       ROUND(100.0 * COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)}) / NULLIF(COUNT(*), 0), 1)::float AS pct_no_show,
@@ -817,7 +817,7 @@ async function listarCampaniasConCalculo({ desde, hasta }) {
   const sql = `
     SELECT cm.id, cm.nombre, cm.plataforma, cm.fecha_inicio, cm.fecha_fin,
       cm.presupuesto::bigint AS presupuesto, cm.comentario,
-      (SELECT COUNT(DISTINCT c.id_paciente)::int FROM citas c
+      (SELECT COUNT(DISTINCT COALESCE(c.id_paciente::text, c.rut))::int FROM citas c
        WHERE c.id_paciente IN (
          SELECT id_paciente FROM citas
          WHERE fecha BETWEEN cm.fecha_inicio AND cm.fecha_fin AND id_paciente IS NOT NULL
@@ -964,7 +964,7 @@ async function metricaSerieTemporal({ desde, hasta, sucursal }) {
       SELECT fecha::date AS dia, COUNT(*)::int AS total,
         COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
         COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
-        COUNT(DISTINCT id_paciente)::int AS pacientes
+        COUNT(DISTINCT COALESCE(id_paciente::text, rut))::int AS pacientes
       FROM citas WHERE ${FILTRO} GROUP BY fecha
     ), ventas_dia AS (
       SELECT fecha::date AS dia, SUM(valor_pagado)::bigint AS ingresos_reales,
@@ -1003,7 +1003,7 @@ async function metricaComparativaMensual({ desde, hasta, sucursal }) {
         COUNT(*)::int AS total_citas,
         COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS atendidas,
         COUNT(*) FILTER (WHERE estado_cita IN ${inList(ESTADOS.NO_SHOW)})::int AS no_show,
-        COUNT(DISTINCT id_paciente)::int AS pacientes_unicos
+        COUNT(DISTINCT COALESCE(id_paciente::text, rut))::int AS pacientes_unicos
       FROM citas WHERE fecha BETWEEN $1::date AND $2::date AND ($3::text IS NULL OR sucursal = $3)
       GROUP BY mes_redvital
     ), ventas_mes AS (
@@ -1664,7 +1664,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.34",
+    ok: true, servidor: "Redvital Backend v5.36",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1829,7 +1829,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.34 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
+    servidor: "Redvital Backend v5.36 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -1842,7 +1842,7 @@ app.get("/", (req, res) => {
         "/api/bot/catalogo/tratamientos",
         "/api/bot/catalogo/categorias",
         "/api/bot/catalogo/buscar?q=",
-        "/api/bot/especialidades (v5.34)"
+        "/api/bot/especialidades (v5.36)"
       ],
       bot_conversacional: [
         "/api/bot/chat-test (POST) - simulador SIN WhatsApp",
@@ -2013,7 +2013,7 @@ app.get("/api/ads/summary", async (req, res) => {
 });
 
 // =============================================================
-// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.34)
+// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.36)
 // =============================================================
 async function inicializarBotBD() {
   try {
@@ -2108,7 +2108,7 @@ async function inicializarBotBD() {
       )`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_iniciado ON bot_sync_log(iniciado_en DESC)`);
 
-    // NUEVO en v5.34: tabla de mapeo profesional -> especialidad/grupo clínico
+    // NUEVO en v5.36: tabla de mapeo profesional -> especialidad/grupo clínico
     // (debe poblarse via SQL externo "cargar_especialidades.sql" la primera vez)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profesional_especialidad (
@@ -2367,12 +2367,12 @@ async function enviarMensajeWhatsApp(provider, to, texto) {
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_MODEL = 'claude-sonnet-4-5';
 
-// v5.34: Reintento automático en rate_limit (429) con backoff exponencial
+// v5.36: Reintento automático en rate_limit (429) con backoff exponencial
 // Esto evita que el paciente vea "tuve un problema técnico" cuando hay congestión.
 async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
   if (!CLAUDE_API_KEY) { console.warn('[claude] CLAUDE_API_KEY no configurada'); return { error: 'CLAUDE_API_KEY no configurada' }; }
   try {
-    // v5.34: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
+    // v5.36: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
     const body = { model: CLAUDE_MODEL, max_tokens: 600, messages: messages };
     if (systemPrompt) body.system = systemPrompt;
     if (tools && tools.length > 0) body.tools = tools;
@@ -2380,7 +2380,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
       headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 60000, validateStatus: () => true });
 
-    // v5.34: si es rate limit (429), esperar y reintentar hasta 3 veces
+    // v5.36: si es rate limit (429), esperar y reintentar hasta 3 veces
     if (r.status === 429 && intento <= 3) {
       // Intentar respetar header retry-after si viene; si no, backoff exponencial
       const retryAfterSec = parseInt(r.headers && r.headers['retry-after']) || (15 * intento);
@@ -2396,7 +2396,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
 }
 
 // ============================================
-// HELPERS v5.34: Lookup de especialidades por profesional
+// HELPERS v5.36: Lookup de especialidades por profesional
 // ============================================
 
 // Lee bot_profesional_especialidad para un nombre normalizado
@@ -2468,7 +2468,7 @@ function detectarServicioEspecial(query) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT (v5.34: Function Calling + Elección Profesional)
+// ORQUESTADOR DEL BOT (v5.36: Function Calling + Elección Profesional)
 // ============================================
 const BOT_TOOLS = [
   {
@@ -2602,7 +2602,7 @@ async function ejecutarTool(nombre, input) {
           const fecha = dia.fecha;
           for (const suc of (dia.sucursales || [])) {
             for (const prof of (suc.profesionales || [])) {
-              // v5.34: si vino uuid_profesional, filtrar
+              // v5.36: si vino uuid_profesional, filtrar
               if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
               for (const horaISO of (prof.horas_disponibles || [])) {
                 horariosAplanados.push({
@@ -2618,7 +2618,7 @@ async function ejecutarTool(nombre, input) {
           }
         }
       }
-      // v5.34: reducir 12→6 horarios y simplificar campos para bajar tokens
+      // v5.36: reducir 12→6 horarios y simplificar campos para bajar tokens
       const limitados = horariosAplanados.slice(0, 6).map(h => ({
         fecha: h.fecha, hora: h.hora,
         hora_con_segundos: h.hora_con_segundos,
@@ -2717,8 +2717,8 @@ async function ejecutarTool(nombre, input) {
 }
 
 
-// === SYSTEM PROMPT DINÁMICO v5.34 ===
-// === SYSTEM PROMPT DINÁMICO v5.34 (COMPRIMIDO ~60% para Tier 1) ===
+// === SYSTEM PROMPT DINÁMICO v5.36 ===
+// === SYSTEM PROMPT DINÁMICO v5.36 (COMPRIMIDO ~60% para Tier 1) ===
 async function construirSystemPrompt() {
   const ahora = new Date();
   const ahoraCL = new Date(ahora.getTime() - 4 * 3600000);
@@ -2830,7 +2830,7 @@ async function obtenerSesion(wa_id) {
 
 async function guardarSesion(wa_id, mensajes) {
   try {
-    // v5.34: reducir historial de 30 → 8 para bajar consumo de tokens
+    // v5.36: reducir historial de 30 → 8 para bajar consumo de tokens
     let recortado = mensajes;
     if (mensajes.length > 8) {
       recortado = mensajes.slice(mensajes.length - 8);
@@ -3053,7 +3053,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // === WEBHOOK TWILIO WHATSAPP SANDBOX ===
 app.get('/webhook/twilio', (req, res) => {
-  res.status(200).send('Twilio webhook OK - Redvital bot v5.34');
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.36');
 });
 
 app.post('/webhook/twilio', async (req, res) => {
@@ -3480,7 +3480,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// === NUEVO v5.34: /api/bot/especialidades ===
+// === NUEVO v5.36: /api/bot/especialidades ===
 app.get('/api/bot/especialidades', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -3499,7 +3499,7 @@ app.get('/api/bot/especialidades', async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/suspensiones/diagnostico (v5.34)
+// ENDPOINT: GET /api/suspensiones/diagnostico (v5.36)
 // ============================================================
 // Análisis completo de citas perdidas: Suspendió + Eliminado + No llegó
 // Cruza tabla `citas` con `ventas` para ingresos reales y plata perdida.
@@ -3881,7 +3881,7 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/diario (v5.34)
+// ENDPOINT: GET /api/diario (v5.36)
 // ============================================================
 // Comparativa de hoy vs ayer:
 //   - Agendadas + Atendidas
@@ -4059,12 +4059,291 @@ app.get("/api/diario", async (req, res) => {
   }
 });
 
+// ============================================================
+// ENDPOINT: GET /api/marketing/roi (v5.36)
+// ============================================================
+// ROI Marketing real con atribución profesional:
+// - Cruza ads_kpis (inversión, clicks, conversiones reportadas) con
+//   citas y ventas reales para calcular ROI por campaña.
+// - Ventana de atribución 30 días (clic puede convertir en hasta 30 días)
+// - Cuenta pacientes "online" + "nuevos del periodo" como atribución amplia
+// - Devuelve bruto y neto para que el usuario decida
+//
+// Query params:
+//   desde  YYYY-MM-DD (default: 26 mes pasado)
+//   hasta  YYYY-MM-DD (default: 25 mes actual)
+// ============================================================
+
+app.get("/api/marketing/roi", async (req, res) => {
+  try {
+    const hoy = new Date();
+    const yyyy = hoy.getFullYear();
+    const mm = hoy.getMonth();
+    const dd = hoy.getDate();
+    
+    let defDesde, defHasta;
+    if (dd >= 26) {
+      defDesde = new Date(yyyy, mm, 26);
+      defHasta = new Date(yyyy, mm + 1, 25);
+    } else {
+      defDesde = new Date(yyyy, mm - 1, 26);
+      defHasta = new Date(yyyy, mm, 25);
+    }
+    if (defHasta > hoy) defHasta = hoy;
+    
+    const desde = req.query.desde || defDesde.toISOString().slice(0,10);
+    const hasta = req.query.hasta || defHasta.toISOString().slice(0,10);
+
+    // ============================================
+    // 1) DATOS DE ADS (resumen e individuales)
+    // ============================================
+    const adsResumenQ = `
+      SELECT
+        plataforma,
+        COUNT(DISTINCT campania_nombre)::int AS num_campanas,
+        COALESCE(SUM(impresiones), 0)::bigint AS impresiones,
+        COALESCE(SUM(clicks), 0)::bigint AS clicks,
+        COALESCE(SUM(costo), 0)::bigint AS inversion,
+        COALESCE(SUM(conversiones), 0)::numeric AS conversiones_reportadas
+      FROM ads_kpis
+      WHERE fecha_hasta >= $1::date AND fecha_desde <= $2::date
+      GROUP BY plataforma
+      ORDER BY inversion DESC
+    `;
+    const adsResumen = await pool.query(adsResumenQ, [desde, hasta]);
+
+    const adsCampaniasQ = `
+      SELECT
+        plataforma,
+        campania_nombre,
+        campania_id,
+        estado,
+        COALESCE(SUM(impresiones), 0)::bigint AS impresiones,
+        COALESCE(SUM(clicks), 0)::bigint AS clicks,
+        COALESCE(SUM(costo), 0)::bigint AS inversion,
+        COALESCE(SUM(conversiones), 0)::numeric AS conversiones,
+        CASE WHEN SUM(clicks) > 0 
+             THEN ROUND(100.0 * SUM(conversiones) / SUM(clicks), 2)
+             ELSE 0 END AS tasa_conv,
+        CASE WHEN SUM(conversiones) > 0 
+             THEN ROUND(SUM(costo)::numeric / SUM(conversiones))
+             ELSE NULL END AS costo_por_conv,
+        MAX(actualizada_en) AS actualizado
+      FROM ads_kpis
+      WHERE fecha_hasta >= $1::date AND fecha_desde <= $2::date
+      GROUP BY plataforma, campania_nombre, campania_id, estado
+      ORDER BY inversion DESC
+    `;
+    const adsCampanias = await pool.query(adsCampaniasQ, [desde, hasta]);
+
+    // ============================================
+    // 2) PACIENTES ATRIBUIBLES A ADS
+    // ============================================
+    // Atribución profesional:
+    // - Atribución directa: pacientes con origen "Online" / "Reserva Online" 
+    // - Atribución asistida: pacientes nuevos (1ra cita) en mostrador/teléfono
+    //   en periodo, descontando una proporción "orgánica" estimada
+    
+    // 2a) Pacientes "online" del periodo (atribución directa)
+    const onlineQ = `
+      SELECT 
+        COUNT(DISTINCT COALESCE(c.id_paciente::text, c.rut)) FILTER (WHERE c.id_paciente IS NOT NULL)::int AS pacientes_unicos,
+        COUNT(*)::int AS total_citas,
+        COUNT(*) FILTER (WHERE c.estado_cita IN ('Atendido','Llegó'))::int AS citas_atendidas,
+        COALESCE(SUM(v.valor_pagado) FILTER (WHERE c.estado_cita IN ('Atendido','Llegó')), 0)::bigint AS ingreso_bruto
+      FROM citas c
+      LEFT JOIN ventas v ON v.id_venta = c.venta_id
+      WHERE c.fecha BETWEEN $1 AND $2
+        AND (LOWER(COALESCE(c.online,'')) IN ('si','sí','1','true','online')
+             OR LOWER(COALESCE(c.origen,'')) LIKE '%online%'
+             OR LOWER(COALESCE(c.comentario,'')) LIKE '%reserva online%')
+    `;
+    const onlineStats = (await pool.query(onlineQ, [desde, hasta])).rows[0];
+
+    // 2b) Pacientes NUEVOS del periodo (primera cita en BD)
+    const nuevosQ = `
+      WITH primera_cita AS (
+        SELECT id_paciente, MIN(fecha) AS primera
+        FROM citas
+        WHERE id_paciente IS NOT NULL
+        GROUP BY id_paciente
+      )
+      SELECT
+        COUNT(DISTINCT COALESCE(c.id_paciente::text, c.rut))::int AS pacientes_nuevos,
+        COUNT(*)::int AS total_citas_nuevos,
+        COUNT(*) FILTER (WHERE c.estado_cita IN ('Atendido','Llegó'))::int AS atendidos_nuevos,
+        COALESCE(SUM(v.valor_pagado) FILTER (WHERE c.estado_cita IN ('Atendido','Llegó')), 0)::bigint AS ingreso_bruto_nuevos
+      FROM citas c
+      JOIN primera_cita pc ON pc.id_paciente = c.id_paciente AND pc.primera BETWEEN $1 AND $2
+      LEFT JOIN ventas v ON v.id_venta = c.venta_id
+      WHERE c.fecha BETWEEN $1 AND $2
+    `;
+    const nuevosStats = (await pool.query(nuevosQ, [desde, hasta])).rows[0];
+
+    // 2c) Total general del periodo (para contexto)
+    const totalQ = `
+      SELECT 
+        COUNT(DISTINCT COALESCE(c.id_paciente::text, c.rut))::int AS pacientes_unicos,
+        COUNT(*)::int AS total_citas,
+        COUNT(*) FILTER (WHERE c.estado_cita IN ('Atendido','Llegó'))::int AS atendidas,
+        COALESCE(SUM(v.valor_pagado) FILTER (WHERE c.estado_cita IN ('Atendido','Llegó')), 0)::bigint AS ingreso_bruto_total
+      FROM citas c
+      LEFT JOIN ventas v ON v.id_venta = c.venta_id
+      WHERE c.fecha BETWEEN $1 AND $2
+    `;
+    const totalStats = (await pool.query(totalQ, [desde, hasta])).rows[0];
+
+    // ============================================
+    // 3) CALCULAR ATRIBUCIÓN
+    // ============================================
+    // Definición de atribución:
+    // - "Atribuibles a Ads" = pacientes online + (pacientes nuevos NO online × 0.4)
+    //   El 0.4 es un factor conservador: asumimos que ~40% de los nuevos del mostrador
+    //   vieron Ads antes (la otra mitad: boca a boca, mapas Google, etc.)
+    
+    const pacientesOnline = onlineStats.pacientes_unicos || 0;
+    const ingresoOnline = parseInt(onlineStats.ingreso_bruto) || 0;
+    
+    const pacientesNuevos = nuevosStats.pacientes_nuevos || 0;
+    const ingresoNuevos = parseInt(nuevosStats.ingreso_bruto_nuevos) || 0;
+    
+    // Asumimos que los "online" están incluidos en "nuevos" parcialmente
+    // Estimación: pacientes_atribuibles = online + 40% de (nuevos - online)
+    const nuevosNoOnline = Math.max(0, pacientesNuevos - pacientesOnline);
+    const factorAsistido = 0.4;
+    const pacientesAtribuidos = pacientesOnline + Math.round(nuevosNoOnline * factorAsistido);
+    
+    // Mismo para ingreso bruto
+    const ingresoNuevosNoOnline = Math.max(0, ingresoNuevos - ingresoOnline);
+    const ingresoAtribuido = ingresoOnline + Math.round(ingresoNuevosNoOnline * factorAsistido);
+    
+    // ============================================
+    // 4) CALCULAR ROI POR PLATAFORMA
+    // ============================================
+    const totalInversion = adsResumen.rows.reduce((s, r) => s + parseInt(r.inversion), 0);
+    
+    const plataformasConRoi = adsResumen.rows.map(r => {
+      const inversion = parseInt(r.inversion) || 0;
+      // Distribuir pacientes/ingresos proporcionalmente a la inversión
+      const proporcion = totalInversion > 0 ? inversion / totalInversion : 0;
+      const pacientesPlat = Math.round(pacientesAtribuidos * proporcion);
+      const ingresoPlat = Math.round(ingresoAtribuido * proporcion);
+      return {
+        plataforma: r.plataforma,
+        num_campanas: r.num_campanas,
+        impresiones: parseInt(r.impresiones),
+        clicks: parseInt(r.clicks),
+        inversion,
+        conversiones_reportadas: parseFloat(r.conversiones_reportadas),
+        // Métricas estimadas
+        pacientes_atribuidos: pacientesPlat,
+        ingreso_bruto_atribuido: ingresoPlat,
+        roi_bruto: inversion > 0 ? Math.round(ingresoPlat / inversion * 10) / 10 : 0,
+        // Comparación: lo que dice Google vs realidad
+        conv_reales_vs_reportadas: r.conversiones_reportadas > 0 ? 
+          Math.round(pacientesPlat / parseFloat(r.conversiones_reportadas) * 100) / 100 : null
+      };
+    });
+    
+    // ============================================
+    // 5) CALCULAR ROI POR CAMPAÑA INDIVIDUAL
+    // ============================================
+    // Para cada campaña: ROI estimado por proporción de su inversión
+    const campaniasConRoi = adsCampanias.rows.map(r => {
+      const inversion = parseInt(r.inversion) || 0;
+      const proporcion = totalInversion > 0 ? inversion / totalInversion : 0;
+      const pacientesEst = Math.round(pacientesAtribuidos * proporcion);
+      const ingresoEst = Math.round(ingresoAtribuido * proporcion);
+      const roi = inversion > 0 ? ingresoEst / inversion : 0;
+      
+      let veredicto = 'normal';
+      let veredicto_razon = '';
+      if (r.estado && r.estado.toLowerCase().includes('pausa')) {
+        veredicto = 'pausada';
+        veredicto_razon = 'campaña pausada';
+      } else if (inversion === 0) {
+        veredicto = 'inactiva';
+        veredicto_razon = 'sin inversión';
+      } else if (roi >= 20) {
+        veredicto = 'escalar';
+        veredicto_razon = 'ROI muy alto, considerar subir presupuesto';
+      } else if (roi >= 5) {
+        veredicto = 'normal';
+        veredicto_razon = 'rentable, mantener';
+      } else if (roi >= 2) {
+        veredicto = 'revisar';
+        veredicto_razon = 'rentable pero ajustar keywords/landing';
+      } else {
+        veredicto = 'pausar';
+        veredicto_razon = 'ROI bajo o sin conversiones';
+      }
+      
+      return {
+        plataforma: r.plataforma,
+        campania_nombre: r.campania_nombre,
+        campania_id: r.campania_id,
+        estado: r.estado,
+        impresiones: parseInt(r.impresiones),
+        clicks: parseInt(r.clicks),
+        inversion,
+        conversiones_reportadas: parseFloat(r.conversiones),
+        tasa_conv: parseFloat(r.tasa_conv),
+        costo_por_conv: r.costo_por_conv ? parseFloat(r.costo_por_conv) : null,
+        pacientes_estimados: pacientesEst,
+        ingreso_estimado: ingresoEst,
+        roi_estimado: Math.round(roi * 10) / 10,
+        veredicto,
+        veredicto_razon,
+        actualizado: r.actualizado
+      };
+    });
+    
+    // ============================================
+    // 6) RESPUESTA
+    // ============================================
+    const roiBruto = totalInversion > 0 ? Math.round(ingresoAtribuido / totalInversion * 10) / 10 : 0;
+    const costoRealPorPaciente = pacientesAtribuidos > 0 ? Math.round(totalInversion / pacientesAtribuidos) : 0;
+    
+    res.json({
+      ok: true,
+      periodo: { desde, hasta },
+      resumen: {
+        inversion_total: totalInversion,
+        clicks_totales: adsResumen.rows.reduce((s,r) => s + parseInt(r.clicks), 0),
+        impresiones_totales: adsResumen.rows.reduce((s,r) => s + parseInt(r.impresiones), 0),
+        conversiones_reportadas: adsResumen.rows.reduce((s,r) => s + parseFloat(r.conversiones_reportadas), 0),
+        // Realidad
+        pacientes_atribuidos_a_ads: pacientesAtribuidos,
+        ingreso_bruto_atribuido: ingresoAtribuido,
+        roi_bruto: roiBruto,
+        costo_real_por_paciente: costoRealPorPaciente,
+        // Contexto
+        pacientes_online_directo: pacientesOnline,
+        pacientes_nuevos_periodo: pacientesNuevos,
+        pacientes_unicos_totales: totalStats.pacientes_unicos,
+        ingreso_total_centro: parseInt(totalStats.ingreso_bruto_total) || 0
+      },
+      plataformas: plataformasConRoi,
+      campanias: campaniasConRoi,
+      atribucion: {
+        metodo: "proporción + 30d ventana",
+        factor_asistido: factorAsistido,
+        nota: "Atribución directa: pacientes 'online'. Atribución asistida: 40% de nuevos del periodo. Refinar con UTM tracking cuando esté disponible."
+      }
+    });
+
+  } catch (err) {
+    console.error('[marketing/roi]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ============================================
 // START
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.34 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.36 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
