@@ -1,9 +1,9 @@
 // ============================================
-// REDVITAL BACKEND v5.37 - Endpoint diario
+// REDVITAL BACKEND v5.38 - Endpoint diario
 // Bot WhatsApp + Claude + Reservo Agendamiento
 // + Twilio WhatsApp Sandbox (paralelo a Meta)
 // + Optimizaciones rate limit Tier 1 (v5.32)
-// + Endpoint diagnóstico de suspensiones (v5.37)
+// + Endpoint diagnóstico de suspensiones (v5.38)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -103,7 +103,7 @@ const WEBHOOK_TO_SEDE = {
 const COSTO_FIJO_MENSUAL = 21537600;
 const PCT_REDVITAL_GLOBAL = 0.47;
 
-// v5.37: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
+// v5.38: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
 const WHATSAPP_SECRETARIAS = "+56 9 2246 7275";
 
 const CATEGORIAS_SERVICIO = [
@@ -186,31 +186,13 @@ async function inicializarBD() {
     `);
 
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS ads_kpis (
-        id BIGSERIAL PRIMARY KEY,
-        plataforma TEXT NOT NULL,
-        campania_nombre TEXT NOT NULL,
-        campania_id TEXT,
-        estado TEXT,
-        fecha_desde DATE NOT NULL,
-        fecha_hasta DATE NOT NULL,
-        impresiones BIGINT DEFAULT 0,
-        clicks BIGINT DEFAULT 0,
-        ctr_pct NUMERIC(6,2),
-        cpc_promedio NUMERIC(10,2),
-        costo BIGINT DEFAULT 0,
-        conversiones NUMERIC(10,2) DEFAULT 0,
-        costo_conversion NUMERIC(10,2),
-        tasa_conversion_pct NUMERIC(6,2),
-        presupuesto_diario BIGINT,
-        comentario TEXT,
-        creada_en TIMESTAMPTZ DEFAULT NOW(),
-        actualizada_en TIMESTAMPTZ DEFAULT NOW()
-      )
+      -- v5.38: tabla ads_kpis ya creada por el importador CSV con esquema en inglés
+      -- Se mantiene este CREATE IF NOT EXISTS por compatibilidad pero NO crea nada nuevo
+      CREATE TABLE IF NOT EXISTS ads_kpis_legacy_disabled (id INT)
     `);
-    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_plataforma ON ads_kpis(plataforma)`); } catch (e) { console.warn("[BD] idx_ads_kpis_plataforma:", e.message); }
-    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_fecha ON ads_kpis(fecha_hasta DESC)`); } catch (e) { console.warn("[BD] idx_ads_kpis_fecha:", e.message); }
-    try { await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_kpis_campania ON ads_kpis(campania_nombre)`); } catch (e) { console.warn("[BD] idx_ads_kpis_campania:", e.message); }
+    // (índices ya creados por importador CSV con nombres en inglés - ver línea ~1885)
+    
+    
 
     console.log("Indices, tabla webhooks_raw, columnas uuid, campanias_marketing y ads_kpis verificados correctamente");
   } catch (err) {
@@ -1425,15 +1407,19 @@ app.delete("/api/campanias/:id", async (req, res) => {
 app.get("/api/ads-kpis", async (req, res) => {
   try {
     const { plataforma, desde, hasta } = req.query;
-    let sql = `SELECT id, plataforma, campania_nombre, campania_id, estado,
-                      fecha_desde, fecha_hasta, impresiones, clicks, ctr_pct,
-                      cpc_promedio, costo, conversiones, costo_conversion, tasa_conversion_pct,
-                      presupuesto_diario, comentario, creada_en, actualizada_en
+    let sql = `SELECT id, platform AS plataforma, campaign_name AS campania_nombre, 
+                      NULL AS campania_id, campaign_status AS estado,
+                      COALESCE(date_range_start, date_range_end) AS fecha_desde, 
+                      date_range_end AS fecha_hasta, impressions AS impresiones, clicks, ctr AS ctr_pct,
+                      cpc AS cpc_promedio, cost_clp AS costo, conversions AS conversiones, 
+                      cpa AS costo_conversion, conversion_rate AS tasa_conversion_pct,
+                      NULL AS presupuesto_diario, NULL AS comentario, 
+                      imported_at AS actualizada_en, imported_at AS creada_en
                FROM ads_kpis WHERE 1=1`;
     const params = [];
-    if (plataforma) { params.push(plataforma); sql += ` AND plataforma = $${params.length}`; }
-    if (desde) { params.push(desde); sql += ` AND fecha_hasta >= $${params.length}::date`; }
-    if (hasta) { params.push(hasta); sql += ` AND fecha_desde <= $${params.length}::date`; }
+    if (plataforma) { params.push(plataforma); sql += ` AND platform = $${params.length}`; }
+    if (desde) { params.push(desde); sql += ` AND date_range_end >= $${params.length}::date`; }
+    if (hasta) { params.push(hasta); sql += ` AND COALESCE(date_range_start, date_range_end) <= $${params.length}::date`; }
     sql += ` ORDER BY fecha_hasta DESC, creada_en DESC`;
     const { rows } = await pool.query(sql, params);
     res.json({ ok: true, data: rows });
@@ -1441,6 +1427,11 @@ app.get("/api/ads-kpis", async (req, res) => {
 });
 
 app.post("/api/ads-kpis", async (req, res) => {
+  // v5.38: deshabilitado - usar importador CSV en /api/ads/import
+  return res.status(410).json({ 
+    ok: false, 
+    error: "Endpoint legacy deshabilitado. Usar el importador CSV en la sección Marketing > Performance de Ads" 
+  });
   try {
     const k = req.body || {};
     if (!k.plataforma || !k.campania_nombre || !k.fecha_desde || !k.fecha_hasta)
@@ -1468,6 +1459,11 @@ app.post("/api/ads-kpis", async (req, res) => {
 });
 
 app.put("/api/ads-kpis/:id", async (req, res) => {
+  // v5.38: deshabilitado - usar importador CSV
+  return res.status(410).json({ 
+    ok: false, 
+    error: "Endpoint legacy deshabilitado. Usar el importador CSV" 
+  });
   try {
     const k = req.body || {};
     const clicks = Number(k.clicks) || 0;
@@ -1515,12 +1511,12 @@ app.get("/api/ads-resumen", async (req, res) => {
     if (!hastaF) hastaF = hoy.toISOString().split('T')[0];
     const sql = `
       WITH ultimos_snapshots AS (
-        SELECT DISTINCT ON (plataforma, campania_nombre)
-          plataforma, campania_nombre, estado,
-          impresiones, clicks, costo, conversiones,
-          ctr_pct, cpc_promedio, costo_conversion, tasa_conversion_pct
-        FROM ads_kpis WHERE fecha_hasta >= $1::date AND fecha_desde <= $2::date
-        ORDER BY plataforma, campania_nombre, fecha_hasta DESC
+        SELECT DISTINCT ON (platform, campaign_name)
+          platform AS plataforma, campaign_name AS campania_nombre, campaign_status AS estado,
+          impressions AS impresiones, clicks, cost_clp AS costo, conversions AS conversiones,
+          ctr AS ctr_pct, cpc AS cpc_promedio, cpa AS costo_conversion, conversion_rate AS tasa_conversion_pct
+        FROM ads_kpis WHERE date_range_end >= $1::date AND COALESCE(date_range_start, date_range_end) <= $2::date
+        ORDER BY platform, campaign_name, date_range_end DESC
       )
       SELECT plataforma, COUNT(*)::int AS num_campanias,
         COUNT(*) FILTER (WHERE estado = 'activa')::int AS campanias_activas,
@@ -1534,13 +1530,14 @@ app.get("/api/ads-resumen", async (req, res) => {
     `;
     const { rows: plataformas } = await pool.query(sql, [desdeF, hastaF]);
     const sqlCampanias = `
-      SELECT DISTINCT ON (plataforma, campania_nombre)
-        id, plataforma, campania_nombre, campania_id, estado,
-        fecha_desde, fecha_hasta, impresiones, clicks, ctr_pct,
-        cpc_promedio, costo, conversiones, costo_conversion, tasa_conversion_pct,
-        presupuesto_diario, actualizada_en
-      FROM ads_kpis WHERE fecha_hasta >= $1::date AND fecha_desde <= $2::date
-      ORDER BY plataforma, campania_nombre, fecha_hasta DESC
+      SELECT DISTINCT ON (platform, campaign_name)
+        id, platform AS plataforma, campaign_name AS campania_nombre, NULL AS campania_id, campaign_status AS estado,
+        COALESCE(date_range_start, date_range_end) AS fecha_desde, date_range_end AS fecha_hasta, 
+        impressions AS impresiones, clicks, ctr AS ctr_pct,
+        cpc AS cpc_promedio, cost_clp AS costo, conversions AS conversiones, cpa AS costo_conversion, conversion_rate AS tasa_conversion_pct,
+        NULL AS presupuesto_diario, imported_at AS actualizada_en
+      FROM ads_kpis WHERE date_range_end >= $1::date AND COALESCE(date_range_start, date_range_end) <= $2::date
+      ORDER BY platform, campaign_name, date_range_end DESC
     `;
     const { rows: campanias } = await pool.query(sqlCampanias, [desdeF, hastaF]);
     const totales = {
@@ -1664,7 +1661,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.37",
+    ok: true, servidor: "Redvital Backend v5.38",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1829,7 +1826,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.37 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
+    servidor: "Redvital Backend v5.38 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -1842,7 +1839,7 @@ app.get("/", (req, res) => {
         "/api/bot/catalogo/tratamientos",
         "/api/bot/catalogo/categorias",
         "/api/bot/catalogo/buscar?q=",
-        "/api/bot/especialidades (v5.37)"
+        "/api/bot/especialidades (v5.38)"
       ],
       bot_conversacional: [
         "/api/bot/chat-test (POST) - simulador SIN WhatsApp",
@@ -2013,7 +2010,7 @@ app.get("/api/ads/summary", async (req, res) => {
 });
 
 // =============================================================
-// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.37)
+// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.38)
 // =============================================================
 async function inicializarBotBD() {
   try {
@@ -2108,7 +2105,7 @@ async function inicializarBotBD() {
       )`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_iniciado ON bot_sync_log(iniciado_en DESC)`);
 
-    // NUEVO en v5.37: tabla de mapeo profesional -> especialidad/grupo clínico
+    // NUEVO en v5.38: tabla de mapeo profesional -> especialidad/grupo clínico
     // (debe poblarse via SQL externo "cargar_especialidades.sql" la primera vez)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profesional_especialidad (
@@ -2367,12 +2364,12 @@ async function enviarMensajeWhatsApp(provider, to, texto) {
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_MODEL = 'claude-sonnet-4-5';
 
-// v5.37: Reintento automático en rate_limit (429) con backoff exponencial
+// v5.38: Reintento automático en rate_limit (429) con backoff exponencial
 // Esto evita que el paciente vea "tuve un problema técnico" cuando hay congestión.
 async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
   if (!CLAUDE_API_KEY) { console.warn('[claude] CLAUDE_API_KEY no configurada'); return { error: 'CLAUDE_API_KEY no configurada' }; }
   try {
-    // v5.37: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
+    // v5.38: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
     const body = { model: CLAUDE_MODEL, max_tokens: 600, messages: messages };
     if (systemPrompt) body.system = systemPrompt;
     if (tools && tools.length > 0) body.tools = tools;
@@ -2380,7 +2377,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
       headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 60000, validateStatus: () => true });
 
-    // v5.37: si es rate limit (429), esperar y reintentar hasta 3 veces
+    // v5.38: si es rate limit (429), esperar y reintentar hasta 3 veces
     if (r.status === 429 && intento <= 3) {
       // Intentar respetar header retry-after si viene; si no, backoff exponencial
       const retryAfterSec = parseInt(r.headers && r.headers['retry-after']) || (15 * intento);
@@ -2396,7 +2393,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
 }
 
 // ============================================
-// HELPERS v5.37: Lookup de especialidades por profesional
+// HELPERS v5.38: Lookup de especialidades por profesional
 // ============================================
 
 // Lee bot_profesional_especialidad para un nombre normalizado
@@ -2468,7 +2465,7 @@ function detectarServicioEspecial(query) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT (v5.37: Function Calling + Elección Profesional)
+// ORQUESTADOR DEL BOT (v5.38: Function Calling + Elección Profesional)
 // ============================================
 const BOT_TOOLS = [
   {
@@ -2602,7 +2599,7 @@ async function ejecutarTool(nombre, input) {
           const fecha = dia.fecha;
           for (const suc of (dia.sucursales || [])) {
             for (const prof of (suc.profesionales || [])) {
-              // v5.37: si vino uuid_profesional, filtrar
+              // v5.38: si vino uuid_profesional, filtrar
               if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
               for (const horaISO of (prof.horas_disponibles || [])) {
                 horariosAplanados.push({
@@ -2618,7 +2615,7 @@ async function ejecutarTool(nombre, input) {
           }
         }
       }
-      // v5.37: reducir 12→6 horarios y simplificar campos para bajar tokens
+      // v5.38: reducir 12→6 horarios y simplificar campos para bajar tokens
       const limitados = horariosAplanados.slice(0, 6).map(h => ({
         fecha: h.fecha, hora: h.hora,
         hora_con_segundos: h.hora_con_segundos,
@@ -2717,8 +2714,8 @@ async function ejecutarTool(nombre, input) {
 }
 
 
-// === SYSTEM PROMPT DINÁMICO v5.37 ===
-// === SYSTEM PROMPT DINÁMICO v5.37 (COMPRIMIDO ~60% para Tier 1) ===
+// === SYSTEM PROMPT DINÁMICO v5.38 ===
+// === SYSTEM PROMPT DINÁMICO v5.38 (COMPRIMIDO ~60% para Tier 1) ===
 async function construirSystemPrompt() {
   const ahora = new Date();
   const ahoraCL = new Date(ahora.getTime() - 4 * 3600000);
@@ -2830,7 +2827,7 @@ async function obtenerSesion(wa_id) {
 
 async function guardarSesion(wa_id, mensajes) {
   try {
-    // v5.37: reducir historial de 30 → 8 para bajar consumo de tokens
+    // v5.38: reducir historial de 30 → 8 para bajar consumo de tokens
     let recortado = mensajes;
     if (mensajes.length > 8) {
       recortado = mensajes.slice(mensajes.length - 8);
@@ -3053,7 +3050,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // === WEBHOOK TWILIO WHATSAPP SANDBOX ===
 app.get('/webhook/twilio', (req, res) => {
-  res.status(200).send('Twilio webhook OK - Redvital bot v5.37');
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.38');
 });
 
 app.post('/webhook/twilio', async (req, res) => {
@@ -3480,7 +3477,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// === NUEVO v5.37: /api/bot/especialidades ===
+// === NUEVO v5.38: /api/bot/especialidades ===
 app.get('/api/bot/especialidades', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -3499,7 +3496,7 @@ app.get('/api/bot/especialidades', async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/suspensiones/diagnostico (v5.37)
+// ENDPOINT: GET /api/suspensiones/diagnostico (v5.38)
 // ============================================================
 // Análisis completo de citas perdidas: Suspendió + Eliminado + No llegó
 // Cruza tabla `citas` con `ventas` para ingresos reales y plata perdida.
@@ -3881,7 +3878,7 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/diario (v5.37)
+// ENDPOINT: GET /api/diario (v5.38)
 // ============================================================
 // Comparativa de hoy vs ayer:
 //   - Agendadas + Atendidas
@@ -4060,7 +4057,7 @@ app.get("/api/diario", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/marketing/roi (v5.37)
+// ENDPOINT: GET /api/marketing/roi (v5.38)
 // ============================================================
 // ROI Marketing real con atribución profesional:
 // - Cruza ads_kpis (inversión, clicks, conversiones reportadas) con
@@ -4106,7 +4103,7 @@ app.get("/api/marketing/roi", async (req, res) => {
         COALESCE(SUM(cost_clp), 0)::bigint AS inversion,
         COALESCE(SUM(conversions), 0)::numeric AS conversiones_reportadas
       FROM ads_kpis
-      WHERE date_range_end >= $1::date AND date_range_start <= $2::date
+      WHERE date_range_end >= $1::date AND COALESCE(date_range_start, date_range_end) <= $2::date
       GROUP BY platform
       ORDER BY inversion DESC
     `;
@@ -4130,7 +4127,7 @@ app.get("/api/marketing/roi", async (req, res) => {
              ELSE NULL END AS costo_por_conv,
         MAX(imported_at) AS actualizado
       FROM ads_kpis
-      WHERE date_range_end >= $1::date AND date_range_start <= $2::date
+      WHERE date_range_end >= $1::date AND COALESCE(date_range_start, date_range_end) <= $2::date
       GROUP BY platform, campaign_name, campaign_status
       ORDER BY inversion DESC
     `;
@@ -4343,7 +4340,7 @@ app.get("/api/marketing/roi", async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.37 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.38 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
