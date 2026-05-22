@@ -1,9 +1,9 @@
 // ============================================
-// REDVITAL BACKEND v5.39 - Endpoint diario
+// REDVITAL BACKEND v5.40 - Endpoint diario
 // Bot WhatsApp + Claude + Reservo Agendamiento
 // + Twilio WhatsApp Sandbox (paralelo a Meta)
 // + Optimizaciones rate limit Tier 1 (v5.32)
-// + Endpoint diagnóstico de suspensiones (v5.39)
+// + Endpoint diagnóstico de suspensiones (v5.40)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -103,7 +103,7 @@ const WEBHOOK_TO_SEDE = {
 const COSTO_FIJO_MENSUAL = 21537600;
 const PCT_REDVITAL_GLOBAL = 0.47;
 
-// v5.39: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
+// v5.40: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
 const WHATSAPP_SECRETARIAS = "+56 9 2246 7275";
 
 const CATEGORIAS_SERVICIO = [
@@ -186,7 +186,7 @@ async function inicializarBD() {
     `);
 
     await pool.query(`
-      -- v5.39: tabla ads_kpis ya creada por el importador CSV con esquema en inglés
+      -- v5.40: tabla ads_kpis ya creada por el importador CSV con esquema en inglés
       -- Se mantiene este CREATE IF NOT EXISTS por compatibilidad pero NO crea nada nuevo
       CREATE TABLE IF NOT EXISTS ads_kpis_legacy_disabled (id INT)
     `);
@@ -1427,7 +1427,7 @@ app.get("/api/ads-kpis", async (req, res) => {
 });
 
 app.post("/api/ads-kpis", async (req, res) => {
-  // v5.39: deshabilitado - usar importador CSV en /api/ads/import
+  // v5.40: deshabilitado - usar importador CSV en /api/ads/import
   return res.status(410).json({ 
     ok: false, 
     error: "Endpoint legacy deshabilitado. Usar el importador CSV en la sección Marketing > Performance de Ads" 
@@ -1459,7 +1459,7 @@ app.post("/api/ads-kpis", async (req, res) => {
 });
 
 app.put("/api/ads-kpis/:id", async (req, res) => {
-  // v5.39: deshabilitado - usar importador CSV
+  // v5.40: deshabilitado - usar importador CSV
   return res.status(410).json({ 
     ok: false, 
     error: "Endpoint legacy deshabilitado. Usar el importador CSV" 
@@ -1661,7 +1661,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.39",
+    ok: true, servidor: "Redvital Backend v5.40",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1826,7 +1826,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.39 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
+    servidor: "Redvital Backend v5.40 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -1839,7 +1839,7 @@ app.get("/", (req, res) => {
         "/api/bot/catalogo/tratamientos",
         "/api/bot/catalogo/categorias",
         "/api/bot/catalogo/buscar?q=",
-        "/api/bot/especialidades (v5.39)"
+        "/api/bot/especialidades (v5.40)"
       ],
       bot_conversacional: [
         "/api/bot/chat-test (POST) - simulador SIN WhatsApp",
@@ -2010,7 +2010,7 @@ app.get("/api/ads/summary", async (req, res) => {
 });
 
 // =============================================================
-// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.39)
+// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.40)
 // =============================================================
 async function inicializarBotBD() {
   try {
@@ -2105,7 +2105,7 @@ async function inicializarBotBD() {
       )`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_iniciado ON bot_sync_log(iniciado_en DESC)`);
 
-    // NUEVO en v5.39: tabla de mapeo profesional -> especialidad/grupo clínico
+    // NUEVO en v5.40: tabla de mapeo profesional -> especialidad/grupo clínico
     // (debe poblarse via SQL externo "cargar_especialidades.sql" la primera vez)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profesional_especialidad (
@@ -2364,12 +2364,12 @@ async function enviarMensajeWhatsApp(provider, to, texto) {
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_MODEL = 'claude-sonnet-4-5';
 
-// v5.39: Reintento automático en rate_limit (429) con backoff exponencial
+// v5.40: Reintento automático en rate_limit (429) con backoff exponencial
 // Esto evita que el paciente vea "tuve un problema técnico" cuando hay congestión.
 async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
   if (!CLAUDE_API_KEY) { console.warn('[claude] CLAUDE_API_KEY no configurada'); return { error: 'CLAUDE_API_KEY no configurada' }; }
   try {
-    // v5.39: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
+    // v5.40: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
     const body = { model: CLAUDE_MODEL, max_tokens: 600, messages: messages };
     if (systemPrompt) body.system = systemPrompt;
     if (tools && tools.length > 0) body.tools = tools;
@@ -2377,7 +2377,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
       headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 60000, validateStatus: () => true });
 
-    // v5.39: si es rate limit (429), esperar y reintentar hasta 3 veces
+    // v5.40: si es rate limit (429), esperar y reintentar hasta 3 veces
     if (r.status === 429 && intento <= 3) {
       // Intentar respetar header retry-after si viene; si no, backoff exponencial
       const retryAfterSec = parseInt(r.headers && r.headers['retry-after']) || (15 * intento);
@@ -2393,7 +2393,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
 }
 
 // ============================================
-// HELPERS v5.39: Lookup de especialidades por profesional
+// HELPERS v5.40: Lookup de especialidades por profesional
 // ============================================
 
 // Lee bot_profesional_especialidad para un nombre normalizado
@@ -2465,7 +2465,7 @@ function detectarServicioEspecial(query) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT (v5.39: Function Calling + Elección Profesional)
+// ORQUESTADOR DEL BOT (v5.40: Function Calling + Elección Profesional)
 // ============================================
 const BOT_TOOLS = [
   {
@@ -2599,7 +2599,7 @@ async function ejecutarTool(nombre, input) {
           const fecha = dia.fecha;
           for (const suc of (dia.sucursales || [])) {
             for (const prof of (suc.profesionales || [])) {
-              // v5.39: si vino uuid_profesional, filtrar
+              // v5.40: si vino uuid_profesional, filtrar
               if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
               for (const horaISO of (prof.horas_disponibles || [])) {
                 horariosAplanados.push({
@@ -2615,7 +2615,7 @@ async function ejecutarTool(nombre, input) {
           }
         }
       }
-      // v5.39: reducir 12→6 horarios y simplificar campos para bajar tokens
+      // v5.40: reducir 12→6 horarios y simplificar campos para bajar tokens
       const limitados = horariosAplanados.slice(0, 6).map(h => ({
         fecha: h.fecha, hora: h.hora,
         hora_con_segundos: h.hora_con_segundos,
@@ -2714,8 +2714,8 @@ async function ejecutarTool(nombre, input) {
 }
 
 
-// === SYSTEM PROMPT DINÁMICO v5.39 ===
-// === SYSTEM PROMPT DINÁMICO v5.39 (COMPRIMIDO ~60% para Tier 1) ===
+// === SYSTEM PROMPT DINÁMICO v5.40 ===
+// === SYSTEM PROMPT DINÁMICO v5.40 (COMPRIMIDO ~60% para Tier 1) ===
 async function construirSystemPrompt() {
   const ahora = new Date();
   const ahoraCL = new Date(ahora.getTime() - 4 * 3600000);
@@ -2827,7 +2827,7 @@ async function obtenerSesion(wa_id) {
 
 async function guardarSesion(wa_id, mensajes) {
   try {
-    // v5.39: reducir historial de 30 → 8 para bajar consumo de tokens
+    // v5.40: reducir historial de 30 → 8 para bajar consumo de tokens
     let recortado = mensajes;
     if (mensajes.length > 8) {
       recortado = mensajes.slice(mensajes.length - 8);
@@ -3050,7 +3050,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // === WEBHOOK TWILIO WHATSAPP SANDBOX ===
 app.get('/webhook/twilio', (req, res) => {
-  res.status(200).send('Twilio webhook OK - Redvital bot v5.39');
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.40');
 });
 
 app.post('/webhook/twilio', async (req, res) => {
@@ -3477,7 +3477,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// === NUEVO v5.39: /api/bot/especialidades ===
+// === NUEVO v5.40: /api/bot/especialidades ===
 app.get('/api/bot/especialidades', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -3496,7 +3496,7 @@ app.get('/api/bot/especialidades', async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/suspensiones/diagnostico (v5.39)
+// ENDPOINT: GET /api/suspensiones/diagnostico (v5.40)
 // ============================================================
 // Análisis completo de citas perdidas: Suspendió + Eliminado + No llegó
 // Cruza tabla `citas` con `ventas` para ingresos reales y plata perdida.
@@ -3878,7 +3878,7 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/diario (v5.39)
+// ENDPOINT: GET /api/diario (v5.40)
 // ============================================================
 // Comparativa de hoy vs ayer:
 //   - Agendadas + Atendidas
@@ -4057,7 +4057,7 @@ app.get("/api/diario", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/marketing/roi (v5.39)
+// ENDPOINT: GET /api/marketing/roi (v5.40)
 // ============================================================
 // ROI Marketing real con atribución profesional:
 // - Cruza ads_kpis (inversión, clicks, conversiones reportadas) con
@@ -4244,7 +4244,7 @@ app.get("/api/marketing/roi", async (req, res) => {
     // ============================================
     // 5) CALCULAR ROI POR CAMPAÑA INDIVIDUAL
     // ============================================
-    // v5.39: Distribuir pacientes/ingresos usando CONVERSIONES de Google como peso
+    // v5.40: Distribuir pacientes/ingresos usando CONVERSIONES de Google como peso
     // (en vez de inversión) — eso hace que el ROI sea distinto por campaña
     // y refleja mejor cuál campaña tracciona pacientes reales
     
@@ -4351,12 +4351,166 @@ app.get("/api/marketing/roi", async (req, res) => {
   }
 });
 
+// ============================================================
+// ENDPOINT: GET /api/metas/equilibrio (v5.40)
+// ============================================================
+// Punto de equilibrio del mes Redvital actual:
+// - Facturado actual del mes
+// - Punto de equilibrio = costo_fijo / margen_redvital
+// - Días restantes
+// - Ritmo necesario para llegar
+// - Proyección a fin de mes
+// ============================================================
+
+app.get("/api/metas/equilibrio", async (req, res) => {
+  try {
+    const hoy = new Date();
+    const yyyy = hoy.getFullYear();
+    const mm = hoy.getMonth();
+    const dd = hoy.getDate();
+    
+    // Calcular periodo mes Redvital actual (26 → 25)
+    let inicio, fin;
+    if (dd >= 26) {
+      inicio = new Date(yyyy, mm, 26);
+      fin = new Date(yyyy, mm + 1, 25);
+    } else {
+      inicio = new Date(yyyy, mm - 1, 26);
+      fin = new Date(yyyy, mm, 25);
+    }
+    
+    const fechaInicio = inicio.toISOString().slice(0, 10);
+    const fechaFin = fin.toISOString().slice(0, 10);
+    const fechaHoy = hoy.toISOString().slice(0, 10);
+    
+    // Días totales del periodo
+    const diasTotales = Math.round((fin - inicio) / (1000 * 60 * 60 * 24)) + 1;
+    
+    // Días transcurridos (hasta hoy, no más allá del fin del periodo)
+    const finEfectivo = hoy > fin ? fin : hoy;
+    const diasTranscurridos = Math.max(1, Math.round((finEfectivo - inicio) / (1000 * 60 * 60 * 24)) + 1);
+    const diasRestantes = Math.max(0, diasTotales - diasTranscurridos);
+    
+    // Facturado del periodo
+    const ventasQ = `
+      SELECT 
+        COUNT(*)::int AS total_ventas,
+        COALESCE(SUM(valor_pagado), 0)::bigint AS facturado
+      FROM ventas
+      WHERE fecha BETWEEN $1 AND $2
+    `;
+    const ventas = (await pool.query(ventasQ, [fechaInicio, fechaHoy])).rows[0];
+    const facturado = parseInt(ventas.facturado) || 0;
+    const totalVentas = ventas.total_ventas || 0;
+    
+    // Histórico (todo lo facturado en la BD)
+    const historicoQ = `
+      SELECT 
+        COUNT(*)::int AS total_ventas,
+        COALESCE(SUM(valor_pagado), 0)::bigint AS facturado,
+        MIN(fecha) AS primera_venta,
+        MAX(fecha) AS ultima_venta
+      FROM ventas
+    `;
+    const historico = (await pool.query(historicoQ)).rows[0];
+    
+    // Constantes
+    const MARGEN_REDVITAL = 0.47;
+    const COSTO_FIJO_MENSUAL_LOCAL = COSTO_FIJO_MENSUAL; // 21.537.600
+    
+    // Punto de equilibrio
+    const puntoEquilibrio = Math.round(COSTO_FIJO_MENSUAL_LOCAL / MARGEN_REDVITAL);
+    
+    // Falta facturar para llegar al equilibrio
+    const faltaParaEquilibrio = Math.max(0, puntoEquilibrio - facturado);
+    
+    // Ritmo diario actual
+    const ritmoDiarioActual = diasTranscurridos > 0 ? Math.round(facturado / diasTranscurridos) : 0;
+    
+    // Ritmo diario necesario los días restantes para llegar al equilibrio
+    const ritmoNecesario = diasRestantes > 0 ? Math.round(faltaParaEquilibrio / diasRestantes) : 0;
+    
+    // Proyección a fin de mes al ritmo actual
+    const proyeccionFinMes = facturado + (ritmoDiarioActual * diasRestantes);
+    
+    // Estado del mes
+    let estado, estado_color, estado_mensaje;
+    const cumplimientoEquilibrio = puntoEquilibrio > 0 ? (proyeccionFinMes / puntoEquilibrio) : 0;
+    
+    if (facturado >= puntoEquilibrio) {
+      estado = 'logrado';
+      estado_color = 'jade';
+      estado_mensaje = '¡Ya alcanzaste el punto de equilibrio! Todo lo que factures de acá en adelante es ganancia.';
+    } else if (cumplimientoEquilibrio >= 1.0) {
+      estado = 'en_camino';
+      estado_color = 'jade';
+      estado_mensaje = 'Al ritmo actual vas a llegar al equilibrio. Mantené el ritmo.';
+    } else if (cumplimientoEquilibrio >= 0.85) {
+      estado = 'ajustado';
+      estado_color = 'warn';
+      estado_mensaje = 'Estás cerca pero no llegás. Hay que apretar el ritmo en los días restantes.';
+    } else {
+      estado = 'deficit';
+      estado_color = 'signal';
+      estado_mensaje = 'Al ritmo actual no llegás al equilibrio. Mes proyectado en pérdida.';
+    }
+    
+    // Resultado
+    res.json({
+      ok: true,
+      periodo: {
+        inicio: fechaInicio,
+        fin: fechaFin,
+        hoy: fechaHoy,
+        dias_totales: diasTotales,
+        dias_transcurridos: diasTranscurridos,
+        dias_restantes: diasRestantes,
+        pct_transcurrido: Math.round(100 * diasTranscurridos / diasTotales)
+      },
+      facturado: {
+        actual: facturado,
+        ventas: totalVentas,
+        ticket_promedio: totalVentas > 0 ? Math.round(facturado / totalVentas) : 0
+      },
+      equilibrio: {
+        objetivo: puntoEquilibrio,
+        falta: faltaParaEquilibrio,
+        pct_logrado: puntoEquilibrio > 0 ? Math.round(100 * facturado / puntoEquilibrio) : 0,
+        margen_redvital: MARGEN_REDVITAL,
+        costo_fijo: COSTO_FIJO_MENSUAL_LOCAL
+      },
+      ritmo: {
+        actual_diario: ritmoDiarioActual,
+        necesario_diario: ritmoNecesario,
+        diferencia: ritmoNecesario - ritmoDiarioActual,
+        proyeccion_fin_mes: proyeccionFinMes,
+        deficit_proyectado: Math.max(0, puntoEquilibrio - proyeccionFinMes)
+      },
+      historico: {
+        facturado_total: parseInt(historico.facturado) || 0,
+        ventas_total: historico.total_ventas || 0,
+        primera_venta: historico.primera_venta,
+        ultima_venta: historico.ultima_venta
+      },
+      estado: {
+        tipo: estado,
+        color: estado_color,
+        mensaje: estado_mensaje
+      }
+    });
+    
+  } catch (err) {
+    console.error('[metas/equilibrio]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ============================================
 // START
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.39 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.40 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
