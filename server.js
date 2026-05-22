@@ -1,9 +1,9 @@
 // ============================================
-// REDVITAL BACKEND v5.38 - Endpoint diario
+// REDVITAL BACKEND v5.39 - Endpoint diario
 // Bot WhatsApp + Claude + Reservo Agendamiento
 // + Twilio WhatsApp Sandbox (paralelo a Meta)
 // + Optimizaciones rate limit Tier 1 (v5.32)
-// + Endpoint diagnóstico de suspensiones (v5.38)
+// + Endpoint diagnóstico de suspensiones (v5.39)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -103,7 +103,7 @@ const WEBHOOK_TO_SEDE = {
 const COSTO_FIJO_MENSUAL = 21537600;
 const PCT_REDVITAL_GLOBAL = 0.47;
 
-// v5.38: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
+// v5.39: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
 const WHATSAPP_SECRETARIAS = "+56 9 2246 7275";
 
 const CATEGORIAS_SERVICIO = [
@@ -186,7 +186,7 @@ async function inicializarBD() {
     `);
 
     await pool.query(`
-      -- v5.38: tabla ads_kpis ya creada por el importador CSV con esquema en inglés
+      -- v5.39: tabla ads_kpis ya creada por el importador CSV con esquema en inglés
       -- Se mantiene este CREATE IF NOT EXISTS por compatibilidad pero NO crea nada nuevo
       CREATE TABLE IF NOT EXISTS ads_kpis_legacy_disabled (id INT)
     `);
@@ -1427,7 +1427,7 @@ app.get("/api/ads-kpis", async (req, res) => {
 });
 
 app.post("/api/ads-kpis", async (req, res) => {
-  // v5.38: deshabilitado - usar importador CSV en /api/ads/import
+  // v5.39: deshabilitado - usar importador CSV en /api/ads/import
   return res.status(410).json({ 
     ok: false, 
     error: "Endpoint legacy deshabilitado. Usar el importador CSV en la sección Marketing > Performance de Ads" 
@@ -1459,7 +1459,7 @@ app.post("/api/ads-kpis", async (req, res) => {
 });
 
 app.put("/api/ads-kpis/:id", async (req, res) => {
-  // v5.38: deshabilitado - usar importador CSV
+  // v5.39: deshabilitado - usar importador CSV
   return res.status(410).json({ 
     ok: false, 
     error: "Endpoint legacy deshabilitado. Usar el importador CSV" 
@@ -1661,7 +1661,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.38",
+    ok: true, servidor: "Redvital Backend v5.39",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1826,7 +1826,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.38 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
+    servidor: "Redvital Backend v5.39 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -1839,7 +1839,7 @@ app.get("/", (req, res) => {
         "/api/bot/catalogo/tratamientos",
         "/api/bot/catalogo/categorias",
         "/api/bot/catalogo/buscar?q=",
-        "/api/bot/especialidades (v5.38)"
+        "/api/bot/especialidades (v5.39)"
       ],
       bot_conversacional: [
         "/api/bot/chat-test (POST) - simulador SIN WhatsApp",
@@ -2010,7 +2010,7 @@ app.get("/api/ads/summary", async (req, res) => {
 });
 
 // =============================================================
-// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.38)
+// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.39)
 // =============================================================
 async function inicializarBotBD() {
   try {
@@ -2105,7 +2105,7 @@ async function inicializarBotBD() {
       )`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_iniciado ON bot_sync_log(iniciado_en DESC)`);
 
-    // NUEVO en v5.38: tabla de mapeo profesional -> especialidad/grupo clínico
+    // NUEVO en v5.39: tabla de mapeo profesional -> especialidad/grupo clínico
     // (debe poblarse via SQL externo "cargar_especialidades.sql" la primera vez)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profesional_especialidad (
@@ -2364,12 +2364,12 @@ async function enviarMensajeWhatsApp(provider, to, texto) {
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_MODEL = 'claude-sonnet-4-5';
 
-// v5.38: Reintento automático en rate_limit (429) con backoff exponencial
+// v5.39: Reintento automático en rate_limit (429) con backoff exponencial
 // Esto evita que el paciente vea "tuve un problema técnico" cuando hay congestión.
 async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
   if (!CLAUDE_API_KEY) { console.warn('[claude] CLAUDE_API_KEY no configurada'); return { error: 'CLAUDE_API_KEY no configurada' }; }
   try {
-    // v5.38: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
+    // v5.39: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
     const body = { model: CLAUDE_MODEL, max_tokens: 600, messages: messages };
     if (systemPrompt) body.system = systemPrompt;
     if (tools && tools.length > 0) body.tools = tools;
@@ -2377,7 +2377,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
       headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 60000, validateStatus: () => true });
 
-    // v5.38: si es rate limit (429), esperar y reintentar hasta 3 veces
+    // v5.39: si es rate limit (429), esperar y reintentar hasta 3 veces
     if (r.status === 429 && intento <= 3) {
       // Intentar respetar header retry-after si viene; si no, backoff exponencial
       const retryAfterSec = parseInt(r.headers && r.headers['retry-after']) || (15 * intento);
@@ -2393,7 +2393,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
 }
 
 // ============================================
-// HELPERS v5.38: Lookup de especialidades por profesional
+// HELPERS v5.39: Lookup de especialidades por profesional
 // ============================================
 
 // Lee bot_profesional_especialidad para un nombre normalizado
@@ -2465,7 +2465,7 @@ function detectarServicioEspecial(query) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT (v5.38: Function Calling + Elección Profesional)
+// ORQUESTADOR DEL BOT (v5.39: Function Calling + Elección Profesional)
 // ============================================
 const BOT_TOOLS = [
   {
@@ -2599,7 +2599,7 @@ async function ejecutarTool(nombre, input) {
           const fecha = dia.fecha;
           for (const suc of (dia.sucursales || [])) {
             for (const prof of (suc.profesionales || [])) {
-              // v5.38: si vino uuid_profesional, filtrar
+              // v5.39: si vino uuid_profesional, filtrar
               if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
               for (const horaISO of (prof.horas_disponibles || [])) {
                 horariosAplanados.push({
@@ -2615,7 +2615,7 @@ async function ejecutarTool(nombre, input) {
           }
         }
       }
-      // v5.38: reducir 12→6 horarios y simplificar campos para bajar tokens
+      // v5.39: reducir 12→6 horarios y simplificar campos para bajar tokens
       const limitados = horariosAplanados.slice(0, 6).map(h => ({
         fecha: h.fecha, hora: h.hora,
         hora_con_segundos: h.hora_con_segundos,
@@ -2714,8 +2714,8 @@ async function ejecutarTool(nombre, input) {
 }
 
 
-// === SYSTEM PROMPT DINÁMICO v5.38 ===
-// === SYSTEM PROMPT DINÁMICO v5.38 (COMPRIMIDO ~60% para Tier 1) ===
+// === SYSTEM PROMPT DINÁMICO v5.39 ===
+// === SYSTEM PROMPT DINÁMICO v5.39 (COMPRIMIDO ~60% para Tier 1) ===
 async function construirSystemPrompt() {
   const ahora = new Date();
   const ahoraCL = new Date(ahora.getTime() - 4 * 3600000);
@@ -2827,7 +2827,7 @@ async function obtenerSesion(wa_id) {
 
 async function guardarSesion(wa_id, mensajes) {
   try {
-    // v5.38: reducir historial de 30 → 8 para bajar consumo de tokens
+    // v5.39: reducir historial de 30 → 8 para bajar consumo de tokens
     let recortado = mensajes;
     if (mensajes.length > 8) {
       recortado = mensajes.slice(mensajes.length - 8);
@@ -3050,7 +3050,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // === WEBHOOK TWILIO WHATSAPP SANDBOX ===
 app.get('/webhook/twilio', (req, res) => {
-  res.status(200).send('Twilio webhook OK - Redvital bot v5.38');
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.39');
 });
 
 app.post('/webhook/twilio', async (req, res) => {
@@ -3477,7 +3477,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// === NUEVO v5.38: /api/bot/especialidades ===
+// === NUEVO v5.39: /api/bot/especialidades ===
 app.get('/api/bot/especialidades', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -3496,7 +3496,7 @@ app.get('/api/bot/especialidades', async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/suspensiones/diagnostico (v5.38)
+// ENDPOINT: GET /api/suspensiones/diagnostico (v5.39)
 // ============================================================
 // Análisis completo de citas perdidas: Suspendió + Eliminado + No llegó
 // Cruza tabla `citas` con `ventas` para ingresos reales y plata perdida.
@@ -3878,7 +3878,7 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/diario (v5.38)
+// ENDPOINT: GET /api/diario (v5.39)
 // ============================================================
 // Comparativa de hoy vs ayer:
 //   - Agendadas + Atendidas
@@ -4057,7 +4057,7 @@ app.get("/api/diario", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/marketing/roi (v5.38)
+// ENDPOINT: GET /api/marketing/roi (v5.39)
 // ============================================================
 // ROI Marketing real con atribución profesional:
 // - Cruza ads_kpis (inversión, clicks, conversiones reportadas) con
@@ -4096,9 +4096,9 @@ app.get("/api/marketing/roi", async (req, res) => {
     // ============================================
     const adsResumenQ = `
       SELECT
-        platform,
+        platform AS plataforma,
         COUNT(DISTINCT campaign_name)::int AS num_campanas,
-        COALESCE(SUM(impressions), 0)::bigint AS impressions,
+        COALESCE(SUM(impressions), 0)::bigint AS impresiones,
         COALESCE(SUM(clicks), 0)::bigint AS clicks,
         COALESCE(SUM(cost_clp), 0)::bigint AS inversion,
         COALESCE(SUM(conversions), 0)::numeric AS conversiones_reportadas
@@ -4111,14 +4111,13 @@ app.get("/api/marketing/roi", async (req, res) => {
 
     const adsCampaniasQ = `
       SELECT
-        platform,
-        campaign_name,
-        NULL,
-        campaign_status,
-        COALESCE(SUM(impressions), 0)::bigint AS impressions,
+        platform AS plataforma,
+        campaign_name AS campania_nombre,
+        MAX(campaign_status) AS estado,
+        COALESCE(SUM(impressions), 0)::bigint AS impresiones,
         COALESCE(SUM(clicks), 0)::bigint AS clicks,
         COALESCE(SUM(cost_clp), 0)::bigint AS inversion,
-        COALESCE(SUM(conversions), 0)::numeric AS conversions,
+        COALESCE(SUM(conversions), 0)::numeric AS conversiones,
         CASE WHEN SUM(clicks) > 0 
              THEN ROUND(100.0 * SUM(conversions) / SUM(clicks), 2)
              ELSE 0 END AS tasa_conv,
@@ -4128,7 +4127,7 @@ app.get("/api/marketing/roi", async (req, res) => {
         MAX(imported_at) AS actualizado
       FROM ads_kpis
       WHERE date_range_end >= $1::date AND COALESCE(date_range_start, date_range_end) <= $2::date
-      GROUP BY platform, campaign_name, campaign_status
+      GROUP BY platform, campaign_name
       ORDER BY inversion DESC
     `;
     const adsCampanias = await pool.query(adsCampaniasQ, [desde, hasta]);
@@ -4245,10 +4244,25 @@ app.get("/api/marketing/roi", async (req, res) => {
     // ============================================
     // 5) CALCULAR ROI POR CAMPAÑA INDIVIDUAL
     // ============================================
-    // Para cada campaña: ROI estimado por proporción de su inversión
+    // v5.39: Distribuir pacientes/ingresos usando CONVERSIONES de Google como peso
+    // (en vez de inversión) — eso hace que el ROI sea distinto por campaña
+    // y refleja mejor cuál campaña tracciona pacientes reales
+    
+    // Total de conversiones reportadas por Google (peso)
+    const totalConvReportadas = adsCampanias.rows.reduce((s, r) => s + (parseFloat(r.conversiones) || 0), 0);
+    
     const campaniasConRoi = adsCampanias.rows.map(r => {
       const inversion = parseInt(r.inversion) || 0;
-      const proporcion = totalInversion > 0 ? inversion / totalInversion : 0;
+      const convCampana = parseFloat(r.conversiones) || 0;
+      
+      // Peso: si hay conversiones Google, usar esa proporción; si no, usar inversión
+      let proporcion;
+      if (totalConvReportadas > 0 && convCampana > 0) {
+        proporcion = convCampana / totalConvReportadas;
+      } else {
+        proporcion = totalInversion > 0 ? inversion / totalInversion : 0;
+      }
+      
       const pacientesEst = Math.round(pacientesAtribuidos * proporcion);
       const ingresoEst = Math.round(ingresoAtribuido * proporcion);
       const roi = inversion > 0 ? ingresoEst / inversion : 0;
@@ -4261,24 +4275,26 @@ app.get("/api/marketing/roi", async (req, res) => {
       } else if (inversion === 0) {
         veredicto = 'inactiva';
         veredicto_razon = 'sin inversión';
-      } else if (roi >= 20) {
+      } else if (roi >= 30) {
         veredicto = 'escalar';
         veredicto_razon = 'ROI muy alto, considerar subir presupuesto';
-      } else if (roi >= 5) {
+      } else if (roi >= 10) {
         veredicto = 'normal';
         veredicto_razon = 'rentable, mantener';
-      } else if (roi >= 2) {
+      } else if (roi >= 3) {
         veredicto = 'revisar';
         veredicto_razon = 'rentable pero ajustar keywords/landing';
-      } else {
+      } else if (convCampana === 0 && inversion > 5000) {
         veredicto = 'pausar';
+        veredicto_razon = '0 conversiones con inversión significativa';
+      } else {
+        veredicto = 'revisar';
         veredicto_razon = 'ROI bajo o sin conversiones';
       }
       
       return {
         plataforma: r.plataforma,
         campania_nombre: r.campania_nombre,
-        campania_id: r.campania_id,
         estado: r.estado,
         impresiones: parseInt(r.impresiones),
         clicks: parseInt(r.clicks),
@@ -4340,7 +4356,7 @@ app.get("/api/marketing/roi", async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.38 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.39 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
