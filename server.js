@@ -1,9 +1,9 @@
 // ============================================
-// REDVITAL BACKEND v5.36 - Endpoint diario
+// REDVITAL BACKEND v5.37 - Endpoint diario
 // Bot WhatsApp + Claude + Reservo Agendamiento
 // + Twilio WhatsApp Sandbox (paralelo a Meta)
 // + Optimizaciones rate limit Tier 1 (v5.32)
-// + Endpoint diagnóstico de suspensiones (v5.36)
+// + Endpoint diagnóstico de suspensiones (v5.37)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -103,7 +103,7 @@ const WEBHOOK_TO_SEDE = {
 const COSTO_FIJO_MENSUAL = 21537600;
 const PCT_REDVITAL_GLOBAL = 0.47;
 
-// v5.36: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
+// v5.37: WhatsApp de secretarias (para Doppler, Laboratorio, etc.)
 const WHATSAPP_SECRETARIAS = "+56 9 2246 7275";
 
 const CATEGORIAS_SERVICIO = [
@@ -1664,7 +1664,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.36",
+    ok: true, servidor: "Redvital Backend v5.37",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1829,7 +1829,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.36 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
+    servidor: "Redvital Backend v5.37 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -1842,7 +1842,7 @@ app.get("/", (req, res) => {
         "/api/bot/catalogo/tratamientos",
         "/api/bot/catalogo/categorias",
         "/api/bot/catalogo/buscar?q=",
-        "/api/bot/especialidades (v5.36)"
+        "/api/bot/especialidades (v5.37)"
       ],
       bot_conversacional: [
         "/api/bot/chat-test (POST) - simulador SIN WhatsApp",
@@ -2013,7 +2013,7 @@ app.get("/api/ads/summary", async (req, res) => {
 });
 
 // =============================================================
-// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.36)
+// BOT WHATSAPP + RESERVO AGENDAMIENTO + CLAUDE (v5.37)
 // =============================================================
 async function inicializarBotBD() {
   try {
@@ -2108,7 +2108,7 @@ async function inicializarBotBD() {
       )`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_iniciado ON bot_sync_log(iniciado_en DESC)`);
 
-    // NUEVO en v5.36: tabla de mapeo profesional -> especialidad/grupo clínico
+    // NUEVO en v5.37: tabla de mapeo profesional -> especialidad/grupo clínico
     // (debe poblarse via SQL externo "cargar_especialidades.sql" la primera vez)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profesional_especialidad (
@@ -2367,12 +2367,12 @@ async function enviarMensajeWhatsApp(provider, to, texto) {
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_MODEL = 'claude-sonnet-4-5';
 
-// v5.36: Reintento automático en rate_limit (429) con backoff exponencial
+// v5.37: Reintento automático en rate_limit (429) con backoff exponencial
 // Esto evita que el paciente vea "tuve un problema técnico" cuando hay congestión.
 async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
   if (!CLAUDE_API_KEY) { console.warn('[claude] CLAUDE_API_KEY no configurada'); return { error: 'CLAUDE_API_KEY no configurada' }; }
   try {
-    // v5.36: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
+    // v5.37: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
     const body = { model: CLAUDE_MODEL, max_tokens: 600, messages: messages };
     if (systemPrompt) body.system = systemPrompt;
     if (tools && tools.length > 0) body.tools = tools;
@@ -2380,7 +2380,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
       headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 60000, validateStatus: () => true });
 
-    // v5.36: si es rate limit (429), esperar y reintentar hasta 3 veces
+    // v5.37: si es rate limit (429), esperar y reintentar hasta 3 veces
     if (r.status === 429 && intento <= 3) {
       // Intentar respetar header retry-after si viene; si no, backoff exponencial
       const retryAfterSec = parseInt(r.headers && r.headers['retry-after']) || (15 * intento);
@@ -2396,7 +2396,7 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
 }
 
 // ============================================
-// HELPERS v5.36: Lookup de especialidades por profesional
+// HELPERS v5.37: Lookup de especialidades por profesional
 // ============================================
 
 // Lee bot_profesional_especialidad para un nombre normalizado
@@ -2468,7 +2468,7 @@ function detectarServicioEspecial(query) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT (v5.36: Function Calling + Elección Profesional)
+// ORQUESTADOR DEL BOT (v5.37: Function Calling + Elección Profesional)
 // ============================================
 const BOT_TOOLS = [
   {
@@ -2602,7 +2602,7 @@ async function ejecutarTool(nombre, input) {
           const fecha = dia.fecha;
           for (const suc of (dia.sucursales || [])) {
             for (const prof of (suc.profesionales || [])) {
-              // v5.36: si vino uuid_profesional, filtrar
+              // v5.37: si vino uuid_profesional, filtrar
               if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
               for (const horaISO of (prof.horas_disponibles || [])) {
                 horariosAplanados.push({
@@ -2618,7 +2618,7 @@ async function ejecutarTool(nombre, input) {
           }
         }
       }
-      // v5.36: reducir 12→6 horarios y simplificar campos para bajar tokens
+      // v5.37: reducir 12→6 horarios y simplificar campos para bajar tokens
       const limitados = horariosAplanados.slice(0, 6).map(h => ({
         fecha: h.fecha, hora: h.hora,
         hora_con_segundos: h.hora_con_segundos,
@@ -2717,8 +2717,8 @@ async function ejecutarTool(nombre, input) {
 }
 
 
-// === SYSTEM PROMPT DINÁMICO v5.36 ===
-// === SYSTEM PROMPT DINÁMICO v5.36 (COMPRIMIDO ~60% para Tier 1) ===
+// === SYSTEM PROMPT DINÁMICO v5.37 ===
+// === SYSTEM PROMPT DINÁMICO v5.37 (COMPRIMIDO ~60% para Tier 1) ===
 async function construirSystemPrompt() {
   const ahora = new Date();
   const ahoraCL = new Date(ahora.getTime() - 4 * 3600000);
@@ -2830,7 +2830,7 @@ async function obtenerSesion(wa_id) {
 
 async function guardarSesion(wa_id, mensajes) {
   try {
-    // v5.36: reducir historial de 30 → 8 para bajar consumo de tokens
+    // v5.37: reducir historial de 30 → 8 para bajar consumo de tokens
     let recortado = mensajes;
     if (mensajes.length > 8) {
       recortado = mensajes.slice(mensajes.length - 8);
@@ -3053,7 +3053,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // === WEBHOOK TWILIO WHATSAPP SANDBOX ===
 app.get('/webhook/twilio', (req, res) => {
-  res.status(200).send('Twilio webhook OK - Redvital bot v5.36');
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.37');
 });
 
 app.post('/webhook/twilio', async (req, res) => {
@@ -3480,7 +3480,7 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// === NUEVO v5.36: /api/bot/especialidades ===
+// === NUEVO v5.37: /api/bot/especialidades ===
 app.get('/api/bot/especialidades', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -3499,7 +3499,7 @@ app.get('/api/bot/especialidades', async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/suspensiones/diagnostico (v5.36)
+// ENDPOINT: GET /api/suspensiones/diagnostico (v5.37)
 // ============================================================
 // Análisis completo de citas perdidas: Suspendió + Eliminado + No llegó
 // Cruza tabla `citas` con `ventas` para ingresos reales y plata perdida.
@@ -3881,7 +3881,7 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/diario (v5.36)
+// ENDPOINT: GET /api/diario (v5.37)
 // ============================================================
 // Comparativa de hoy vs ayer:
 //   - Agendadas + Atendidas
@@ -4060,7 +4060,7 @@ app.get("/api/diario", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/marketing/roi (v5.36)
+// ENDPOINT: GET /api/marketing/roi (v5.37)
 // ============================================================
 // ROI Marketing real con atribución profesional:
 // - Cruza ads_kpis (inversión, clicks, conversiones reportadas) con
@@ -4099,39 +4099,39 @@ app.get("/api/marketing/roi", async (req, res) => {
     // ============================================
     const adsResumenQ = `
       SELECT
-        plataforma,
-        COUNT(DISTINCT campania_nombre)::int AS num_campanas,
-        COALESCE(SUM(impresiones), 0)::bigint AS impresiones,
+        platform,
+        COUNT(DISTINCT campaign_name)::int AS num_campanas,
+        COALESCE(SUM(impressions), 0)::bigint AS impressions,
         COALESCE(SUM(clicks), 0)::bigint AS clicks,
-        COALESCE(SUM(costo), 0)::bigint AS inversion,
-        COALESCE(SUM(conversiones), 0)::numeric AS conversiones_reportadas
+        COALESCE(SUM(cost_clp), 0)::bigint AS inversion,
+        COALESCE(SUM(conversions), 0)::numeric AS conversiones_reportadas
       FROM ads_kpis
-      WHERE fecha_hasta >= $1::date AND fecha_desde <= $2::date
-      GROUP BY plataforma
+      WHERE date_range_end >= $1::date AND date_range_start <= $2::date
+      GROUP BY platform
       ORDER BY inversion DESC
     `;
     const adsResumen = await pool.query(adsResumenQ, [desde, hasta]);
 
     const adsCampaniasQ = `
       SELECT
-        plataforma,
-        campania_nombre,
-        campania_id,
-        estado,
-        COALESCE(SUM(impresiones), 0)::bigint AS impresiones,
+        platform,
+        campaign_name,
+        NULL,
+        campaign_status,
+        COALESCE(SUM(impressions), 0)::bigint AS impressions,
         COALESCE(SUM(clicks), 0)::bigint AS clicks,
-        COALESCE(SUM(costo), 0)::bigint AS inversion,
-        COALESCE(SUM(conversiones), 0)::numeric AS conversiones,
+        COALESCE(SUM(cost_clp), 0)::bigint AS inversion,
+        COALESCE(SUM(conversions), 0)::numeric AS conversions,
         CASE WHEN SUM(clicks) > 0 
-             THEN ROUND(100.0 * SUM(conversiones) / SUM(clicks), 2)
+             THEN ROUND(100.0 * SUM(conversions) / SUM(clicks), 2)
              ELSE 0 END AS tasa_conv,
-        CASE WHEN SUM(conversiones) > 0 
-             THEN ROUND(SUM(costo)::numeric / SUM(conversiones))
+        CASE WHEN SUM(conversions) > 0 
+             THEN ROUND(SUM(cost_clp)::numeric / SUM(conversions))
              ELSE NULL END AS costo_por_conv,
-        MAX(actualizada_en) AS actualizado
+        MAX(imported_at) AS actualizado
       FROM ads_kpis
-      WHERE fecha_hasta >= $1::date AND fecha_desde <= $2::date
-      GROUP BY plataforma, campania_nombre, campania_id, estado
+      WHERE date_range_end >= $1::date AND date_range_start <= $2::date
+      GROUP BY platform, campaign_name, campaign_status
       ORDER BY inversion DESC
     `;
     const adsCampanias = await pool.query(adsCampaniasQ, [desde, hasta]);
@@ -4343,7 +4343,7 @@ app.get("/api/marketing/roi", async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.36 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.37 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
