@@ -1,9 +1,10 @@
 // ============================================
-// REDVITAL BACKEND v5.41 - Endpoint diario
+// REDVITAL BACKEND v5.42 - Bot con secretaría + anti-fechas-al-aire
 // Bot WhatsApp + Claude + Reservo Agendamiento
 // + Twilio WhatsApp Sandbox (paralelo a Meta)
 // + Optimizaciones rate limit Tier 1 (v5.32)
 // + Endpoint diagnóstico de suspensiones (v5.41)
+// + v5.42: Handoff secretaría + anti-fechas inventadas
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -186,13 +187,8 @@ async function inicializarBD() {
     `);
 
     await pool.query(`
-      -- v5.41: tabla ads_kpis ya creada por el importador CSV con esquema en inglés
-      -- Se mantiene este CREATE IF NOT EXISTS por compatibilidad pero NO crea nada nuevo
       CREATE TABLE IF NOT EXISTS ads_kpis_legacy_disabled (id INT)
     `);
-    // (índices ya creados por importador CSV con nombres en inglés - ver línea ~1885)
-    
-    
 
     console.log("Indices, tabla webhooks_raw, columnas uuid, campanias_marketing y ads_kpis verificados correctamente");
   } catch (err) {
@@ -1427,67 +1423,17 @@ app.get("/api/ads-kpis", async (req, res) => {
 });
 
 app.post("/api/ads-kpis", async (req, res) => {
-  // v5.41: deshabilitado - usar importador CSV en /api/ads/import
   return res.status(410).json({ 
     ok: false, 
     error: "Endpoint legacy deshabilitado. Usar el importador CSV en la sección Marketing > Performance de Ads" 
   });
-  try {
-    const k = req.body || {};
-    if (!k.plataforma || !k.campania_nombre || !k.fecha_desde || !k.fecha_hasta)
-      return res.status(400).json({ ok: false, error: "Faltan: plataforma, campania_nombre, fecha_desde, fecha_hasta" });
-    const clicks = Number(k.clicks) || 0;
-    const impresiones = Number(k.impresiones) || 0;
-    const costo = Number(k.costo) || 0;
-    const conversiones = Number(k.conversiones) || 0;
-    const ctr = impresiones > 0 ? +(100 * clicks / impresiones).toFixed(2) : 0;
-    const cpc = clicks > 0 ? +(costo / clicks).toFixed(2) : 0;
-    const costoConv = conversiones > 0 ? +(costo / conversiones).toFixed(2) : null;
-    const tasaConv = clicks > 0 ? +(100 * conversiones / clicks).toFixed(2) : 0;
-    const { rows } = await pool.query(
-      `INSERT INTO ads_kpis (plataforma, campania_nombre, campania_id, estado,
-        fecha_desde, fecha_hasta, impresiones, clicks, ctr_pct, cpc_promedio, costo, conversiones,
-        costo_conversion, tasa_conversion_pct, presupuesto_diario, comentario)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
-      [k.plataforma, k.campania_nombre, k.campania_id || null, k.estado || 'activa',
-       k.fecha_desde, k.fecha_hasta, impresiones, clicks, k.ctr_pct || ctr,
-       k.cpc_promedio || cpc, costo, conversiones,
-       k.costo_conversion || costoConv, k.tasa_conversion_pct || tasaConv,
-       k.presupuesto_diario || null, k.comentario || null]);
-    res.json({ ok: true, data: rows[0] });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
 app.put("/api/ads-kpis/:id", async (req, res) => {
-  // v5.41: deshabilitado - usar importador CSV
   return res.status(410).json({ 
     ok: false, 
     error: "Endpoint legacy deshabilitado. Usar el importador CSV" 
   });
-  try {
-    const k = req.body || {};
-    const clicks = Number(k.clicks) || 0;
-    const impresiones = Number(k.impresiones) || 0;
-    const costo = Number(k.costo) || 0;
-    const conversiones = Number(k.conversiones) || 0;
-    const ctr = impresiones > 0 ? +(100 * clicks / impresiones).toFixed(2) : 0;
-    const cpc = clicks > 0 ? +(costo / clicks).toFixed(2) : 0;
-    const costoConv = conversiones > 0 ? +(costo / conversiones).toFixed(2) : null;
-    const tasaConv = clicks > 0 ? +(100 * conversiones / clicks).toFixed(2) : 0;
-    const { rows } = await pool.query(
-      `UPDATE ads_kpis SET plataforma=$1, campania_nombre=$2, campania_id=$3, estado=$4,
-         fecha_desde=$5, fecha_hasta=$6, impresiones=$7, clicks=$8, ctr_pct=$9,
-         cpc_promedio=$10, costo=$11, conversiones=$12, costo_conversion=$13, tasa_conversion_pct=$14,
-         presupuesto_diario=$15, comentario=$16, actualizada_en=NOW()
-       WHERE id=$17 RETURNING *`,
-      [k.plataforma, k.campania_nombre, k.campania_id || null, k.estado || 'activa',
-       k.fecha_desde, k.fecha_hasta, impresiones, clicks, k.ctr_pct || ctr,
-       k.cpc_promedio || cpc, costo, conversiones,
-       k.costo_conversion || costoConv, k.tasa_conversion_pct || tasaConv,
-       k.presupuesto_diario || null, k.comentario || null, req.params.id]);
-    if (rows.length === 0) return res.status(404).json({ ok: false, error: "No encontrado" });
-    res.json({ ok: true, data: rows[0] });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
 app.delete("/api/ads-kpis/:id", async (req, res) => {
@@ -1661,7 +1607,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.41",
+    ok: true, servidor: "Redvital Backend v5.42",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1826,7 +1772,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.41 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional",
+    servidor: "Redvital Backend v5.42 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional + Secretaría",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard"],
@@ -2105,8 +2051,6 @@ async function inicializarBotBD() {
       )`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_log_iniciado ON bot_sync_log(iniciado_en DESC)`);
 
-    // NUEVO en v5.41: tabla de mapeo profesional -> especialidad/grupo clínico
-    // (debe poblarse via SQL externo "cargar_especialidades.sql" la primera vez)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_profesional_especialidad (
         nombre_normalizado TEXT PRIMARY KEY,
@@ -2364,12 +2308,9 @@ async function enviarMensajeWhatsApp(provider, to, texto) {
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_MODEL = 'claude-sonnet-4-5';
 
-// v5.41: Reintento automático en rate_limit (429) con backoff exponencial
-// Esto evita que el paciente vea "tuve un problema técnico" cuando hay congestión.
 async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
   if (!CLAUDE_API_KEY) { console.warn('[claude] CLAUDE_API_KEY no configurada'); return { error: 'CLAUDE_API_KEY no configurada' }; }
   try {
-    // v5.41: max_tokens 1024 → 600 (suficiente para respuestas de WhatsApp, ahorra cuota)
     const body = { model: CLAUDE_MODEL, max_tokens: 600, messages: messages };
     if (systemPrompt) body.system = systemPrompt;
     if (tools && tools.length > 0) body.tools = tools;
@@ -2377,11 +2318,9 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
       headers: { 'x-api-key': CLAUDE_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       timeout: 60000, validateStatus: () => true });
 
-    // v5.41: si es rate limit (429), esperar y reintentar hasta 3 veces
     if (r.status === 429 && intento <= 3) {
-      // Intentar respetar header retry-after si viene; si no, backoff exponencial
       const retryAfterSec = parseInt(r.headers && r.headers['retry-after']) || (15 * intento);
-      const espera = Math.min(retryAfterSec * 1000, 45000); // máx 45 segundos
+      const espera = Math.min(retryAfterSec * 1000, 45000);
       console.warn(`[claude] 429 rate limit. Esperando ${espera/1000}s y reintentando (intento ${intento}/3)...`);
       await new Promise(resolve => setTimeout(resolve, espera));
       return claudeMessage(messages, systemPrompt, tools, intento + 1);
@@ -2396,7 +2335,6 @@ async function claudeMessage(messages, systemPrompt, tools, intento = 1) {
 // HELPERS v5.41: Lookup de especialidades por profesional
 // ============================================
 
-// Lee bot_profesional_especialidad para un nombre normalizado
 async function obtenerEspecialidadDeProfesional(nombreNormalizado) {
   try {
     const { rows } = await pool.query(
@@ -2409,7 +2347,6 @@ async function obtenerEspecialidadDeProfesional(nombreNormalizado) {
   } catch (err) { return null; }
 }
 
-// Lista profesionales activos para un grupo_clinico, cruzando con bot_catalogo_profesionales
 async function obtenerProfesionalesPorGrupo(grupoClinico) {
   try {
     const { rows } = await pool.query(
@@ -2434,26 +2371,21 @@ async function obtenerProfesionalesPorGrupo(grupoClinico) {
   }
 }
 
-// Devuelve un wording correcto: "médica general con formación en cardiología"
-// o "el cardiólogo Dr. X" según si tiene subespecialidad_formacion o no
 function getWordingProfesional(profEsp, opciones = {}) {
-  const formato = opciones.formato || 'completo'; // 'completo' o 'corto'
+  const formato = opciones.formato || 'completo';
   if (!profEsp) return '';
   const nombre = profEsp.nombre_display;
   const esp = (profEsp.especialidad_oficial || '').toLowerCase();
   const sub = profEsp.subespecialidad_formacion;
 
-  // Si tiene subespecialidad (no revalidada), usar wording "con formación en X"
   if (sub) {
     const articulo = esp.includes('médica') || esp.includes('cirujana') ? 'la' : 'el';
     if (formato === 'corto') return `${nombre} (con formación en ${sub})`;
     return `${nombre}, ${esp.includes('médica') ? 'médica' : 'médico'} general con formación en ${sub}`;
   }
-  // Si tiene especialidad oficial revalidada
   return `${nombre} (${profEsp.especialidad_oficial})`;
 }
 
-// Detecta tipos de servicios especiales (Doppler, Laboratorio, Ecocardio)
 function detectarServicioEspecial(query) {
   const q = (query || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   return {
@@ -2465,7 +2397,7 @@ function detectarServicioEspecial(query) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT (v5.41: Function Calling + Elección Profesional)
+// ORQUESTADOR DEL BOT (v5.42: Function Calling + Elección Profesional + Secretaría)
 // ============================================
 const BOT_TOOLS = [
   {
@@ -2536,7 +2468,6 @@ async function ejecutarTool(nombre, input) {
           duracion: t.duracion, categoria: t.categoria,
           sedes: t.sedes, agendas_disponibles: t.agendas
         }));
-        // Derivaciones especiales (Doppler, Laboratorio): devolver flag para que system prompt actúe
         if (flags.es_doppler) {
           return { ok: true, total: simple.length, tratamientos: simple,
             derivar_secretaria: true, motivo: "Doppler — agenda especial, secretaría coordina",
@@ -2599,7 +2530,6 @@ async function ejecutarTool(nombre, input) {
           const fecha = dia.fecha;
           for (const suc of (dia.sucursales || [])) {
             for (const prof of (suc.profesionales || [])) {
-              // v5.41: si vino uuid_profesional, filtrar
               if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
               for (const horaISO of (prof.horas_disponibles || [])) {
                 horariosAplanados.push({
@@ -2615,8 +2545,8 @@ async function ejecutarTool(nombre, input) {
           }
         }
       }
-      // v5.41: reducir 12→6 horarios y simplificar campos para bajar tokens
-      const limitados = horariosAplanados.slice(0, 6).map(h => ({
+      // v5.42: aumentar 6→12 horarios para mostrar TODOS los días del rango consultado
+      const limitados = horariosAplanados.slice(0, 12).map(h => ({
         fecha: h.fecha, hora: h.hora,
         hora_con_segundos: h.hora_con_segundos,
         time_zone: h.time_zone,
@@ -2625,12 +2555,20 @@ async function ejecutarTool(nombre, input) {
         sucursal_uuid: h.sucursal_uuid,
         sucursal_nombre: h.sucursal_nombre
       }));
+      // v5.42: agrupar por fecha para que el bot pueda mostrar TODOS los días disponibles
+      const dias_disponibles = {};
+      for (const h of limitados) {
+        if (!dias_disponibles[h.fecha]) dias_disponibles[h.fecha] = [];
+        dias_disponibles[h.fecha].push({ hora: h.hora, profesional: h.profesional_nombre });
+      }
       return {
         ok: true, sede: agenda.sede, total_horarios: horariosAplanados.length,
-        horarios: limitados, filtrado_por_profesional: input.uuid_profesional || null,
+        horarios: limitados,
+        dias_disponibles: dias_disponibles,
+        filtrado_por_profesional: input.uuid_profesional || null,
         nota: horariosAplanados.length === 0
           ? "Sin horarios para esta fecha. Pedile al paciente otra fecha (puede que el profesional no atienda ese día)."
-          : undefined
+          : `Hay ${Object.keys(dias_disponibles).length} días con cupos. Mostrale TODOS al paciente.`
       };
     }
 
@@ -2714,8 +2652,11 @@ async function ejecutarTool(nombre, input) {
 }
 
 
-// === SYSTEM PROMPT DINÁMICO v5.41 ===
-// === SYSTEM PROMPT DINÁMICO v5.41 (COMPRIMIDO ~60% para Tier 1) ===
+// === SYSTEM PROMPT DINÁMICO v5.42 ===
+// Cambios v5.42:
+//  1. Anti-fechas-al-aire: NUNCA ofrecer días específicos sin consultar Reservo PRIMERO
+//  2. Mostrar TODOS los días disponibles del rango consultado de una vez
+//  3. Handoff a secretaría WhatsApp en 3 momentos: confirmación reserva, precios/políticas, cancelar/reagendar
 async function construirSystemPrompt() {
   const ahora = new Date();
   const ahoraCL = new Date(ahora.getTime() - 4 * 3600000);
@@ -2738,30 +2679,63 @@ Próximos días: ${proximosDias.join(' / ')}
 
 SEDES: Victoria 766 (principal, 6 boxes), Maturana 293 (endo/colono). L-V 8-20, Sáb 9-13, Dom cerrado.
 
+📞 SECRETARÍA: ${WHATSAPP_SECRETARIAS}
+
 ═════ REGLAS GENERALES ═════
 1. UNA cita por conversación. Después preguntás "¿Algo más?".
 2. NO recomendás ni sugerís otros exámenes. Si pide cardio, solo cardio.
-3. NO das precios → "Valor según previsión, secretaría confirma al llegar".
-4. NUNCA inventés info ni UUIDs. Solo de tools. Si tool falla, "Tuvimos un problema, llamá al centro".
-5. Cancelar/reagendar → "Llamá al centro".
+3. **PRECIOS / VALORES / FORMA DE PAGO**: NUNCA inventes valores. Si pregunta precio, copago, descuentos, convenios o formas de pago → derivá: "Para valores exactos y formas de pago contactá a nuestra secretaría: ${WHATSAPP_SECRETARIAS}".
+4. NUNCA inventés info ni UUIDs. Solo de tools. Si tool falla, derivá a secretaría: "Tuve un problema, escribíle a la secretaría: ${WHATSAPP_SECRETARIAS}".
+5. **CANCELAR / REAGENDAR**: si paciente quiere cancelar o reagendar una cita existente → derivá SIEMPRE: "Para cancelar o reagendar coordiná con la secretaría: ${WHATSAPP_SECRETARIAS}".
 6. MANTENÉ contexto. NO vuelvas a llamar buscar_tratamientos si ya tenés uuid_tratamiento.
 7. Si consultar_disponibilidad devuelve total_horarios:0 → decile al paciente que ese día no hay y pedile otro día. NO insistas con la misma fecha.
+
+═════ REGLAS CRÍTICAS v5.42 ═════
+
+🚨 REGLA 8 (ANTI-FECHAS-AL-AIRE):
+NUNCA ofrezcas días específicos sin haber llamado consultar_disponibilidad ANTES.
+Está PROHIBIDO decir frases como "tengo lunes 2 a las 10" sin que esos datos vengan de una tool call real.
+Si el paciente te pregunta "qué días tienen disponible esta semana" → llamá consultar_disponibilidad con fecha = lunes próximo y MIRÁ el resultado antes de responder.
+Si no llamaste a la tool, NO ofrezcas fechas. Decile "Dame un segundo que consulto la agenda" y llamá la tool YA.
+
+🚨 REGLA 9 (MOSTRAR TODOS LOS DÍAS):
+Cuando consultar_disponibilidad devuelva resultados, el campo dias_disponibles contiene un objeto con TODOS los días del rango consultado y sus horarios reales.
+Cuando le respondas al paciente, mostrale TODOS esos días, no solo uno.
+Formato sugerido: 
+"Esta semana tengo disponibles:
+- Lunes 2: 10:00, 11:30, 16:00
+- Martes 3: 09:00, 15:00
+- Jueves 5: 11:00, 17:30
+¿Cuál te queda?"
+Listá TODOS los días que vinieron en dias_disponibles. No filtrés ni ocultes.
+
+🚨 REGLA 10 (INFO QUE NO MANEJÁS → SECRETARÍA):
+Si el paciente pregunta sobre:
+- Precios exactos, copagos, descuentos
+- Convenios con isapres / FONASA / bonificación
+- Formas de pago (cuotas, tarjetas, transferencia)
+- Políticas (parking, accesibilidad, mascotas, niños)
+- Urgencias / atención inmediata
+- Reembolsos, certificados, licencias, exámenes preoperatorios complejos
+- Doppler, laboratorio (sangre), atenciones domiciliarias
+→ Derivá SIEMPRE: "Esa info la maneja directo nuestra secretaría. Escribíle a ${WHATSAPP_SECRETARIAS}, te van a atender al toque."
+NUNCA inventés respuesta. Si no estás 100% seguro, derivá.
 
 ═════ FLUJOS POR TIPO ═════
 
 🔵 MEDICINA GENERAL ("medicina general", "médico", "consulta general"):
 - buscar_tratamientos("medicina general")
 - NO listés profesionales. Preguntá día directo.
-- consultar_disponibilidad SIN uuid_profesional → muestra horarios con nombre del médico al lado: "10:00 con Dra. X, 11:30 con Dr. Y..."
-- Paciente elige hora → avanzá a RUT.
+- consultar_disponibilidad SIN uuid_profesional → muestra TODOS los días disponibles (ver regla 9).
+- Paciente elige día y hora → avanzá a RUT.
 
 🟢 ESPECIALIDADES (cardio, gastro, trauma, neuro, gineco, broncopulmonar, dermato, otorrino, geriatria, pediatria, kine, nutricion, matrona, psiquiatría):
 - buscar_tratamientos(...) para confirmar tratamiento.
 - listar_profesionales_por_especialidad(grupo_clinico) → trae profesionales reales.
-- Si 1 solo: "Tu opción es [wording_completo]. ¿Para qué día?" y avanzá.
-- Si 2+: "Tengo a [Dr.X wording] y [Dr.Y wording]. ¿Con cuál?" — USÁ el campo wording_completo del resultado, no inventes.
-- Cuando elija: consultar_disponibilidad con uuid_profesional del elegido.
-- Horarios → RUT → crear_reserva.
+- Si 1 solo: "Tu opción es [wording_completo]. ¿Para qué día querés?" y avanzá.
+- Si 2+: "Tengo a [Dr.X wording] y [Dr.Y wording]. ¿Con cuál?" — USÁ el campo wording_completo del resultado.
+- Cuando elija: consultar_disponibilidad con uuid_profesional del elegido → mostrá TODOS los días disponibles (regla 9).
+- RUT → crear_reserva.
 
 🟣 SALUD MENTAL (delicado, 3 grupos):
 - "psicólogo" → listar_profesionales_por_especialidad("psicologia") (no recetan).
@@ -2773,7 +2747,7 @@ SEDES: Victoria 766 (principal, 6 boxes), Maturana 293 (endo/colono). L-V 8-20, 
 🟡 EXÁMENES SIN PROFESIONAL (RX, eco no-doppler, ECG, Holter, espirometría, audiometría, endoscopía, colonoscopía):
 - buscar_tratamientos devuelve es_examen:true.
 - NO listés profesional, NO preguntés con quién.
-- Preguntá fecha directo → consultar_disponibilidad → mostrá horarios.
+- consultar_disponibilidad → mostrá TODOS los días (regla 9).
 - Endoscopía/Colonoscopía → sede Maturana. Resto → Victoria.
 
 🟠 ECOCARDIOGRAMA (lo hacen cardiólogos):
@@ -2794,11 +2768,14 @@ SEDES: Victoria 766 (principal, 6 boxes), Maturana 293 (endo/colono). L-V 8-20, 
 2. verificar_paciente_rut:
    - existe:true → guardás uuid_paciente, vas a paso 3.
    - existe:false → "Como es tu primera vez necesito nombre completo, email y teléfono."
-   - lista_negra:true → "Necesitás llamar directo al centro." STOP.
+   - lista_negra:true → "Para coordinar esta cita escribíle directo a la secretaría: ${WHATSAPP_SECRETARIAS}". STOP.
 3. crear_reserva con TODO (uuid_agenda, uuid_tratamiento, uuid_profesional, sucursal_uuid, fecha, hora_con_segundos, time_zone) + datos paciente.
-   - ok:true → confirmá.
-   - error_validacion → "Uy, justo se ocupó. Veamos otras horas." → consultar_disponibilidad de nuevo.
-4. Confirmá: "✅ Listo: [tratamiento] el [día fecha] a las [hora] con [profesional] en [sede], [dirección]. Te esperamos."
+   - ok:true → confirmá (paso 4).
+   - error_validacion → "Uy, justo se ocupó. Veamos otras horas." → consultar_disponibilidad de nuevo y mostrá TODOS los días.
+4. ✅ CONFIRMACIÓN (formato exacto):
+"✅ Listo: [tratamiento] el [día fecha] a las [hora] con [profesional] en [sede], [dirección]. Te esperamos.
+
+📞 Para cualquier duda o atención más personalizada, escribíle a nuestra secretaría: ${WHATSAPP_SECRETARIAS}"
 5. "¿Necesitás algo más?"
 
 ═════ DATOS PACIENTE ═════
@@ -2808,9 +2785,9 @@ SEDES: Victoria 766 (principal, 6 boxes), Maturana 293 (endo/colono). L-V 8-20, 
 ═════ ESTILO ═════
 - Chileno cercano, tuteo. Cálido pero EFICIENTE.
 - Mensajes CORTOS (1-3 oraciones). Saludo solo al inicio: "¡Hola! Soy el asistente de Redvital 👋 ¿En qué te ayudo?"
-- Emojis: 👋 saludo, ✅ confirmar.
+- Emojis: 👋 saludo, ✅ confirmar, 📞 secretaría.
 - Wording: subespecialidad → usar wording_completo ("médica general con formación en X"). Revalidados (Jorge López/Traumatólogo, Cristián Arellano/Pediatra, Myriam Vicencio/Pediatra) → título directo.
-- Emergencia → "Si es emergencia, llamá al 131 o andá a urgencia."`;
+- Emergencia → "Si es emergencia, llamá al 131 o andá a urgencia. Para coordinación rápida también podés escribirle a la secretaría: ${WHATSAPP_SECRETARIAS}"`;
 }
 
 
@@ -2827,7 +2804,6 @@ async function obtenerSesion(wa_id) {
 
 async function guardarSesion(wa_id, mensajes) {
   try {
-    // v5.41: reducir historial de 30 → 8 para bajar consumo de tokens
     let recortado = mensajes;
     if (mensajes.length > 8) {
       recortado = mensajes.slice(mensajes.length - 8);
@@ -2914,7 +2890,7 @@ async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
     const respuesta = await claudeMessage(messages, system, BOT_TOOLS);
     if (respuesta.error) {
       return { ok: false, error: respuesta.error, tools_log: toolsLog,
-        texto: 'Disculpá, tuve un problema técnico. ¿Podés intentar de nuevo? Si urgente, llamá al centro.' };
+        texto: `Disculpá, tuve un problema técnico. Para coordinación rápida escribíle a la secretaría: ${WHATSAPP_SECRETARIAS}` };
     }
     const stopReason = respuesta.stop_reason;
     const content = respuesta.content || [];
@@ -2959,7 +2935,7 @@ async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
       iteraciones: iter + 1, stop_reason: stopReason };
   }
   if (waId) await guardarSesion(waId, messages);
-  return { ok: false, texto: 'Disculpá, esta consulta se está complicando. ¿Querés llamar al centro?',
+  return { ok: false, texto: `Disculpá, esta consulta se está complicando. Para coordinación más rápida escribíle a la secretaría: ${WHATSAPP_SECRETARIAS}`,
     tools_log: toolsLog, error: 'max_iteraciones' };
 }
 
@@ -3050,7 +3026,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // === WEBHOOK TWILIO WHATSAPP SANDBOX ===
 app.get('/webhook/twilio', (req, res) => {
-  res.status(200).send('Twilio webhook OK - Redvital bot v5.41');
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.42');
 });
 
 app.post('/webhook/twilio', async (req, res) => {
@@ -3477,7 +3453,6 @@ app.get('/api/bot/catalogo/categorias', async (req, res) => {
   } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// === NUEVO v5.41: /api/bot/especialidades ===
 app.get('/api/bot/especialidades', async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -3498,20 +3473,10 @@ app.get('/api/bot/especialidades', async (req, res) => {
 // ============================================================
 // ENDPOINT: GET /api/suspensiones/diagnostico (v5.41)
 // ============================================================
-// Análisis completo de citas perdidas: Suspendió + Eliminado + No llegó
-// Cruza tabla `citas` con `ventas` para ingresos reales y plata perdida.
-//
-// Query params:
-//   desde   YYYY-MM-DD (default: primer día mes Redvital actual = 26 mes pasado)
-//   hasta   YYYY-MM-DD (default: hoy)
-//   sucursal "Centro Médico Redvital" | "Redvital Sede Maturana" | null (todas)
-// ============================================================
-
 app.get("/api/suspensiones/diagnostico", async (req, res) => {
   try {
     const { desde, hasta, sucursal } = req.query;
 
-    // Defaults: mes Redvital actual (26 mes pasado → 25 mes actual)
     const hoy = new Date();
     const dia26pasado = new Date(hoy.getFullYear(), hoy.getMonth() - (hoy.getDate() < 26 ? 1 : 0), 26);
     const fechaDesde = desde || dia26pasado.toISOString().slice(0,10);
@@ -3525,33 +3490,11 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       whereSucursal = ` AND sucursal = $3`;
     }
 
-    // Estado: clasificación canónica
-    // PERDIDA_GRAVE = Suspendió + Eliminado (lo que tu app llama "suspensiones": 454)
-    // NO_SHOW = No llegó (no avisó)
-    // ATENDIDA = Atendido + Llegó
-    // FUTURA = Confirmado + No Confirmado + Lista de Espera
-    const ESTADOS_PERDIDA_GRAVE = ['Suspendió', 'Eliminado'];
-    const ESTADOS_NO_SHOW = ['No llegó'];
-    const ESTADOS_ATENDIDA = ['Atendido', 'Llegó'];
-
-    // ====================================================
-    // QUERY 1: RESUMEN GENERAL
-    // ====================================================
     const resumenQ = `
       WITH base AS (
         SELECT estado_cita, profesional, tratamiento
         FROM citas
         WHERE fecha BETWEEN $1 AND $2 ${whereSucursal}
-      ),
-      tickets AS (
-        SELECT profesional,
-               COALESCE(AVG(v.valor_pagado)::int, 28000) AS ticket_prom
-        FROM citas c
-        LEFT JOIN ventas v ON v.id_venta = c.venta_id
-        WHERE c.fecha BETWEEN $1 AND $2 ${whereSucursal}
-          AND c.estado_cita IN ('Atendido', 'Llegó')
-          AND v.valor_pagado IS NOT NULL
-        GROUP BY profesional
       ),
       ticket_global AS (
         SELECT COALESCE(AVG(v.valor_pagado)::int, 28000) AS prom
@@ -3574,9 +3517,6 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       FROM base;
     `;
 
-    // ====================================================
-    // QUERY 2: POR DÍA DE LA SEMANA (3 estados separados)
-    // ====================================================
     const porDiaQ = `
       SELECT
         EXTRACT(DOW FROM fecha)::int AS dow,
@@ -3593,9 +3533,6 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       ORDER BY dow;
     `;
 
-    // ====================================================
-    // QUERY 3: POR HORA DEL DÍA
-    // ====================================================
     const porHoraQ = `
       SELECT
         EXTRACT(HOUR FROM hora_inicio)::int AS hora,
@@ -3612,9 +3549,6 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       ORDER BY hora;
     `;
 
-    // ====================================================
-    // QUERY 4: POR PROFESIONAL (con plata perdida real)
-    // ====================================================
     const porProfQ = `
       WITH ticket_prof AS (
         SELECT c.profesional,
@@ -3657,9 +3591,6 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       LIMIT 30;
     `;
 
-    // ====================================================
-    // QUERY 5: POR ESPECIALIDAD / TRATAMIENTO
-    // ====================================================
     const porTratQ = `
       WITH ticket_trat AS (
         SELECT c.tratamiento,
@@ -3693,9 +3624,6 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       LIMIT 25;
     `;
 
-    // ====================================================
-    // QUERY 6: POR CANAL (online vs mostrador vs Reservo online)
-    // ====================================================
     const porCanalQ = `
       SELECT
         CASE
@@ -3721,9 +3649,6 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       ORDER BY perdidas DESC;
     `;
 
-    // ====================================================
-    // QUERY 7: POR PREVISIÓN (FONASA / Isapre / Particular)
-    // ====================================================
     const porPrevQ = `
       SELECT
         COALESCE(NULLIF(TRIM(prevision),''), 'Sin especificar') AS prevision,
@@ -3740,9 +3665,6 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       ORDER BY perdidas DESC;
     `;
 
-    // ====================================================
-    // QUERY 8: POR PERFIL PACIENTE (edad + sexo)
-    // ====================================================
     const porPerfilQ = `
       SELECT
         CASE
@@ -3766,9 +3688,6 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       ORDER BY rango_edad, sexo;
     `;
 
-    // ====================================================
-    // QUERY 9: TOP PACIENTES "TÓXICOS" + RECUPERABLES
-    // ====================================================
     const topToxicosQ = `
       SELECT
         c.paciente,
@@ -3789,7 +3708,6 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       LIMIT 50;
     `;
 
-    // Recuperables: suspendieron 1 vez, antes tenían historial bueno o son recientes
     const recuperablesQ = `
       WITH historico_paciente AS (
         SELECT
@@ -3825,7 +3743,6 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
       LIMIT 200;
     `;
 
-    // Ejecutar todas en paralelo
     const [resumen, porDia, porHora, porProf, porTrat, porCanal, porPrev, porPerfil, toxicos, recuperables] = await Promise.all([
       pool.query(resumenQ, params),
       pool.query(porDiaQ, params),
@@ -3880,26 +3797,14 @@ app.get("/api/suspensiones/diagnostico", async (req, res) => {
 // ============================================================
 // ENDPOINT: GET /api/diario (v5.41)
 // ============================================================
-// Comparativa de hoy vs ayer:
-//   - Agendadas + Atendidas
-//   - Por 8 categorías: Consultas, RX, Ecografía, Laboratorio, Endoscopía, Holter, ECG, Otros
-//   - Plata bruta facturada del día (de tabla ventas)
-//
-// Query params:
-//   hoy   YYYY-MM-DD (default: hoy del servidor)
-//   ayer  YYYY-MM-DD (default: ayer del servidor)
-// ============================================================
-
 app.get("/api/diario", async (req, res) => {
   try {
-    // Calcular fechas default
     const ahora = new Date();
     const fechaHoy = req.query.hoy || ahora.toISOString().slice(0,10);
     const ayer = new Date(ahora);
     ayer.setDate(ayer.getDate() - 1);
     const fechaAyer = req.query.ayer || ayer.toISOString().slice(0,10);
 
-    // Regex de cada categoría (case insensitive, busca en tratamiento O profesional)
     const CATS = [
       { id: 'consultas',   nombre: 'Consultas',    regex: '^CONSULTA |CONSULTA MEDIC|CONSULTA ' },
       { id: 'rx',          nombre: 'Rayos X',      regex: 'RADIOGRAF|RX |RAYOS X|RAYOS-X' },
@@ -3910,10 +3815,7 @@ app.get("/api/diario", async (req, res) => {
       { id: 'ecg',         nombre: 'ECG',          regex: 'ELECTROCARDIO|EKG| ECG' }
     ];
 
-    // Query: cuenta citas por estado y categoría para un día específico
-    // Devuelve: { dia, agendadas_total, atendidas_total, plata_bruta, por_categoria: [...] }
     async function statsDia(fecha) {
-      // Resumen del día
       const resumenQ = `
         SELECT
           COUNT(*)::int AS agendadas,
@@ -3923,7 +3825,6 @@ app.get("/api/diario", async (req, res) => {
       `;
       const resumen = (await pool.query(resumenQ, [fecha])).rows[0];
 
-      // Plata bruta del día (de tabla ventas)
       const plataQ = `
         SELECT COALESCE(SUM(valor_pagado), 0)::bigint AS bruto
         FROM ventas
@@ -3931,15 +3832,12 @@ app.get("/api/diario", async (req, res) => {
       `;
       const plata = (await pool.query(plataQ, [fecha])).rows[0];
 
-      // Categorías: contar agendadas + atendidas en citas, y plata bruta de ventas, por cada categoría
       const porCategoria = [];
       let totalClasificadas = 0;
 
       for (const cat of CATS) {
-        // Construir condición regex
         const cond = cat.regex;
         
-        // Citas (agendadas y atendidas) que matchean
         const citasQ = `
           SELECT
             COUNT(*)::int AS agendadas,
@@ -3950,7 +3848,6 @@ app.get("/api/diario", async (req, res) => {
         `;
         const c = (await pool.query(citasQ, [fecha, cond])).rows[0];
 
-        // Plata bruta de esa categoría
         const plataCatQ = `
           SELECT COALESCE(SUM(valor_pagado), 0)::bigint AS bruto
           FROM ventas
@@ -3969,9 +3866,7 @@ app.get("/api/diario", async (req, res) => {
         totalClasificadas += c.agendadas;
       }
 
-      // "Otros" = lo que no cayó en ninguna categoría
       const otrosAgendadas = Math.max(0, resumen.agendadas - totalClasificadas);
-      // Para "atendidas" y "bruto" de otros, restamos lo clasificado del total
       const totalAtendidasClasif = porCategoria.reduce((s, c) => s + c.atendidas, 0);
       const totalBrutoClasif = porCategoria.reduce((s, c) => s + c.bruto, 0);
       
@@ -3997,13 +3892,11 @@ app.get("/api/diario", async (req, res) => {
       statsDia(fechaAyer)
     ]);
 
-    // Calcular variaciones
     const variacion = (hoy, ayer) => {
       if (ayer === 0) return hoy > 0 ? 100 : 0;
       return Math.round((hoy - ayer) / ayer * 100);
     };
 
-    // Combinar categorías hoy + ayer
     const categoriasComparadas = statsHoy.por_categoria.map(catH => {
       const catA = statsAyer.por_categoria.find(c => c.id === catH.id) || { agendadas: 0, atendidas: 0, bruto: 0 };
       return {
@@ -4025,7 +3918,6 @@ app.get("/api/diario", async (req, res) => {
       };
     });
 
-    // Ordenar por plata bruta de hoy (la más rentable arriba)
     categoriasComparadas.sort((a, b) => b.hoy.bruto - a.hoy.bruto);
 
     res.json({
@@ -4059,18 +3951,6 @@ app.get("/api/diario", async (req, res) => {
 // ============================================================
 // ENDPOINT: GET /api/marketing/roi (v5.41)
 // ============================================================
-// ROI Marketing real con atribución profesional:
-// - Cruza ads_kpis (inversión, clicks, conversiones reportadas) con
-//   citas y ventas reales para calcular ROI por campaña.
-// - Ventana de atribución 30 días (clic puede convertir en hasta 30 días)
-// - Cuenta pacientes "online" + "nuevos del periodo" como atribución amplia
-// - Devuelve bruto y neto para que el usuario decida
-//
-// Query params:
-//   desde  YYYY-MM-DD (default: 26 mes pasado)
-//   hasta  YYYY-MM-DD (default: 25 mes actual)
-// ============================================================
-
 app.get("/api/marketing/roi", async (req, res) => {
   try {
     const hoy = new Date();
@@ -4091,9 +3971,6 @@ app.get("/api/marketing/roi", async (req, res) => {
     const desde = req.query.desde || defDesde.toISOString().slice(0,10);
     const hasta = req.query.hasta || defHasta.toISOString().slice(0,10);
 
-    // ============================================
-    // 1) DATOS DE ADS (resumen e individuales)
-    // ============================================
     const adsResumenQ = `
       SELECT
         platform AS plataforma,
@@ -4132,15 +4009,6 @@ app.get("/api/marketing/roi", async (req, res) => {
     `;
     const adsCampanias = await pool.query(adsCampaniasQ, [desde, hasta]);
 
-    // ============================================
-    // 2) PACIENTES ATRIBUIBLES A ADS
-    // ============================================
-    // Atribución profesional:
-    // - Atribución directa: pacientes con origen "Online" / "Reserva Online" 
-    // - Atribución asistida: pacientes nuevos (1ra cita) en mostrador/teléfono
-    //   en periodo, descontando una proporción "orgánica" estimada
-    
-    // 2a) Pacientes "online" del periodo (atribución directa)
     const onlineQ = `
       SELECT 
         COUNT(DISTINCT COALESCE(NULLIF(c.rut, ''), c.id_paciente::text)) FILTER (WHERE c.id_paciente IS NOT NULL)::int AS pacientes_unicos,
@@ -4156,7 +4024,6 @@ app.get("/api/marketing/roi", async (req, res) => {
     `;
     const onlineStats = (await pool.query(onlineQ, [desde, hasta])).rows[0];
 
-    // 2b) Pacientes NUEVOS del periodo (primera cita en BD)
     const nuevosQ = `
       WITH primera_cita AS (
         SELECT id_paciente, MIN(fecha) AS primera
@@ -4176,7 +4043,6 @@ app.get("/api/marketing/roi", async (req, res) => {
     `;
     const nuevosStats = (await pool.query(nuevosQ, [desde, hasta])).rows[0];
 
-    // 2c) Total general del periodo (para contexto)
     const totalQ = `
       SELECT 
         COUNT(DISTINCT COALESCE(NULLIF(c.rut, ''), c.id_paciente::text))::int AS pacientes_unicos,
@@ -4189,38 +4055,23 @@ app.get("/api/marketing/roi", async (req, res) => {
     `;
     const totalStats = (await pool.query(totalQ, [desde, hasta])).rows[0];
 
-    // ============================================
-    // 3) CALCULAR ATRIBUCIÓN
-    // ============================================
-    // Definición de atribución:
-    // - "Atribuibles a Ads" = pacientes online + (pacientes nuevos NO online × 0.4)
-    //   El 0.4 es un factor conservador: asumimos que ~40% de los nuevos del mostrador
-    //   vieron Ads antes (la otra mitad: boca a boca, mapas Google, etc.)
-    
     const pacientesOnline = onlineStats.pacientes_unicos || 0;
     const ingresoOnline = parseInt(onlineStats.ingreso_bruto) || 0;
     
     const pacientesNuevos = nuevosStats.pacientes_nuevos || 0;
     const ingresoNuevos = parseInt(nuevosStats.ingreso_bruto_nuevos) || 0;
     
-    // Asumimos que los "online" están incluidos en "nuevos" parcialmente
-    // Estimación: pacientes_atribuibles = online + 40% de (nuevos - online)
     const nuevosNoOnline = Math.max(0, pacientesNuevos - pacientesOnline);
     const factorAsistido = 0.4;
     const pacientesAtribuidos = pacientesOnline + Math.round(nuevosNoOnline * factorAsistido);
     
-    // Mismo para ingreso bruto
     const ingresoNuevosNoOnline = Math.max(0, ingresoNuevos - ingresoOnline);
     const ingresoAtribuido = ingresoOnline + Math.round(ingresoNuevosNoOnline * factorAsistido);
     
-    // ============================================
-    // 4) CALCULAR ROI POR PLATAFORMA
-    // ============================================
     const totalInversion = adsResumen.rows.reduce((s, r) => s + parseInt(r.inversion), 0);
     
     const plataformasConRoi = adsResumen.rows.map(r => {
       const inversion = parseInt(r.inversion) || 0;
-      // Distribuir pacientes/ingresos proporcionalmente a la inversión
       const proporcion = totalInversion > 0 ? inversion / totalInversion : 0;
       const pacientesPlat = Math.round(pacientesAtribuidos * proporcion);
       const ingresoPlat = Math.round(ingresoAtribuido * proporcion);
@@ -4231,31 +4082,20 @@ app.get("/api/marketing/roi", async (req, res) => {
         clicks: parseInt(r.clicks),
         inversion,
         conversiones_reportadas: parseFloat(r.conversiones_reportadas),
-        // Métricas estimadas
         pacientes_atribuidos: pacientesPlat,
         ingreso_bruto_atribuido: ingresoPlat,
         roi_bruto: inversion > 0 ? Math.round(ingresoPlat / inversion * 10) / 10 : 0,
-        // Comparación: lo que dice Google vs realidad
         conv_reales_vs_reportadas: r.conversiones_reportadas > 0 ? 
           Math.round(pacientesPlat / parseFloat(r.conversiones_reportadas) * 100) / 100 : null
       };
     });
     
-    // ============================================
-    // 5) CALCULAR ROI POR CAMPAÑA INDIVIDUAL
-    // ============================================
-    // v5.41: Distribuir pacientes/ingresos usando CONVERSIONES de Google como peso
-    // (en vez de inversión) — eso hace que el ROI sea distinto por campaña
-    // y refleja mejor cuál campaña tracciona pacientes reales
-    
-    // Total de conversiones reportadas por Google (peso)
     const totalConvReportadas = adsCampanias.rows.reduce((s, r) => s + (parseFloat(r.conversiones) || 0), 0);
     
     const campaniasConRoi = adsCampanias.rows.map(r => {
       const inversion = parseInt(r.inversion) || 0;
       const convCampana = parseFloat(r.conversiones) || 0;
       
-      // Peso: si hay conversiones Google, usar esa proporción; si no, usar inversión
       let proporcion;
       if (totalConvReportadas > 0 && convCampana > 0) {
         proporcion = convCampana / totalConvReportadas;
@@ -4311,9 +4151,6 @@ app.get("/api/marketing/roi", async (req, res) => {
       };
     });
     
-    // ============================================
-    // 6) RESPUESTA
-    // ============================================
     const roiBruto = totalInversion > 0 ? Math.round(ingresoAtribuido / totalInversion * 10) / 10 : 0;
     const costoRealPorPaciente = pacientesAtribuidos > 0 ? Math.round(totalInversion / pacientesAtribuidos) : 0;
     
@@ -4325,12 +4162,10 @@ app.get("/api/marketing/roi", async (req, res) => {
         clicks_totales: adsResumen.rows.reduce((s,r) => s + parseInt(r.clicks), 0),
         impresiones_totales: adsResumen.rows.reduce((s,r) => s + parseInt(r.impresiones), 0),
         conversiones_reportadas: adsResumen.rows.reduce((s,r) => s + parseFloat(r.conversiones_reportadas), 0),
-        // Realidad
         pacientes_atribuidos_a_ads: pacientesAtribuidos,
         ingreso_bruto_atribuido: ingresoAtribuido,
         roi_bruto: roiBruto,
         costo_real_por_paciente: costoRealPorPaciente,
-        // Contexto
         pacientes_online_directo: pacientesOnline,
         pacientes_nuevos_periodo: pacientesNuevos,
         pacientes_unicos_totales: totalStats.pacientes_unicos,
@@ -4354,14 +4189,6 @@ app.get("/api/marketing/roi", async (req, res) => {
 // ============================================================
 // ENDPOINT: GET /api/metas/equilibrio (v5.41)
 // ============================================================
-// Punto de equilibrio del mes Redvital actual:
-// - Facturado actual del mes
-// - Punto de equilibrio = costo_fijo / margen_redvital
-// - Días restantes
-// - Ritmo necesario para llegar
-// - Proyección a fin de mes
-// ============================================================
-
 app.get("/api/metas/equilibrio", async (req, res) => {
   try {
     const hoy = new Date();
@@ -4369,7 +4196,6 @@ app.get("/api/metas/equilibrio", async (req, res) => {
     const mm = hoy.getMonth();
     const dd = hoy.getDate();
     
-    // Calcular periodo mes Redvital actual (26 → 25)
     let inicio, fin;
     if (dd >= 26) {
       inicio = new Date(yyyy, mm, 26);
@@ -4383,15 +4209,11 @@ app.get("/api/metas/equilibrio", async (req, res) => {
     const fechaFin = fin.toISOString().slice(0, 10);
     const fechaHoy = hoy.toISOString().slice(0, 10);
     
-    // Días totales del periodo
     const diasTotales = Math.round((fin - inicio) / (1000 * 60 * 60 * 24)) + 1;
-    
-    // Días transcurridos (hasta hoy, no más allá del fin del periodo)
     const finEfectivo = hoy > fin ? fin : hoy;
     const diasTranscurridos = Math.max(1, Math.round((finEfectivo - inicio) / (1000 * 60 * 60 * 24)) + 1);
     const diasRestantes = Math.max(0, diasTotales - diasTranscurridos);
     
-    // Facturado del periodo
     const ventasQ = `
       SELECT 
         COUNT(*)::int AS total_ventas,
@@ -4403,7 +4225,6 @@ app.get("/api/metas/equilibrio", async (req, res) => {
     const facturado = parseInt(ventas.facturado) || 0;
     const totalVentas = ventas.total_ventas || 0;
     
-    // Histórico (todo lo facturado en la BD)
     const historicoQ = `
       SELECT 
         COUNT(*)::int AS total_ventas,
@@ -4414,26 +4235,16 @@ app.get("/api/metas/equilibrio", async (req, res) => {
     `;
     const historico = (await pool.query(historicoQ)).rows[0];
     
-    // Constantes
     const MARGEN_REDVITAL = 0.47;
-    const COSTO_FIJO_MENSUAL_LOCAL = COSTO_FIJO_MENSUAL; // 21.537.600
+    const COSTO_FIJO_MENSUAL_LOCAL = COSTO_FIJO_MENSUAL;
     
-    // Punto de equilibrio
     const puntoEquilibrio = Math.round(COSTO_FIJO_MENSUAL_LOCAL / MARGEN_REDVITAL);
-    
-    // Falta facturar para llegar al equilibrio
     const faltaParaEquilibrio = Math.max(0, puntoEquilibrio - facturado);
     
-    // Ritmo diario actual
     const ritmoDiarioActual = diasTranscurridos > 0 ? Math.round(facturado / diasTranscurridos) : 0;
-    
-    // Ritmo diario necesario los días restantes para llegar al equilibrio
     const ritmoNecesario = diasRestantes > 0 ? Math.round(faltaParaEquilibrio / diasRestantes) : 0;
-    
-    // Proyección a fin de mes al ritmo actual
     const proyeccionFinMes = facturado + (ritmoDiarioActual * diasRestantes);
     
-    // Estado del mes
     let estado, estado_color, estado_mensaje;
     const cumplimientoEquilibrio = puntoEquilibrio > 0 ? (proyeccionFinMes / puntoEquilibrio) : 0;
     
@@ -4455,7 +4266,6 @@ app.get("/api/metas/equilibrio", async (req, res) => {
       estado_mensaje = 'Al ritmo actual no llegás al equilibrio. Mes proyectado en pérdida.';
     }
     
-    // Resultado
     res.json({
       ok: true,
       periodo: {
@@ -4510,7 +4320,7 @@ app.get("/api/metas/equilibrio", async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.41 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.42 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
