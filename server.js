@@ -1855,10 +1855,63 @@ function parseCsvLine(line) {
 
 function toNumber(val) {
   if (val === undefined || val === null) return 0;
-  const s = String(val).trim();
-  if (s === "" || s === "--" || s === "-") return 0;
-  const cleaned = s.replace(/[",%$\s]/g, "").replace(/CLP/gi, "");
-  const n = parseFloat(cleaned);
+  let s = String(val).trim();
+  if (s === "" || s === "--" || s === "-" || s.toLowerCase() === "null") return 0;
+  
+  // Limpiar símbolos comunes: comillas, %, $, espacios, CLP
+  s = s.replace(/["%$\s]/g, "").replace(/CLP/gi, "");
+  
+  // v5.43.3: detección de formato numérico
+  // - Español/Europa: "9.060,50" → 9060.50 (punto miles, coma decimal)
+  // - Español/Europa: "9.060" → 9060 (solo punto de miles)
+  // - LATAM/Inglés:   "9,060.50" → 9060.50 (coma miles, punto decimal)
+  // - LATAM/Inglés:   "9,060" → 9060 (solo coma de miles)
+  // - Simple:         "9060" → 9060
+  // - Simple:         "9060.5" → 9060.5
+  // - Porcentajes:    "8,75" → 8.75 (con coma como decimal sola)
+  
+  const tienePunto = s.includes('.');
+  const tieneComa = s.includes(',');
+  
+  if (tienePunto && tieneComa) {
+    // Ambos: el último carácter determina el decimal
+    const ultimoPunto = s.lastIndexOf('.');
+    const ultimaComa = s.lastIndexOf(',');
+    if (ultimoPunto > ultimaComa) {
+      // Inglés: "9,060.50" → quitar comas, mantener punto
+      s = s.replace(/,/g, '');
+    } else {
+      // Europeo: "9.060,50" → quitar puntos, coma a punto
+      s = s.replace(/\./g, '').replace(',', '.');
+    }
+  } else if (tieneComa && !tienePunto) {
+    // Solo coma: ambiguo. Decidir por contexto:
+    // - Si después de la coma hay 1-2 dígitos = decimal (español): "8,75" → 8.75
+    // - Si después de la coma hay 3+ dígitos = miles (LATAM): "9,060" → 9060
+    const partes = s.split(',');
+    if (partes.length === 2 && partes[1].length <= 2) {
+      // Decimal
+      s = s.replace(',', '.');
+    } else {
+      // Miles
+      s = s.replace(/,/g, '');
+    }
+  } else if (tienePunto && !tieneComa) {
+    // Solo punto: ambiguo similar
+    // - "9.060" → si hay 3 dígitos después y es entero, es miles europeo: 9060
+    // - "9.5" → decimal: 9.5
+    const partes = s.split('.');
+    if (partes.length === 2 && partes[1].length === 3 && /^\d+$/.test(partes[0]) && /^\d+$/.test(partes[1])) {
+      // Probablemente formato europeo de miles: "9.060" → 9060
+      s = s.replace(/\./g, '');
+    } else if (partes.length > 2) {
+      // Múltiples puntos: definitivamente miles europeo
+      s = s.replace(/\./g, '');
+    }
+    // Sino, dejar como está (decimal)
+  }
+  
+  const n = parseFloat(s);
   return isNaN(n) ? 0 : n;
 }
 
@@ -1873,31 +1926,57 @@ app.post("/api/ads/import-csv", async (req, res) => {
     let headerIndex = -1;
     for (let i = 0; i < Math.min(8, lines.length); i++) {
       const low = lines[i].toLowerCase();
-      if (low.includes("campa") && (low.includes("costo") || low.includes("clic") || low.includes("conversi"))) {
+      // v5.43.3: detectar headers en español LATAM y de España
+      // España usa: "Coste", "Clics"; LATAM usa: "Costo", "Clics"
+      if (low.includes("campa") && (low.includes("costo") || low.includes("coste") || low.includes("clic") || low.includes("conversi"))) {
         headerIndex = i; break;
       }
     }
     if (headerIndex === -1) return res.status(400).json({ error: "No se encontro fila de headers" });
     const headers = parseCsvLine(lines[headerIndex]);
+    
+    // v5.43.3: comparación robusta (ignora acentos, espacios extras, mayúsculas)
+    function normalizarHeader(h) {
+      return (h || '').toLowerCase()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quitar acentos
+        .replace(/\s+/g, ' ').trim();
+    }
+    const headersNorm = headers.map(normalizarHeader);
+    
     const idxOf = (...names) => {
       for (const n of names) {
-        const i = headers.findIndex(h => h.toLowerCase() === n.toLowerCase());
+        const nNorm = normalizarHeader(n);
+        const i = headersNorm.findIndex(h => h === nNorm);
         if (i !== -1) return i;
       }
       return -1;
     };
-    const colEstado = idxOf("Estado de la campaña", "Estado");
-    const colCampana = idxOf("Campaña", "Campana");
-    const colTipo = idxOf("Tipo de campaña", "Tipo");
-    const colCosto = idxOf("Costo");
-    const colImpr = idxOf("Impr.", "Impresiones");
-    const colClics = idxOf("Clics", "Interacciones");
-    const colConv = idxOf("Conversiones");
-    const colCpc = idxOf("Prom. CPC", "CPC prom.");
-    const colCpa = idxOf("Costo/conv.", "Costo por conv.");
-    const colCtr = idxOf("Porcentaje de interacción", "CTR");
-    const colConvRate = idxOf("Porcentaje de conv.", "Tasa de conv.");
+
+    // v5.43.3: ESTADO de la campaña (NO el "Estado" suelto que es motivo)
+    // Primero busca "Estado de la campaña" exactamente, después fallbacks
+    const colEstado = idxOf("Estado de la campaña", "Estado de la campana", "Campaign status");
+    const colCampana = idxOf("Campaña", "Campana", "Campaign");
+    const colTipo = idxOf("Tipo de campaña", "Tipo de campana", "Tipo", "Campaign type");
+    // v5.43.3: España usa "Coste", LATAM usa "Costo"
+    const colCosto = idxOf("Coste", "Costo", "Cost");
+    const colImpr = idxOf("Impr.", "Impresiones", "Impressions");
+    const colClics = idxOf("Clics", "Interacciones", "Clicks");
+    const colConv = idxOf("Conversiones", "Conversions");
+    // v5.43.3: España usa "CPC medio", LATAM "Prom. CPC"
+    const colCpc = idxOf("CPC medio", "Prom. CPC", "CPC prom.", "Avg. CPC");
+    // v5.43.3: España usa "Coste/conv.", LATAM "Costo/conv."
+    const colCpa = idxOf("Coste/conv.", "Costo/conv.", "Costo por conv.", "Cost/conv.");
+    // v5.43.3: España usa "Tasa de interacción", LATAM "Porcentaje de interacción"
+    const colCtr = idxOf("Tasa de interacción", "Tasa de interaccion", "Porcentaje de interacción", "CTR");
+    const colConvRate = idxOf("Tasa de conv.", "Porcentaje de conv.", "Conv. rate");
+    
     if (colCampana === -1) return res.status(400).json({ error: "No se encontro columna Campaña" });
+    
+    console.log('[ads import] Columnas detectadas:', {
+      estado: colEstado, campana: colCampana, costo: colCosto, 
+      clics: colClics, impr: colImpr, ctr: colCtr
+    });
+    
     await pool.query("DELETE FROM ads_kpis WHERE platform=$1 AND DATE(imported_at)=CURRENT_DATE", [plat]);
     let inserted = 0; let skipped = 0;
     const importDate = new Date().toISOString().slice(0, 10);
