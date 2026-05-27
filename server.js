@@ -4885,73 +4885,56 @@ app.get("/api/box-mapa", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINT: GET /api/agenda-semanal (v5.43)
 // ============================================================
-// Devuelve turnos de profesionales agrupados por día de la semana
-// para una semana específica. Infiere el "turno" de cada profesional
-// como [primera hora de cita, última hora de cita + duración].
+// ENDPOINT: GET /api/agenda-semanal (v5.43.4)
+// ============================================================
+// Devuelve para cada día de la semana:
+//   - Lista de profesionales con su turno horario y especialidad
+//   - Huecos sin cubrir (franjas donde quedan boxes libres)
+//   - Conteo boxes ocupados vs los 9 totales del centro
+//
+// MODELO DE BOXES (9 total):
+//   - Maturana 293: 3 boxes (2 con agenda Reservo, 1 nuevo físico sin agenda)
+//   - Victoria 766: 6 boxes
+//
+// EXCLUSIONES (NO ocupan box, no se cuentan):
+//   - Ecografías, Laboratorio, Sala RX, Sala Cardiología, Espirometría, 
+//     Exámenes auditivos, Telemedicina
 //
 // Query params:
 //   semana_inicio  YYYY-MM-DD (default: lunes de esta semana)
-//   sucursal       "Centro Medico Redvital" | "RedVital Sede Maturana" | null (ambas)
-//
-// Respuesta:
-// {
-//   ok: true,
-//   periodo: { lunes: "2026-05-25", sabado: "2026-05-30" },
-//   sucursal: "Centro Medico Redvital",
-//   horario_sede: { lv_inicio: 8, lv_fin: 20, sab_inicio: 9, sab_fin: 13 },
-//   dias: [
-//     {
-//       fecha: "2026-05-25",
-//       nombre: "Lunes 25",
-//       dow: 1,
-//       sede_abierta: true,
-//       horario_dia: { inicio: 8, fin: 20 },
-//       profesionales: [
-//         { nombre, especialidad, hora_inicio: "08:00", hora_fin: "13:00", color },
-//         ...
-//       ],
-//       huecos: ["13:00–14:00", "18:00–20:00"],
-//       gravedad_huecos: "bajo" | "medio" | "alto"
-//     }
-//   ]
-// }
 // ============================================================
+const TOTAL_BOXES = 9;
+const HORARIO_LV_INICIO = 8;
+const HORARIO_LV_FIN = 20;
+const HORARIO_SAB_INICIO = 9;
+const HORARIO_SAB_FIN = 14;
+
+// Recursos que NO son boxes (excluidos del cálculo de huecos)
+const RECURSOS_NO_BOX_REGEX = /^(ecograf|laboratorio|sala de rayos|sala de cardio|sala rayos|espirometr|exam.* auditiv|telemedicina|natalia garrido)/i;
+
 app.get("/api/agenda-semanal", async (req, res) => {
   try {
     // Calcular lunes y sábado de la semana
     const hoy = new Date();
     let semanaInicio;
     if (req.query.semana_inicio) {
-      semanaInicio = new Date(req.query.semana_inicio + 'T00:00:00');
+      semanaInicio = new Date(req.query.semana_inicio + 'T12:00:00Z');
     } else {
-      // Lunes de esta semana
-      const ahoraCL = new Date(hoy.getTime() - 4 * 3600000);
-      const dow = ahoraCL.getUTCDay(); // 0=domingo, 1=lunes, ..., 6=sábado
-      const offset = dow === 0 ? -6 : 1 - dow; // si es domingo, retroceder 6; si no, ir al lunes
-      semanaInicio = new Date(ahoraCL);
-      semanaInicio.setUTCDate(semanaInicio.getUTCDate() + offset);
+      semanaInicio = new Date(hoy);
+      const dow = semanaInicio.getDay();
+      const offset = dow === 0 ? -6 : 1 - dow;
+      semanaInicio.setDate(semanaInicio.getDate() + offset);
     }
     const lunes = new Date(semanaInicio);
+    lunes.setUTCHours(0, 0, 0, 0);
     const sabado = new Date(lunes);
     sabado.setUTCDate(sabado.getUTCDate() + 5);
 
     const fechaLunes = lunes.toISOString().slice(0, 10);
     const fechaSabado = sabado.toISOString().slice(0, 10);
 
-    const sucursal = req.query.sucursal || null;
-    const filtroSucursal = sucursal && sucursal !== 'Ambas' ? sucursal : null;
-
-    const params = [fechaLunes, fechaSabado];
-    let whereSuc = '';
-    if (filtroSucursal) {
-      params.push(filtroSucursal);
-      whereSuc = ' AND c.sucursal = $3';
-    }
-
-    // Query: por (fecha, profesional, especialidad/agenda) sacar min/max hora_inicio
-    // Solo citas que NO estén eliminadas
+    // Traer citas reales de la semana
     const sql = `
       SELECT
         c.fecha::text AS fecha,
@@ -4964,7 +4947,6 @@ app.get("/api/agenda-semanal", async (req, res) => {
         COUNT(*)::int AS num_citas
       FROM citas c
       WHERE c.fecha BETWEEN $1 AND $2
-        ${whereSuc}
         AND c.estado_cita != 'Eliminado'
         AND c.profesional IS NOT NULL
         AND c.hora_inicio IS NOT NULL
@@ -4972,9 +4954,9 @@ app.get("/api/agenda-semanal", async (req, res) => {
                COALESCE(NULLIF(c.agenda, ''), NULLIF(c.tratamiento, ''), 'Sin especificar')
       ORDER BY c.fecha, MIN(c.hora_inicio)
     `;
-    const { rows } = await pool.query(sql, params);
+    const { rows } = await pool.query(sql, [fechaLunes, fechaSabado]);
 
-    // Mapear especialidades a colores fijos (azul/verde/coral/rosa/púrpura/ámbar)
+    // Mapeo de colores fijos por especialidad
     const coloresEsp = {};
     const paletaColores = [
       { bg: '#E6F1FB', text: '#0C447C', name: 'azul' },
@@ -4994,7 +4976,6 @@ app.get("/api/agenda-semanal", async (req, res) => {
       return coloresEsp[especialidad];
     }
 
-    // Función para extraer "HH" de "HH:MM:SS" o "HH:MM"
     function horaToInt(h) {
       if (!h) return null;
       const partes = String(h).split(':');
@@ -5007,148 +4988,205 @@ app.get("/api/agenda-semanal", async (req, res) => {
       return `${partes[0]}:${partes[1] || '00'}`;
     }
 
-    // Construir estructura: día → lista de profesionales con su turno
-    const diasMap = {};
+    function fmtSucursal(s) {
+      if (!s) return '';
+      if (s.toLowerCase().includes('maturana')) return 'Maturana 293';
+      if (s.toLowerCase().includes('victoria') || s.toLowerCase().includes('centro medico')) return 'Victoria 766';
+      return s;
+    }
+
+    function esRecursoNoBox(esp, prof) {
+      // Si el "profesional" o agenda matchea con recursos no-box, excluir
+      if (RECURSOS_NO_BOX_REGEX.test(esp || '')) return true;
+      if (RECURSOS_NO_BOX_REGEX.test(prof || '')) return true;
+      return false;
+    }
+
+    // Construir estructura por día
     const diasNombres = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+    const diasMap = {};
 
     for (let i = 0; i < 6; i++) {
       const fecha = new Date(lunes);
       fecha.setUTCDate(fecha.getUTCDate() + i);
       const fechaStr = fecha.toISOString().slice(0, 10);
-      const dow = (i === 5) ? 6 : i + 1; // 0=Lun, 1=Mar, ..., 5=Sáb (en BD: 1-6)
+      const dow = (i === 5) ? 6 : i + 1;
       const diaName = diasNombres[dow];
       const diaNumero = fecha.getUTCDate();
+      const esSabado = (dow === 6);
 
       diasMap[fechaStr] = {
         fecha: fechaStr,
         dow: dow,
         nombre: `${diaName} ${diaNumero}`,
-        profesionales: []
+        es_sabado: esSabado,
+        horario_dia: {
+          inicio: esSabado ? HORARIO_SAB_INICIO : HORARIO_LV_INICIO,
+          fin: esSabado ? HORARIO_SAB_FIN : HORARIO_LV_FIN
+        },
+        sede_abierta: true,
+        profesionales: [],
+        recursos_no_box: [] // ecografías, laboratorio, etc. (informativo, no cuenta)
       };
     }
 
-    // Poblar profesionales por día (puede haber un profesional en varias agendas el mismo día → mergear)
+    // Poblar cada día con los profesionales
     for (const r of rows) {
       if (!diasMap[r.fecha]) continue;
-      const color = asignarColor(r.especialidad);
       const horaInicio = fmtHora(r.hora_min);
       const horaFin = fmtHora(r.hora_max);
+      const sedeFmt = fmtSucursal(r.sucursal);
 
-      // Buscar si ya existe ese profesional en el día (misma persona, distintas agendas) → tomar rango más amplio
+      // Verificar si es recurso no-box
+      if (esRecursoNoBox(r.especialidad, r.profesional)) {
+        diasMap[r.fecha].recursos_no_box.push({
+          nombre: r.profesional,
+          especialidad: r.especialidad,
+          hora_inicio: horaInicio,
+          hora_fin: horaFin,
+          sede: sedeFmt
+        });
+        continue;
+      }
+
+      const color = asignarColor(r.especialidad);
+      
+      // Buscar si ya existe ese profesional en el día (mergear si está en varias agendas)
       const existente = diasMap[r.fecha].profesionales.find(p => p.nombre === r.profesional);
       if (existente) {
         if (horaToInt(horaInicio) < horaToInt(existente.hora_inicio)) existente.hora_inicio = horaInicio;
         if (horaToInt(horaFin) > horaToInt(existente.hora_fin)) existente.hora_fin = horaFin;
         existente.num_citas += r.num_citas;
-        // Si especialidades distintas, concatenar
-        if (!existente.especialidad.includes(r.especialidad)) {
-          existente.especialidad += ' + ' + r.especialidad;
-        }
       } else {
         diasMap[r.fecha].profesionales.push({
           nombre: r.profesional,
           especialidad: r.especialidad,
           hora_inicio: horaInicio,
           hora_fin: horaFin,
+          sede: sedeFmt,
           num_citas: r.num_citas,
           color: color
         });
       }
     }
 
-    // Horario de cada sede (para detectar huecos)
-    function getHorarioDia(dow, sucursalArg) {
-      // Si filtramos por sede, usar su horario; si "Ambas", usar el más amplio (Centro)
-      const sucClave = sucursalArg || 'Centro Medico Redvital';
-      const cfg = INFRAESTRUCTURA[sucClave] || INFRAESTRUCTURA['Centro Medico Redvital'];
-      if (dow === 6) return cfg.horario_sabado;
-      if (dow === 0) return null; // domingo cerrado
-      return cfg.horario_lunes_viernes;
-    }
-
-    // Calcular huecos: rangos donde la sede está abierta pero NADIE atiende
-    function calcularHuecos(diaInfo, sucursalArg) {
-      const horarioDia = getHorarioDia(diaInfo.dow, sucursalArg);
-      if (!horarioDia) return { huecos: [], gravedad: 'cerrado', sede_abierta: false, horario_dia: null };
-
-      const inicioSede = horarioDia.inicio;
-      const finSede = horarioDia.fin;
-
-      // Generar set de horas cubiertas (granularidad 1 hora)
-      const cubierto = new Set();
-      for (const p of diaInfo.profesionales) {
+    // Calcular HUECOS por franja horaria
+    // Para cada día, recorrer hora por hora y contar cuántos profesionales atienden esa hora
+    for (const fechaStr of Object.keys(diasMap)) {
+      const dia = diasMap[fechaStr];
+      const horaIni = dia.horario_dia.inicio;
+      const horaFin = dia.horario_dia.fin;
+      
+      // Conteo por franja: { 8: 3, 9: 5, 10: 7, ... }
+      const conteoPorHora = {};
+      for (let h = horaIni; h < horaFin; h++) {
+        conteoPorHora[h] = 0;
+      }
+      
+      for (const p of dia.profesionales) {
         const hi = horaToInt(p.hora_inicio);
         const hf = horaToInt(p.hora_fin);
         if (hi === null || hf === null) continue;
-        for (let h = hi; h < hf; h++) cubierto.add(h);
+        for (let h = Math.max(hi, horaIni); h < Math.min(hf, horaFin); h++) {
+          if (conteoPorHora[h] !== undefined) conteoPorHora[h]++;
+        }
       }
-
-      // Detectar huecos contiguos
+      
+      // Detectar huecos: franjas con menos de TOTAL_BOXES ocupados
+      // Agrupar huecos contiguos
       const huecos = [];
-      let inicioHueco = null;
-      for (let h = inicioSede; h < finSede; h++) {
-        if (!cubierto.has(h)) {
-          if (inicioHueco === null) inicioHueco = h;
+      let huecoActual = null;
+      
+      for (let h = horaIni; h < horaFin; h++) {
+        const ocupados = conteoPorHora[h];
+        const huecosCount = TOTAL_BOXES - ocupados;
+        
+        if (huecosCount > 0) {
+          // Hay hueco esta franja
+          if (huecoActual && huecoActual.boxes_faltantes === huecosCount) {
+            // Extender el hueco actual (mismo número de boxes faltantes)
+            huecoActual.hora_fin = h + 1;
+          } else {
+            // Cerrar el anterior si existe
+            if (huecoActual) huecos.push(huecoActual);
+            // Abrir uno nuevo
+            huecoActual = {
+              hora_inicio: h,
+              hora_fin: h + 1,
+              boxes_faltantes: huecosCount,
+              boxes_ocupados: ocupados
+            };
+          }
         } else {
-          if (inicioHueco !== null) {
-            huecos.push(`${String(inicioHueco).padStart(2,'0')}:00–${String(h).padStart(2,'0')}:00`);
-            inicioHueco = null;
+          // Hora llena, cerrar hueco si había
+          if (huecoActual) {
+            huecos.push(huecoActual);
+            huecoActual = null;
           }
         }
       }
-      if (inicioHueco !== null) {
-        huecos.push(`${String(inicioHueco).padStart(2,'0')}:00–${String(finSede).padStart(2,'0')}:00`);
-      }
-
-      // Calcular gravedad: cuántas horas libres vs total
-      const horasTotales = finSede - inicioSede;
-      const horasCubiertas = cubierto.size;
-      const pctCubierto = horasTotales > 0 ? (horasCubiertas / horasTotales) : 0;
-      let gravedad;
-      if (diaInfo.profesionales.length === 0) gravedad = 'sin_nadie';
-      else if (pctCubierto >= 0.85) gravedad = 'bajo';
-      else if (pctCubierto >= 0.5) gravedad = 'medio';
-      else gravedad = 'alto';
-
-      return {
-        huecos,
-        gravedad,
-        sede_abierta: true,
-        horario_dia: { inicio: inicioSede, fin: finSede }
+      // Último hueco abierto
+      if (huecoActual) huecos.push(huecoActual);
+      
+      // Formatear huecos para frontend
+      dia.huecos = huecos.map(h => ({
+        rango: `${String(h.hora_inicio).padStart(2,'0')}:00-${String(h.hora_fin).padStart(2,'0')}:00`,
+        duracion_horas: h.hora_fin - h.hora_inicio,
+        boxes_faltantes: h.boxes_faltantes,
+        boxes_ocupados: h.boxes_ocupados
+      }));
+      
+      // Stats del día
+      const totalHorasOperativas = horaFin - horaIni;
+      const horasConTodoLleno = Object.values(conteoPorHora).filter(c => c >= TOTAL_BOXES).length;
+      const boxesMaxSimultaneos = Math.max(0, ...Object.values(conteoPorHora));
+      const totalHuecoHoras = dia.huecos.reduce((sum, h) => sum + (h.duracion_horas * h.boxes_faltantes), 0);
+      
+      dia.stats = {
+        total_profesionales: dia.profesionales.length,
+        boxes_max_simultaneos: boxesMaxSimultaneos,
+        boxes_total: TOTAL_BOXES,
+        horas_operativas: totalHorasOperativas,
+        horas_completamente_llenas: horasConTodoLleno,
+        total_hueco_horas: totalHuecoHoras,
+        pct_ocupacion: totalHorasOperativas > 0 
+          ? Math.round(100 * (Object.values(conteoPorHora).reduce((a,b) => a+b, 0)) / (totalHorasOperativas * TOTAL_BOXES))
+          : 0
       };
+      
+      // Gravedad del día (para colorear la tarjeta)
+      const pct = dia.stats.pct_ocupacion;
+      if (pct >= 80) dia.gravedad = 'lleno';      // verde
+      else if (pct >= 50) dia.gravedad = 'medio';  // amarillo
+      else if (pct >= 20) dia.gravedad = 'bajo';   // naranja
+      else dia.gravedad = 'critico';                // rojo
+      
+      // Conteo de boxes vs ocupados (para el badge "7/9 boxes")
+      dia.boxes_resumen = `${boxesMaxSimultaneos}/${TOTAL_BOXES}`;
+      
+      // Datos internos para debug
+      dia._conteo_por_hora = conteoPorHora;
     }
 
-    const dias = Object.values(diasMap).map(d => {
-      const info = calcularHuecos(d, filtroSucursal);
-      // Ordenar profesionales por hora_inicio
-      d.profesionales.sort((a, b) => horaToInt(a.hora_inicio) - horaToInt(b.hora_inicio));
-      return {
-        ...d,
-        sede_abierta: info.sede_abierta,
-        horario_dia: info.horario_dia,
-        huecos: info.huecos,
-        gravedad_huecos: info.gravedad
-      };
-    });
+    // Ordenar profesionales en cada día por hora de inicio
+    for (const fechaStr of Object.keys(diasMap)) {
+      diasMap[fechaStr].profesionales.sort((a, b) => {
+        const ai = horaToInt(a.hora_inicio) || 0;
+        const bi = horaToInt(b.hora_inicio) || 0;
+        return ai - bi;
+      });
+    }
 
-    // Horario de la sede (info general)
-    const sucRef = filtroSucursal || 'Centro Medico Redvital';
-    const cfgRef = INFRAESTRUCTURA[sucRef] || INFRAESTRUCTURA['Centro Medico Redvital'];
+    const dias = Object.values(diasMap);
 
     res.json({
       ok: true,
-      periodo: {
-        lunes: fechaLunes,
-        sabado: fechaSabado
-      },
-      sucursal: filtroSucursal || 'Ambas',
+      periodo: { lunes: fechaLunes, sabado: fechaSabado },
+      total_boxes: TOTAL_BOXES,
       horario_sede: {
-        lv_inicio: cfgRef.horario_lunes_viernes ? cfgRef.horario_lunes_viernes.inicio : null,
-        lv_fin: cfgRef.horario_lunes_viernes ? cfgRef.horario_lunes_viernes.fin : null,
-        sab_inicio: cfgRef.horario_sabado ? cfgRef.horario_sabado.inicio : null,
-        sab_fin: cfgRef.horario_sabado ? cfgRef.horario_sabado.fin : null
+        lv_inicio: HORARIO_LV_INICIO, lv_fin: HORARIO_LV_FIN,
+        sab_inicio: HORARIO_SAB_INICIO, sab_fin: HORARIO_SAB_FIN
       },
-      especialidades_colores: coloresEsp,
       dias
     });
 
