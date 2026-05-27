@@ -1,10 +1,13 @@
 // ============================================
-// REDVITAL BACKEND v5.42 - Bot con secretaría + anti-fechas-al-aire
+// REDVITAL BACKEND v5.43 - Bot reforzado + Box Mapa
 // Bot WhatsApp + Claude + Reservo Agendamiento
 // + Twilio WhatsApp Sandbox (paralelo a Meta)
 // + Optimizaciones rate limit Tier 1 (v5.32)
 // + Endpoint diagnóstico de suspensiones (v5.41)
 // + v5.42: Handoff secretaría + anti-fechas inventadas
+// + v5.43: Bot consulta Reservo SIEMPRE en "qué días tenés"
+//          + multi-fecha automático cuando hay 0 horarios
+//          + Endpoint /api/box-mapa (heat map ocupación)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -1607,7 +1610,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.42",
+    ok: true, servidor: "Redvital Backend v5.43",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1772,10 +1775,10 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.42 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional + Secretaría",
+    servidor: "Redvital Backend v5.43 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional + Secretaría",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
-      operativo: ["/api/dashboard"],
+      operativo: ["/api/dashboard", "/api/box-mapa", "/api/diario", "/api/metas/equilibrio", "/api/marketing/roi", "/api/suspensiones/diagnostico"],
       bot_debug: ["/api/bot/debug-env", "/api/bot/test-reservo", "/api/bot/tratamientos"],
       bot_catalogo: [
         "/api/bot/catalogo/stats",
@@ -2397,7 +2400,7 @@ function detectarServicioEspecial(query) {
 }
 
 // ============================================
-// ORQUESTADOR DEL BOT (v5.42: Function Calling + Elección Profesional + Secretaría)
+// ORQUESTADOR DEL BOT (v5.43: Function Calling + Elección Profesional + Secretaría)
 // ============================================
 const BOT_TOOLS = [
   {
@@ -2519,33 +2522,78 @@ async function ejecutarTool(nombre, input) {
     if (nombre === "consultar_disponibilidad") {
       const agenda = AGENDAS_BOT.find(a => a.uuid === input.uuid_agenda);
       if (!agenda) return { ok: false, error: "Agenda no encontrada" };
-      const params = { uuid_tratamiento: input.uuid_tratamiento };
-      if (input.fecha) params.fecha = input.fecha;
-      const resp = await reservoGetHorarios(agenda.uuid, agenda.token, params);
-      if (resp.__error) return { ok: false, error: `Error Reservo http=${resp.http}`, detalle: resp.body };
-      const data = resp.data;
-      const horariosAplanados = [];
-      if (Array.isArray(data)) {
-        for (const dia of data) {
-          const fecha = dia.fecha;
-          for (const suc of (dia.sucursales || [])) {
-            for (const prof of (suc.profesionales || [])) {
-              if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
-              for (const horaISO of (prof.horas_disponibles || [])) {
-                horariosAplanados.push({
-                  fecha: fecha, hora: horaISO.substring(11, 16),
-                  hora_con_segundos: horaISO.substring(11, 19), hora_iso: horaISO,
-                  time_zone: suc.time_zone || "America/Santiago",
-                  profesional_nombre: prof.nombre, uuid_profesional: prof.agenda,
-                  sucursal_uuid: suc.uuid, sucursal_nombre: suc.nombre,
-                  sucursal_direccion: suc.direccion
-                });
+
+      // v5.43: helper interno para 1 consulta a Reservo
+      async function consultarFecha(fecha) {
+        const params = { uuid_tratamiento: input.uuid_tratamiento };
+        if (fecha) params.fecha = fecha;
+        const resp = await reservoGetHorarios(agenda.uuid, agenda.token, params);
+        if (resp.__error) return { __error: true, http: resp.http, body: resp.body };
+        const data = resp.data;
+        const aplanados = [];
+        if (Array.isArray(data)) {
+          for (const dia of data) {
+            const fechaDia = dia.fecha;
+            for (const suc of (dia.sucursales || [])) {
+              for (const prof of (suc.profesionales || [])) {
+                if (input.uuid_profesional && prof.agenda !== input.uuid_profesional && prof.uuid !== input.uuid_profesional) continue;
+                for (const horaISO of (prof.horas_disponibles || [])) {
+                  aplanados.push({
+                    fecha: fechaDia, hora: horaISO.substring(11, 16),
+                    hora_con_segundos: horaISO.substring(11, 19), hora_iso: horaISO,
+                    time_zone: suc.time_zone || "America/Santiago",
+                    profesional_nombre: prof.nombre, uuid_profesional: prof.agenda,
+                    sucursal_uuid: suc.uuid, sucursal_nombre: suc.nombre,
+                    sucursal_direccion: suc.direccion
+                  });
+                }
               }
             }
           }
         }
+        return { __error: false, horarios: aplanados };
       }
-      // v5.42: aumentar 6→12 horarios para mostrar TODOS los días del rango consultado
+
+      // v5.43: BÚSQUEDA MULTI-VENTANA
+      // Si no hay fecha, o si la fecha pedida vino vacía → buscar hasta 4 semanas adelante
+      const hoy = new Date();
+      const ahoraCL = new Date(hoy.getTime() - 4 * 3600000);
+      const fechasIntentadas = [];
+      let horariosAplanados = [];
+      let ventanaUsada = null;
+
+      if (input.fecha) {
+        // Paciente pidió fecha específica → intentar esa primero
+        const r1 = await consultarFecha(input.fecha);
+        if (r1.__error) return { ok: false, error: `Error Reservo http=${r1.http}`, detalle: r1.body };
+        fechasIntentadas.push(input.fecha);
+        horariosAplanados = r1.horarios;
+        if (horariosAplanados.length > 0) ventanaUsada = input.fecha;
+      }
+
+      // Si no se pidió fecha O si la pedida vino vacía → ventanas progresivas
+      if (horariosAplanados.length === 0) {
+        const ventanas = [
+          { offset: 1,  label: "próximos 7 días" },
+          { offset: 8,  label: "semana 2" },
+          { offset: 15, label: "semana 3" },
+          { offset: 22, label: "semana 4" }
+        ];
+        for (const v of ventanas) {
+          const d = new Date(ahoraCL);
+          d.setDate(d.getDate() + v.offset);
+          const fechaIntento = d.toISOString().split('T')[0];
+          fechasIntentadas.push(fechaIntento);
+          const r = await consultarFecha(fechaIntento);
+          if (r.__error) continue;
+          if (r.horarios.length > 0) {
+            horariosAplanados = r.horarios;
+            ventanaUsada = v.label + " (" + fechaIntento + ")";
+            break;
+          }
+        }
+      }
+
       const limitados = horariosAplanados.slice(0, 12).map(h => ({
         fecha: h.fecha, hora: h.hora,
         hora_con_segundos: h.hora_con_segundos,
@@ -2555,20 +2603,32 @@ async function ejecutarTool(nombre, input) {
         sucursal_uuid: h.sucursal_uuid,
         sucursal_nombre: h.sucursal_nombre
       }));
-      // v5.42: agrupar por fecha para que el bot pueda mostrar TODOS los días disponibles
+
       const dias_disponibles = {};
       for (const h of limitados) {
         if (!dias_disponibles[h.fecha]) dias_disponibles[h.fecha] = [];
         dias_disponibles[h.fecha].push({ hora: h.hora, profesional: h.profesional_nombre });
       }
+
+      // v5.43: nota más directiva
+      let nota;
+      if (horariosAplanados.length === 0) {
+        nota = `Sin horarios para este profesional en las próximas 4 semanas (consulté ${fechasIntentadas.join(', ')}). Decile al paciente que este profesional no tiene horas próximas, NO ofrezcas otro profesional salvo que el paciente lo pida.`;
+      } else if (ventanaUsada && ventanaUsada !== input.fecha) {
+        nota = `No había horas en la fecha pedida. Encontré horas en ${ventanaUsada}. Mostrale TODOS los días disponibles al paciente.`;
+      } else {
+        nota = `Hay ${Object.keys(dias_disponibles).length} días con cupos. Mostrale TODOS al paciente con horas reales.`;
+      }
+
       return {
-        ok: true, sede: agenda.sede, total_horarios: horariosAplanados.length,
+        ok: true, sede: agenda.sede,
+        total_horarios: horariosAplanados.length,
+        ventana_usada: ventanaUsada,
+        fechas_intentadas: fechasIntentadas,
         horarios: limitados,
         dias_disponibles: dias_disponibles,
         filtrado_por_profesional: input.uuid_profesional || null,
-        nota: horariosAplanados.length === 0
-          ? "Sin horarios para esta fecha. Pedile al paciente otra fecha (puede que el profesional no atienda ese día)."
-          : `Hay ${Object.keys(dias_disponibles).length} días con cupos. Mostrale TODOS al paciente.`
+        nota: nota
       };
     }
 
@@ -2652,8 +2712,8 @@ async function ejecutarTool(nombre, input) {
 }
 
 
-// === SYSTEM PROMPT DINÁMICO v5.42 ===
-// Cambios v5.42:
+// === SYSTEM PROMPT DINÁMICO v5.43 ===
+// Cambios v5.43:
 //  1. Anti-fechas-al-aire: NUNCA ofrecer días específicos sin consultar Reservo PRIMERO
 //  2. Mostrar TODOS los días disponibles del rango consultado de una vez
 //  3. Handoff a secretaría WhatsApp en 3 momentos: confirmación reserva, precios/políticas, cancelar/reagendar
@@ -2688,26 +2748,31 @@ SEDES: Victoria 766 (principal, 6 boxes), Maturana 293 (endo/colono). L-V 8-20, 
 4. NUNCA inventés info ni UUIDs. Solo de tools. Si tool falla, derivá a secretaría: "Tuve un problema, escribíle a la secretaría: ${WHATSAPP_SECRETARIAS}".
 5. **CANCELAR / REAGENDAR**: si paciente quiere cancelar o reagendar una cita existente → derivá SIEMPRE: "Para cancelar o reagendar coordiná con la secretaría: ${WHATSAPP_SECRETARIAS}".
 6. MANTENÉ contexto. NO vuelvas a llamar buscar_tratamientos si ya tenés uuid_tratamiento.
-7. Si consultar_disponibilidad devuelve total_horarios:0 → decile al paciente que ese día no hay y pedile otro día. NO insistas con la misma fecha.
+7. **NUNCA ofrezcas cambiar de profesional salvo que el paciente lo pida.** Si el paciente eligió Lodolo y Lodolo no tiene horas, NO digas "¿te sirve con Miranda?". Decile "Lodolo no tiene horas próximas, ¿querés que mire más adelante?".
 
-═════ REGLAS CRÍTICAS v5.42 ═════
+═════ REGLAS CRÍTICAS v5.43 ═════
 
-🚨 REGLA 8 (ANTI-FECHAS-AL-AIRE):
+🚨 REGLA 8 (ANTI-FECHAS-AL-AIRE — REFORZADA):
 NUNCA ofrezcas días específicos sin haber llamado consultar_disponibilidad ANTES.
-Está PROHIBIDO decir frases como "tengo lunes 2 a las 10" sin que esos datos vengan de una tool call real.
-Si el paciente te pregunta "qué días tienen disponible esta semana" → llamá consultar_disponibilidad con fecha = lunes próximo y MIRÁ el resultado antes de responder.
-Si no llamaste a la tool, NO ofrezcas fechas. Decile "Dame un segundo que consulto la agenda" y llamá la tool YA.
+**TRIGGERS OBLIGATORIOS para llamar consultar_disponibilidad SIN preguntar nada más:**
+- "¿qué días tienen?" / "qué días tenés" / "qué horas hay"
+- "¿cuándo puedo?" / "¿cuándo tenés?"
+- "para esta semana" / "para mañana" / "lo antes posible"
+- Cualquier pregunta sobre disponibilidad en general
+En esos casos: NO preguntés "¿qué día querés?" — LLAMÁ la tool YA con uuid_tratamiento + uuid_profesional (si ya eligió) + sin fecha (la tool busca automáticamente las próximas 4 semanas).
+Está PROHIBIDO inventar fechas u horarios. Si no llamaste la tool, NO digas fechas.
 
 🚨 REGLA 9 (MOSTRAR TODOS LOS DÍAS):
-Cuando consultar_disponibilidad devuelva resultados, el campo dias_disponibles contiene un objeto con TODOS los días del rango consultado y sus horarios reales.
-Cuando le respondas al paciente, mostrale TODOS esos días, no solo uno.
-Formato sugerido: 
-"Esta semana tengo disponibles:
+Cuando consultar_disponibilidad devuelva resultados, el campo dias_disponibles contiene TODOS los días con cupos.
+Mostrale TODOS al paciente, no solo uno.
+Formato:
+"Tengo estas opciones con [Dr.X]:
 - Lunes 2: 10:00, 11:30, 16:00
 - Martes 3: 09:00, 15:00
-- Jueves 5: 11:00, 17:30
+- Jueves 5: 11:00
 ¿Cuál te queda?"
-Listá TODOS los días que vinieron en dias_disponibles. No filtrés ni ocultes.
+Si vino el campo ventana_usada con texto tipo "semana 2 (2026-06-02)" → mencionále al paciente que no había en la fecha original pero encontraste más adelante.
+Si total_horarios:0 después de las 4 ventanas → "Lodolo no tiene horas en las próximas 4 semanas. Te paso a la secretaría para que te avise cuando abran cupos: ${WHATSAPP_SECRETARIAS}". NO ofrezcas otro profesional.
 
 🚨 REGLA 10 (INFO QUE NO MANEJÁS → SECRETARÍA):
 Si el paciente pregunta sobre:
@@ -2720,6 +2785,12 @@ Si el paciente pregunta sobre:
 - Doppler, laboratorio (sangre), atenciones domiciliarias
 → Derivá SIEMPRE: "Esa info la maneja directo nuestra secretaría. Escribíle a ${WHATSAPP_SECRETARIAS}, te van a atender al toque."
 NUNCA inventés respuesta. Si no estás 100% seguro, derivá.
+
+🚨 REGLA 11 (NO CAMBIAR DE PROFESIONAL — NUNCA):
+Si el paciente eligió un profesional específico y ese profesional no tiene horas:
+- ✅ "Lodolo no tiene horas próximas, ¿querés que mire la semana siguiente o te paso a la secretaría?"
+- ❌ "¿Te sirve con Miranda en su lugar?" ← PROHIBIDO. Eso es marketing barato y el paciente lo lee como manipulación.
+Solo cambiá de profesional si el paciente lo pide explícitamente.
 
 ═════ FLUJOS POR TIPO ═════
 
@@ -3026,7 +3097,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
 
 // === WEBHOOK TWILIO WHATSAPP SANDBOX ===
 app.get('/webhook/twilio', (req, res) => {
-  res.status(200).send('Twilio webhook OK - Redvital bot v5.42');
+  res.status(200).send('Twilio webhook OK - Redvital bot v5.43');
 });
 
 app.post('/webhook/twilio', async (req, res) => {
@@ -4315,12 +4386,325 @@ app.get("/api/metas/equilibrio", async (req, res) => {
   }
 });
 
+// ============================================================
+// ENDPOINT: GET /api/box-mapa (v5.43) — HEAT MAP DE OCUPACIÓN
+// ============================================================
+// Distribución de boxes por día de semana × hora del día:
+// - Cuánto se usa cada slot (% ocupación)
+// - Qué profesionales lo ocupan
+// - Plata bruta generada por slot (de tabla ventas cruzada por fecha+hora)
+// - Slots vacíos (cuántos cupos perdidos por slot)
+//
+// Sirve para:
+//  - Ver qué horas son más rentables ($/box-hora)
+//  - Detectar boxes sub-ocupados → mover profesional ahí
+//  - Decidir si abrir o cerrar bloques horarios
+//
+// Query params:
+//   desde     YYYY-MM-DD (default: hace 30 días)
+//   hasta     YYYY-MM-DD (default: hoy)
+//   sucursal  "Centro Medico Redvital" | "RedVital Sede Maturana" | null (ambas)
+// ============================================================
+app.get("/api/box-mapa", async (req, res) => {
+  try {
+    const { sucursal } = req.query;
+    const hoy = new Date();
+    const hace30 = new Date(hoy.getTime() - 30 * 86400000);
+    const desde = req.query.desde || hace30.toISOString().slice(0,10);
+    const hasta = req.query.hasta || hoy.toISOString().slice(0,10);
+    const filtroSucursal = sucursal && sucursal !== 'Ambas' ? sucursal : null;
+
+    const params = [desde, hasta];
+    let whereSuc = '';
+    if (filtroSucursal) { params.push(filtroSucursal); whereSuc = ` AND c.sucursal = $3`; }
+
+    // ========================================
+    // 1) MATRIZ DÍA-SEMANA × HORA × SUCURSAL
+    // ========================================
+    // Para cada combinación (sucursal, dow, hora): cuántas citas hubo,
+    // cuántas atendidas, cuántas suspendieron/no-show, plata bruta de ventas
+    const matrizQ = `
+      WITH ventas_hora AS (
+        -- Cruzamos ventas con la hora_inicio de la cita por uuid (cuando coincide)
+        SELECT
+          c.sucursal,
+          EXTRACT(DOW FROM c.fecha)::int AS dow,
+          EXTRACT(HOUR FROM c.hora_inicio)::int AS hora,
+          SUM(v.valor_pagado)::bigint AS bruto
+        FROM citas c
+        LEFT JOIN ventas v
+          ON v.fecha = c.fecha
+         AND v.rut_demandante = c.rut
+         AND v.estado_venta IN ('Realizada','Modificada')
+        WHERE c.fecha BETWEEN $1 AND $2 ${whereSuc}
+          AND c.hora_inicio IS NOT NULL
+          AND c.estado_cita IN ('Atendido','Llegó')
+        GROUP BY c.sucursal, EXTRACT(DOW FROM c.fecha), EXTRACT(HOUR FROM c.hora_inicio)
+      ),
+      citas_hora AS (
+        SELECT
+          c.sucursal,
+          EXTRACT(DOW FROM c.fecha)::int AS dow,
+          EXTRACT(HOUR FROM c.hora_inicio)::int AS hora,
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (WHERE c.estado_cita IN ('Atendido','Llegó'))::int AS atendidas,
+          COUNT(*) FILTER (WHERE c.estado_cita IN ('Suspendió','Eliminado','No llegó'))::int AS perdidas,
+          COUNT(*) FILTER (WHERE c.estado_cita IN ('Confirmado','No Confirmado','Lista de Espera'))::int AS pendientes,
+          COUNT(DISTINCT c.profesional)::int AS profesionales_distintos,
+          COUNT(DISTINCT c.fecha)::int AS dias_unicos
+        FROM citas c
+        WHERE c.fecha BETWEEN $1 AND $2 ${whereSuc}
+          AND c.hora_inicio IS NOT NULL
+          AND c.estado_cita != 'Eliminado'
+        GROUP BY c.sucursal, EXTRACT(DOW FROM c.fecha), EXTRACT(HOUR FROM c.hora_inicio)
+      )
+      SELECT
+        ch.sucursal,
+        ch.dow,
+        ch.hora,
+        ch.total,
+        ch.atendidas,
+        ch.perdidas,
+        ch.pendientes,
+        ch.profesionales_distintos,
+        ch.dias_unicos,
+        COALESCE(vh.bruto, 0)::bigint AS bruto
+      FROM citas_hora ch
+      LEFT JOIN ventas_hora vh USING (sucursal, dow, hora)
+      ORDER BY ch.sucursal, ch.dow, ch.hora
+    `;
+    const matriz = await pool.query(matrizQ, params);
+
+    // ========================================
+    // 2) PROFESIONALES POR SLOT (top 3 por celda)
+    // ========================================
+    const profsQ = `
+      SELECT
+        c.sucursal,
+        EXTRACT(DOW FROM c.fecha)::int AS dow,
+        EXTRACT(HOUR FROM c.hora_inicio)::int AS hora,
+        c.profesional,
+        COUNT(*)::int AS citas,
+        COUNT(*) FILTER (WHERE c.estado_cita IN ('Atendido','Llegó'))::int AS atendidas
+      FROM citas c
+      WHERE c.fecha BETWEEN $1 AND $2 ${whereSuc}
+        AND c.hora_inicio IS NOT NULL
+        AND c.profesional IS NOT NULL
+        AND c.estado_cita != 'Eliminado'
+      GROUP BY c.sucursal, EXTRACT(DOW FROM c.fecha), EXTRACT(HOUR FROM c.hora_inicio), c.profesional
+      HAVING COUNT(*) >= 2
+      ORDER BY c.sucursal, dow, hora, atendidas DESC
+    `;
+    const profsPorSlot = await pool.query(profsQ, params);
+
+    // Agrupar profesionales por (sucursal, dow, hora)
+    const mapaProfs = {};
+    for (const r of profsPorSlot.rows) {
+      const key = `${r.sucursal}|${r.dow}|${r.hora}`;
+      if (!mapaProfs[key]) mapaProfs[key] = [];
+      if (mapaProfs[key].length < 3) {
+        mapaProfs[key].push({ profesional: r.profesional, citas: r.citas, atendidas: r.atendidas });
+      }
+    }
+
+    // ========================================
+    // 3) CONSTRUIR MAPA POR SUCURSAL
+    // ========================================
+    const diasSemana = ['Domingo','Lunes','Martes','Miércoles','Jueves','Viernes','Sábado'];
+    const sucursales = filtroSucursal ? [filtroSucursal] : Object.keys(INFRAESTRUCTURA);
+
+    const mapaPorSucursal = sucursales.map(suc => {
+      const infra = INFRAESTRUCTURA[suc] || { boxes: 2, cupos_por_hora: 3, horario_lunes_viernes: {inicio:8,fin:20}, horario_sabado: {inicio:9,fin:13} };
+      const cuposPorHoraTotal = infra.boxes * infra.cupos_por_hora; // capacidad teórica de UN día-hora
+
+      // Horas a graficar (rango completo entre L-V y sábado)
+      const horaMin = Math.min(
+        infra.horario_lunes_viernes ? infra.horario_lunes_viernes.inicio : 99,
+        infra.horario_sabado ? infra.horario_sabado.inicio : 99
+      );
+      const horaMax = Math.max(
+        infra.horario_lunes_viernes ? infra.horario_lunes_viernes.fin : 0,
+        infra.horario_sabado ? infra.horario_sabado.fin : 0
+      );
+
+      const horas = [];
+      for (let h = horaMin; h <= horaMax; h++) horas.push(h);
+
+      // Calcular cuántas veces ocurrió cada (dow, hora) en el rango (= n° de días disponibles para ese slot)
+      // Lo aproximamos contando días distintos de calendario en el rango por dow
+      const inicio = new Date(desde);
+      const fin = new Date(hasta);
+      const conteoDows = [0,0,0,0,0,0,0];
+      for (let d = new Date(inicio); d <= fin; d.setDate(d.getDate()+1)) {
+        conteoDows[d.getDay()]++;
+      }
+
+      // Filas: una por dow (0-6), columnas: una por hora
+      const filas = [];
+      for (let dow = 0; dow <= 6; dow++) {
+        // Saltar si el dow no aplica (Dom siempre cerrado, Sáb solo si tiene horario_sabado)
+        if (dow === 0) continue;
+        if (dow === 6 && !infra.horario_sabado) {
+          // Sábado cerrado en esta sede
+          filas.push({
+            dow,
+            dia_nombre: diasSemana[dow],
+            cerrada: true,
+            celdas: horas.map(h => ({ hora: h, abierto: false }))
+          });
+          continue;
+        }
+
+        // Para L-V y Sáb abierto: definir si cada hora está dentro de su horario
+        const horarioDow = (dow === 6) ? infra.horario_sabado : infra.horario_lunes_viernes;
+        const fila = {
+          dow,
+          dia_nombre: diasSemana[dow],
+          cerrada: false,
+          celdas: []
+        };
+
+        for (const hora of horas) {
+          const abierto = horarioDow && hora >= horarioDow.inicio && hora < horarioDow.fin;
+
+          // Buscar datos en matriz
+          const fila_matriz = matriz.rows.find(m => m.sucursal === suc && m.dow === dow && m.hora === hora);
+          const totales = fila_matriz || { total: 0, atendidas: 0, perdidas: 0, pendientes: 0, bruto: 0, profesionales_distintos: 0, dias_unicos: 0 };
+
+          // Capacidad total del slot en el rango = boxes × cupos_por_hora × n_dias_de_ese_dow
+          const nDiasDow = conteoDows[dow] || 0;
+          const capacidad = abierto ? (cuposPorHoraTotal * nDiasDow) : 0;
+          const programadas = totales.total || 0;
+          const atendidas = totales.atendidas || 0;
+          const perdidas = totales.perdidas || 0;
+          const bruto = parseInt(totales.bruto) || 0;
+          const vacios = Math.max(0, capacidad - programadas);
+
+          const pctProgramado = capacidad > 0 ? Math.round(100 * programadas / capacidad) : 0;
+          const pctAtendido = capacidad > 0 ? Math.round(100 * atendidas / capacidad) : 0;
+
+          // Categoría de ocupación para colorear el mapa
+          let zona;
+          if (!abierto) zona = 'cerrado';
+          else if (pctProgramado >= 90) zona = 'saturado';     // ojo: no podés crecer
+          else if (pctProgramado >= 70) zona = 'optimo';        // funciona bien
+          else if (pctProgramado >= 40) zona = 'medio';         // hay capacidad
+          else if (pctProgramado >= 10) zona = 'bajo';          // sub-utilizado
+          else zona = 'vacio';                                   // perdiendo plata
+
+          // Rentabilidad por slot ($ bruto / hora-box ocupada)
+          const brutoPorCita = atendidas > 0 ? Math.round(bruto / atendidas) : 0;
+          const brutoPorBoxHora = capacidad > 0 ? Math.round(bruto / (capacidad / cuposPorHoraTotal)) : 0;
+
+          // Top profesionales del slot
+          const profsSlot = mapaProfs[`${suc}|${dow}|${hora}`] || [];
+
+          fila.celdas.push({
+            hora, abierto,
+            capacidad,
+            programadas, atendidas, perdidas,
+            pendientes: totales.pendientes || 0,
+            vacios,
+            pct_programado: pctProgramado,
+            pct_atendido: pctAtendido,
+            zona,
+            bruto,
+            bruto_por_cita: brutoPorCita,
+            bruto_por_box_hora: brutoPorBoxHora,
+            profesionales: profsSlot,
+            n_dias_dow: nDiasDow
+          });
+        }
+
+        filas.push(fila);
+      }
+
+      // Totales por sucursal
+      let capTotal = 0, progTotal = 0, atendTotal = 0, brutoTotal = 0, perdTotal = 0;
+      for (const f of filas) {
+        for (const c of f.celdas) {
+          if (!c.abierto) continue;
+          capTotal += c.capacidad;
+          progTotal += c.programadas;
+          atendTotal += c.atendidas;
+          brutoTotal += c.bruto;
+          perdTotal += c.perdidas;
+        }
+      }
+
+      // Top 5 horas más rentables (bruto_por_box_hora)
+      const todasCeldas = [];
+      for (const f of filas) {
+        for (const c of f.celdas) {
+          if (c.abierto && c.bruto > 0) {
+            todasCeldas.push({ dia: f.dia_nombre, dow: f.dow, hora: c.hora, ...c });
+          }
+        }
+      }
+      const topRentables = [...todasCeldas]
+        .sort((a, b) => b.bruto_por_box_hora - a.bruto_por_box_hora)
+        .slice(0, 5)
+        .map(c => ({ dia: c.dia, hora: c.hora, bruto: c.bruto, bruto_por_box_hora: c.bruto_por_box_hora, atendidas: c.atendidas }));
+
+      // Top 5 huecos (más capacidad desperdiciada en $$)
+      const topHuecos = [...todasCeldas]
+        .filter(c => c.vacios > 0)
+        .map(c => ({ ...c, lucro_cesante: c.vacios * (c.bruto_por_cita || TICKET_PROMEDIO) }))
+        .sort((a, b) => b.lucro_cesante - a.lucro_cesante)
+        .slice(0, 5)
+        .map(c => ({ dia: c.dia, hora: c.hora, vacios: c.vacios, lucro_cesante: c.lucro_cesante, pct_programado: c.pct_programado }));
+
+      return {
+        sucursal: suc,
+        infraestructura: {
+          boxes: infra.boxes,
+          cupos_por_hora: infra.cupos_por_hora,
+          horario_lv: infra.horario_lunes_viernes,
+          horario_sab: infra.horario_sabado
+        },
+        horas_grafico: horas,
+        filas,
+        totales: {
+          capacidad: capTotal,
+          programadas: progTotal,
+          atendidas: atendTotal,
+          perdidas: perdTotal,
+          bruto: brutoTotal,
+          pct_uso_programado: capTotal > 0 ? Math.round(100 * progTotal / capTotal) : 0,
+          pct_uso_atendido: capTotal > 0 ? Math.round(100 * atendTotal / capTotal) : 0,
+          bruto_por_box_hora_global: capTotal > 0 ? Math.round(brutoTotal / (capTotal / cuposPorHoraTotal)) : 0
+        },
+        top_horas_rentables: topRentables,
+        top_huecos: topHuecos
+      };
+    });
+
+    res.json({
+      ok: true,
+      periodo: { desde, hasta, sucursal: filtroSucursal || 'Ambas' },
+      leyenda_zonas: {
+        cerrado: 'Sede cerrada en ese día/hora',
+        vacio: '< 10% ocupado — perdiendo plata',
+        bajo: '10-39% — sub-utilizado',
+        medio: '40-69% — hay capacidad',
+        optimo: '70-89% — funciona bien',
+        saturado: '≥ 90% — no podés crecer ahí'
+      },
+      sucursales: mapaPorSucursal
+    });
+
+  } catch (err) {
+    console.error('[box-mapa]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ============================================
 // START
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.42 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.43 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
