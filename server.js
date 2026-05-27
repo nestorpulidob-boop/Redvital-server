@@ -7,7 +7,9 @@
 // + v5.42: Handoff secretaría + anti-fechas inventadas
 // + v5.43: Bot consulta Reservo SIEMPRE en "qué días tenés"
 //          + multi-fecha automático cuando hay 0 horarios
-//          + Endpoint /api/box-mapa (heat map ocupación)
+// + v5.43.1: Multi-agenda en consultar_disponibilidad (fix bug
+//            'no hay horas' cuando un tratamiento está en
+//            múltiples agendas, como medicina general)
 // ============================================
 const express = require("express");
 const cors = require("cors");
@@ -1610,7 +1612,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.43",
+    ok: true, servidor: "Redvital Backend v5.43.1",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -2420,7 +2422,7 @@ const BOT_TOOLS = [
   },
   {
     name: "consultar_disponibilidad",
-    description: "Consulta horarios en vivo. Devuelve horarios con uuid_profesional, sucursal_uuid, hora_con_segundos, time_zone. uuid_profesional opcional: pasarlo después de elegir profesional; omitir para medicina general.",
+    description: "Consulta horarios en vivo. v5.43.1: busca AUTOMÁTICAMENTE en TODAS las agendas que tengan el tratamiento (no solo en la que pasas como uuid_agenda). Pasá CUALQUIER uuid_agenda del listado de agendas del tratamiento — el código se encarga del resto. Devuelve horarios con uuid_profesional, sucursal_uuid, hora_con_segundos, time_zone. uuid_profesional opcional: pasarlo después de elegir profesional; omitir para medicina general.",
     input_schema: { type: "object", properties: {
       uuid_agenda: { type: "string" },
       uuid_tratamiento: { type: "string" },
@@ -2520,15 +2522,38 @@ async function ejecutarTool(nombre, input) {
     }
 
     if (nombre === "consultar_disponibilidad") {
-      const agenda = AGENDAS_BOT.find(a => a.uuid === input.uuid_agenda);
-      if (!agenda) return { ok: false, error: "Agenda no encontrada" };
+      // v5.43.1 MULTI-AGENDA: si el bot vino con uuid_agenda específico,
+      // intentamos esa primero, pero si está vacío buscamos en todas las
+      // agendas que tengan el tratamiento.
 
-      // v5.43: helper interno para 1 consulta a Reservo
-      async function consultarFecha(fecha) {
+      // Buscar TODAS las agendas que tienen este uuid_tratamiento
+      let agendasACandidato = [];
+      try {
+        const { rows } = await pool.query(
+          `SELECT DISTINCT agenda_uuid FROM bot_catalogo_tratamientos
+           WHERE uuid = $1 AND activo = TRUE`,
+          [input.uuid_tratamiento]
+        );
+        agendasACandidato = rows.map(r => AGENDAS_BOT.find(a => a.uuid === r.agenda_uuid)).filter(Boolean);
+      } catch (e) {
+        console.error('[consultar_disponibilidad] error BD agendas:', e.message);
+      }
+
+      // Si no encontramos por tratamiento, caer al agenda que vino en el input
+      if (agendasACandidato.length === 0) {
+        const agendaInput = AGENDAS_BOT.find(a => a.uuid === input.uuid_agenda);
+        if (!agendaInput) return { ok: false, error: "Agenda no encontrada y tratamiento sin agendas mapeadas" };
+        agendasACandidato = [agendaInput];
+      }
+
+      console.log(`[consultar_disponibilidad] buscando en ${agendasACandidato.length} agendas: ${agendasACandidato.map(a => a.sede + '/' + a.tipo).join(', ')}`);
+
+      // Helper: una consulta a UNA agenda en UNA fecha
+      async function consultarAgendaFecha(agenda, fecha) {
         const params = { uuid_tratamiento: input.uuid_tratamiento };
         if (fecha) params.fecha = fecha;
         const resp = await reservoGetHorarios(agenda.uuid, agenda.token, params);
-        if (resp.__error) return { __error: true, http: resp.http, body: resp.body };
+        if (resp.__error) return { __error: true, http: resp.http, body: resp.body, agenda };
         const data = resp.data;
         const aplanados = [];
         if (Array.isArray(data)) {
@@ -2544,34 +2569,50 @@ async function ejecutarTool(nombre, input) {
                     time_zone: suc.time_zone || "America/Santiago",
                     profesional_nombre: prof.nombre, uuid_profesional: prof.agenda,
                     sucursal_uuid: suc.uuid, sucursal_nombre: suc.nombre,
-                    sucursal_direccion: suc.direccion
+                    sucursal_direccion: suc.direccion,
+                    agenda_origen_uuid: agenda.uuid,
+                    agenda_origen_sede: agenda.sede
                   });
                 }
               }
             }
           }
         }
-        return { __error: false, horarios: aplanados };
+        return { __error: false, horarios: aplanados, agenda };
       }
 
-      // v5.43: BÚSQUEDA MULTI-VENTANA
-      // Si no hay fecha, o si la fecha pedida vino vacía → buscar hasta 4 semanas adelante
+      // Helper: consultar TODAS las agendas en paralelo para UNA fecha
+      async function consultarTodasAgendasFecha(fecha) {
+        const promesas = agendasACandidato.map(a => consultarAgendaFecha(a, fecha));
+        const resultados = await Promise.all(promesas);
+        const aplanados = [];
+        const errores = [];
+        for (const r of resultados) {
+          if (r.__error) {
+            errores.push({ sede: r.agenda.sede, tipo: r.agenda.tipo, http: r.http });
+          } else {
+            aplanados.push(...r.horarios);
+          }
+        }
+        return { horarios: aplanados, errores };
+      }
+
+      // BÚSQUEDA MULTI-VENTANA (intentar fecha pedida + 4 ventanas progresivas)
       const hoy = new Date();
       const ahoraCL = new Date(hoy.getTime() - 4 * 3600000);
       const fechasIntentadas = [];
       let horariosAplanados = [];
       let ventanaUsada = null;
+      let erroresTotales = [];
 
       if (input.fecha) {
-        // Paciente pidió fecha específica → intentar esa primero
-        const r1 = await consultarFecha(input.fecha);
-        if (r1.__error) return { ok: false, error: `Error Reservo http=${r1.http}`, detalle: r1.body };
+        const r1 = await consultarTodasAgendasFecha(input.fecha);
         fechasIntentadas.push(input.fecha);
         horariosAplanados = r1.horarios;
+        erroresTotales.push(...r1.errores);
         if (horariosAplanados.length > 0) ventanaUsada = input.fecha;
       }
 
-      // Si no se pidió fecha O si la pedida vino vacía → ventanas progresivas
       if (horariosAplanados.length === 0) {
         const ventanas = [
           { offset: 1,  label: "próximos 7 días" },
@@ -2584,8 +2625,8 @@ async function ejecutarTool(nombre, input) {
           d.setDate(d.getDate() + v.offset);
           const fechaIntento = d.toISOString().split('T')[0];
           fechasIntentadas.push(fechaIntento);
-          const r = await consultarFecha(fechaIntento);
-          if (r.__error) continue;
+          const r = await consultarTodasAgendasFecha(fechaIntento);
+          erroresTotales.push(...r.errores);
           if (r.horarios.length > 0) {
             horariosAplanados = r.horarios;
             ventanaUsada = v.label + " (" + fechaIntento + ")";
@@ -2594,6 +2635,12 @@ async function ejecutarTool(nombre, input) {
         }
       }
 
+      // Ordenar horarios por fecha+hora antes de cortar a 12
+      horariosAplanados.sort((a, b) => {
+        if (a.fecha !== b.fecha) return a.fecha.localeCompare(b.fecha);
+        return a.hora.localeCompare(b.hora);
+      });
+
       const limitados = horariosAplanados.slice(0, 12).map(h => ({
         fecha: h.fecha, hora: h.hora,
         hora_con_segundos: h.hora_con_segundos,
@@ -2601,19 +2648,19 @@ async function ejecutarTool(nombre, input) {
         profesional_nombre: h.profesional_nombre,
         uuid_profesional: h.uuid_profesional,
         sucursal_uuid: h.sucursal_uuid,
-        sucursal_nombre: h.sucursal_nombre
+        sucursal_nombre: h.sucursal_nombre,
+        agenda_origen_uuid: h.agenda_origen_uuid
       }));
 
       const dias_disponibles = {};
       for (const h of limitados) {
         if (!dias_disponibles[h.fecha]) dias_disponibles[h.fecha] = [];
-        dias_disponibles[h.fecha].push({ hora: h.hora, profesional: h.profesional_nombre });
+        dias_disponibles[h.fecha].push({ hora: h.hora, profesional: h.profesional_nombre, sede: h.sucursal_nombre });
       }
 
-      // v5.43: nota más directiva
       let nota;
       if (horariosAplanados.length === 0) {
-        nota = `Sin horarios para este profesional en las próximas 4 semanas (consulté ${fechasIntentadas.join(', ')}). Decile al paciente que este profesional no tiene horas próximas, NO ofrezcas otro profesional salvo que el paciente lo pida.`;
+        nota = `Sin horarios en NINGUNA de las ${agendasACandidato.length} agendas en las próximas 4 semanas (consulté ${fechasIntentadas.join(', ')}). Decile al paciente que no hay horas próximas, NO ofrezcas otro profesional salvo que el paciente lo pida.`;
       } else if (ventanaUsada && ventanaUsada !== input.fecha) {
         nota = `No había horas en la fecha pedida. Encontré horas en ${ventanaUsada}. Mostrale TODOS los días disponibles al paciente.`;
       } else {
@@ -2621,13 +2668,16 @@ async function ejecutarTool(nombre, input) {
       }
 
       return {
-        ok: true, sede: agenda.sede,
+        ok: true,
+        agendas_consultadas: agendasACandidato.length,
+        sedes_consultadas: [...new Set(agendasACandidato.map(a => a.sede))],
         total_horarios: horariosAplanados.length,
         ventana_usada: ventanaUsada,
         fechas_intentadas: fechasIntentadas,
         horarios: limitados,
         dias_disponibles: dias_disponibles,
         filtrado_por_profesional: input.uuid_profesional || null,
+        errores_reservo: erroresTotales.length > 0 ? erroresTotales : undefined,
         nota: nota
       };
     }
@@ -5120,7 +5170,7 @@ app.get("/api/bot/diagnostico", async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.43 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.43.1 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
