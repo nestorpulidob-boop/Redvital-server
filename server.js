@@ -4911,7 +4911,9 @@ const HORARIO_SAB_INICIO = 9;
 const HORARIO_SAB_FIN = 14;
 
 // Recursos que NO son boxes (excluidos del cálculo de huecos)
-const RECURSOS_NO_BOX_REGEX = /^(ecograf|laboratorio|sala de rayos|sala de cardio|sala rayos|espirometr|exam.* auditiv|telemedicina|natalia garrido)/i;
+// Incluye: salas/exámenes (no son personas), telemedicina (no usa box presencial),
+// y personal administrativo (María Bohórquez = administrativa, no atiende pacientes)
+const RECURSOS_NO_BOX_REGEX = /^(ecograf|laboratorio|sala de rayos|sala de cardio|sala rayos|espirometr|exam.* auditiv|telemedicina|natalia garrido|maria bohorquez|bohorquez)/i;
 
 app.get("/api/agenda-semanal", async (req, res) => {
   try {
