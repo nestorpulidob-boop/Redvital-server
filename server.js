@@ -7,7 +7,7 @@
 // + v5.42: Handoff secretaría + anti-fechas inventadas
 // + v5.43: Bot consulta Reservo SIEMPRE en "qué días tenés"
 //          + multi-fecha automático cuando hay 0 horarios
-// + v5.43.2: Multi-agenda en consultar_disponibilidad (fix bug
+// + v5.43.3: Multi-agenda en consultar_disponibilidad (fix bug
 //            'no hay horas' cuando un tratamiento está en
 //            múltiples agendas, como medicina general)
 // ============================================
@@ -1612,7 +1612,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.43.2",
+    ok: true, servidor: "Redvital Backend v5.43.3",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1777,7 +1777,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.43 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional + Secretaría",
+    servidor: "Redvital Backend v5.43.3 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional + Secretaría",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard", "/api/agenda-semanal", "/api/box-mapa", "/api/diario", "/api/metas/equilibrio", "/api/marketing/roi", "/api/suspensiones/diagnostico"],
@@ -2149,7 +2149,7 @@ async function inicializarBotBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_prof_esp_grupo ON bot_profesional_especialidad(grupo_clinico)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_prof_esp_visible ON bot_profesional_especialidad(visible)`);
 
-    // v5.43.2 - Tabla de recordatorios manuales/automáticos
+    // v5.43.3 - Tabla de recordatorios manuales/automáticos
     await pool.query(`
       CREATE TABLE IF NOT EXISTS bot_recordatorios_log (
         id BIGSERIAL PRIMARY KEY,
@@ -2175,7 +2175,7 @@ async function inicializarBotBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_recordatorios_uuid_cita ON bot_recordatorios_log(uuid_cita)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_recordatorios_estado ON bot_recordatorios_log(estado)`);
 
-    // v5.43.2 - Mapeo automático de 3 profesionales nuevos
+    // v5.43.3 - Mapeo automático de 3 profesionales nuevos
     // (Gladys, Miguelandres = medicina general puros; Viviana = medicina general infantil)
     await pool.query(`
       INSERT INTO bot_profesional_especialidad
@@ -2550,7 +2550,7 @@ const BOT_TOOLS = [
   },
   {
     name: "consultar_disponibilidad",
-    description: "Consulta horarios en vivo. v5.43.2: busca AUTOMÁTICAMENTE en TODAS las agendas que tengan el tratamiento (no solo en la que pasas como uuid_agenda). Pasá CUALQUIER uuid_agenda del listado de agendas del tratamiento — el código se encarga del resto. Devuelve horarios con uuid_profesional, sucursal_uuid, hora_con_segundos, time_zone. uuid_profesional opcional: pasarlo después de elegir profesional; omitir para medicina general.",
+    description: "Consulta horarios en vivo. v5.43.3: busca AUTOMÁTICAMENTE en TODAS las agendas que tengan el tratamiento (no solo en la que pasas como uuid_agenda). Pasá CUALQUIER uuid_agenda del listado de agendas del tratamiento — el código se encarga del resto. Devuelve horarios con uuid_profesional, sucursal_uuid, hora_con_segundos, time_zone. uuid_profesional opcional: pasarlo después de elegir profesional; omitir para medicina general.",
     input_schema: { type: "object", properties: {
       uuid_agenda: { type: "string" },
       uuid_tratamiento: { type: "string" },
@@ -2650,7 +2650,7 @@ async function ejecutarTool(nombre, input) {
     }
 
     if (nombre === "consultar_disponibilidad") {
-      // v5.43.2 MULTI-AGENDA: si el bot vino con uuid_agenda específico,
+      // v5.43.3 MULTI-AGENDA: si el bot vino con uuid_agenda específico,
       // intentamos esa primero, pero si está vacío buscamos en todas las
       // agendas que tengan el tratamiento.
 
@@ -5301,7 +5301,7 @@ app.get("/api/bot/diagnostico", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINTS DE RECORDATORIOS MANUALES (v5.43.2)
+// ENDPOINTS DE RECORDATORIOS MANUALES (v5.43.3)
 // ============================================================
 // GET  /api/recordatorios/listado?fecha=YYYY-MM-DD
 // POST /api/recordatorios/marcar { uuid_cita, estado, respuesta? }
@@ -5629,7 +5629,7 @@ app.get("/api/recordatorios/stats", async (req, res) => {
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.43.2 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.43.3 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
