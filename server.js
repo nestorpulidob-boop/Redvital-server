@@ -1612,7 +1612,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.43.3",
+    ok: true, servidor: "Redvital Backend v5.43.5",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -1777,7 +1777,7 @@ app.get("/api/stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    servidor: "Redvital Backend v5.43.3 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional + Secretaría",
+    servidor: "Redvital Backend v5.43.5 - Bot WhatsApp + Claude + Catálogo + Function Calling + Twilio Sandbox + Elección Profesional + Secretaría",
     endpoints: {
       sistema: ["/api/status", "/api/stats"],
       operativo: ["/api/dashboard", "/api/agenda-semanal", "/api/box-mapa", "/api/diario", "/api/metas/equilibrio", "/api/marketing/roi", "/api/suspensiones/diagnostico"],
@@ -2174,6 +2174,36 @@ async function inicializarBotBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_recordatorios_fecha ON bot_recordatorios_log(fecha_cita)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_recordatorios_uuid_cita ON bot_recordatorios_log(uuid_cita)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_recordatorios_estado ON bot_recordatorios_log(estado)`);
+
+    // v5.43.5 - Tabla de rescates de suspensiones (cancelaciones / no-shows)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_rescates_log (
+        id BIGSERIAL PRIMARY KEY,
+        uuid_cita TEXT,
+        rut_paciente TEXT,
+        nombre_paciente TEXT,
+        telefono TEXT,
+        fecha_cita_original DATE NOT NULL,
+        hora_cita_original TEXT,
+        profesional TEXT,
+        sucursal TEXT,
+        tratamiento TEXT,
+        estado_cita_original TEXT, -- "Suspendió" o "No llegó"
+        mensaje_enviado TEXT,
+        modo TEXT DEFAULT 'manual', -- manual | twilio_auto
+        estado_rescate TEXT DEFAULT 'pendiente', -- pendiente | contactado | reagendo | rechazo | sin_telefono | no_respondio
+        contactado_en TIMESTAMPTZ,
+        respuesta_paciente TEXT,
+        respondido_en TIMESTAMPTZ,
+        usuario_envio TEXT,
+        cita_reagendada_uuid TEXT, -- si vuelve a agendar
+        creado_en TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_fecha ON bot_rescates_log(fecha_cita_original)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_uuid_cita ON bot_rescates_log(uuid_cita)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_estado ON bot_rescates_log(estado_rescate)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_rut ON bot_rescates_log(rut_paciente)`);
 
     // v5.43.3 - Mapeo automático de 3 profesionales nuevos
     // (Gladys, Miguelandres = medicina general puros; Viviana = medicina general infantil)
@@ -5664,12 +5694,291 @@ app.get("/api/recordatorios/stats", async (req, res) => {
   }
 });
 
+// ============================================================
+// ENDPOINTS DE RESCATE DE SUSPENSIONES (v5.43.5)
+// ============================================================
+// GET  /api/rescates/listado?dias=7
+// POST /api/rescates/marcar { uuid_cita, estado, respuesta? }
+// GET  /api/rescates/stats?desde&hasta
+// ============================================================
+
+// Construye el mensaje de rescate
+function construirMensajeRescate(cita) {
+  const dias = ['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
+  const fechaObj = new Date(cita.fecha + 'T12:00:00');
+  const dia = dias[fechaObj.getDay()];
+  const fechaFmt = String(fechaObj.getDate()).padStart(2,'0') + '/' + String(fechaObj.getMonth()+1).padStart(2,'0');
+  
+  // Nombre solo primer nombre
+  const partes = (cita.paciente || '').trim().split(' ').filter(Boolean);
+  const nombreCorto = partes.length >= 1 ? partes[0] : 'paciente';
+  
+  const profesional = cita.profesional || 'tu profesional';
+  
+  return `Hola ${nombreCorto} 👋 Vimos que no pudiste asistir a tu cita del ${dia} ${fechaFmt} con ${profesional}. ¿Querés que te ayudemos a reagendar? Tenemos horas disponibles esta semana. 🙏`;
+}
+
+// GET /api/rescates/listado?dias=7&sucursal=X&estado=pendiente
+// Lista pacientes con suspensión/no-show en últimos N días (default 7)
+app.get("/api/rescates/listado", async (req, res) => {
+  try {
+    const dias = parseInt(req.query.dias) || 7;
+    const sucursal = req.query.sucursal && req.query.sucursal !== 'Ambas' ? req.query.sucursal : null;
+    
+    // Fecha desde (N días atrás) hasta AYER (no incluye hoy porque no se manda mismo día)
+    const ahora = new Date();
+    const ayer = new Date(ahora.getTime() - 1 * 86400000);
+    const desde = new Date(ahora.getTime() - dias * 86400000);
+    
+    const fechaDesde = desde.toISOString().slice(0,10);
+    const fechaHasta = ayer.toISOString().slice(0,10);
+    
+    const params = [fechaDesde, fechaHasta];
+    let whereSuc = '';
+    if (sucursal) { params.push(sucursal); whereSuc = ' AND c.sucursal = $3'; }
+    
+    // Traer citas suspendidas o no-show
+    const sql = `
+      SELECT 
+        c.uuid_cita,
+        c.rut,
+        c.paciente,
+        c.telefonos,
+        c.mail,
+        c.fecha::text AS fecha,
+        c.hora_inicio::text AS hora_inicio,
+        c.profesional,
+        c.sucursal,
+        c.tratamiento,
+        c.estado_cita,
+        r.id AS log_id,
+        r.estado_rescate,
+        r.contactado_en::text AS contactado_en,
+        r.respuesta_paciente,
+        r.respondido_en::text AS respondido_en,
+        EXTRACT(DAY FROM (NOW() - c.fecha))::int AS dias_pasados
+      FROM citas c
+      LEFT JOIN bot_rescates_log r ON r.uuid_cita = c.uuid_cita
+      WHERE c.fecha BETWEEN $1 AND $2 ${whereSuc}
+        AND c.estado_cita IN ('Suspendió', 'No llegó')
+        AND c.paciente IS NOT NULL
+      ORDER BY c.fecha DESC, c.hora_inicio NULLS LAST
+    `;
+    const { rows } = await pool.query(sql, params);
+    
+    // Stats
+    const stats = {
+      total: rows.length,
+      pendientes: 0,
+      contactados: 0,
+      reagendaron: 0,
+      rechazaron: 0,
+      sin_telefono: 0,
+      por_estado: { suspendio: 0, no_llego: 0 }
+    };
+    
+    const rescates = rows.map(r => {
+      const telefonoFmt = formatearTelefono(r.telefonos);
+      const telefonoWa = telefonoParaWaMe(r.telefonos);
+      const sinTelefono = !telefonoWa;
+      const estado = r.estado_rescate || 'pendiente';
+      
+      const mensaje = construirMensajeRescate({
+        paciente: r.paciente,
+        fecha: r.fecha,
+        profesional: r.profesional
+      });
+      
+      const wameUrl = telefonoWa 
+        ? `https://wa.me/${telefonoWa}?text=${encodeURIComponent(mensaje)}`
+        : null;
+      
+      const partes = (r.paciente || '').trim().split(' ').filter(Boolean);
+      const iniciales = (partes[0] ? partes[0][0] : '') + (partes[1] ? partes[1][0] : '');
+      
+      // Stats
+      if (sinTelefono) stats.sin_telefono++;
+      if (estado === 'pendiente') stats.pendientes++;
+      else if (estado === 'contactado') stats.contactados++;
+      else if (estado === 'reagendo') stats.reagendaron++;
+      else if (estado === 'rechazo') stats.rechazaron++;
+      if (r.estado_cita === 'Suspendió') stats.por_estado.suspendio++;
+      else if (r.estado_cita === 'No llegó') stats.por_estado.no_llego++;
+      
+      return {
+        uuid_cita: r.uuid_cita,
+        rut: r.rut,
+        paciente: r.paciente,
+        iniciales: iniciales.toUpperCase(),
+        telefono_fmt: telefonoFmt,
+        telefono_wame: telefonoWa,
+        sin_telefono: sinTelefono,
+        mail: r.mail,
+        fecha: r.fecha,
+        hora: (r.hora_inicio || '').substring(0,5),
+        dias_pasados: r.dias_pasados,
+        profesional: r.profesional,
+        sucursal: r.sucursal,
+        sucursal_corta: r.sucursal && r.sucursal.includes('Victoria') ? 'Victoria 766' :
+                        r.sucursal && r.sucursal.includes('Maturana') ? 'Maturana 293' :
+                        r.sucursal && r.sucursal.includes('Centro Medico') ? 'Victoria 766' : r.sucursal,
+        tratamiento: r.tratamiento,
+        estado_cita_original: r.estado_cita,
+        estado_cita_label: r.estado_cita === 'Suspendió' ? '⚠️ Suspendió' : '❌ No llegó',
+        mensaje: mensaje,
+        wame_url: wameUrl,
+        estado: estado,
+        contactado_en: r.contactado_en,
+        respuesta_paciente: r.respuesta_paciente,
+        respondido_en: r.respondido_en
+      };
+    });
+    
+    res.json({
+      ok: true,
+      periodo: { desde: fechaDesde, hasta: fechaHasta, dias: dias },
+      sucursal: sucursal || 'Ambas',
+      stats: stats,
+      rescates: rescates
+    });
+    
+  } catch (err) {
+    console.error('[rescates/listado]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/rescates/marcar
+// Body: { uuid_cita, estado, respuesta?, usuario?, mensaje_enviado? }
+app.post("/api/rescates/marcar", async (req, res) => {
+  try {
+    const { uuid_cita, estado, respuesta, usuario, mensaje_enviado } = req.body || {};
+    
+    if (!uuid_cita || !estado) {
+      return res.status(400).json({ ok: false, error: "Faltan uuid_cita y estado" });
+    }
+    
+    const estadosValidos = ['pendiente', 'contactado', 'reagendo', 'rechazo', 'no_respondio', 'sin_telefono'];
+    if (!estadosValidos.includes(estado)) {
+      return res.status(400).json({ ok: false, error: "Estado no válido. Usar: " + estadosValidos.join(', ') });
+    }
+    
+    // Buscar datos de la cita
+    const citaQ = await pool.query(
+      `SELECT uuid_cita, rut, paciente, telefonos, fecha::text AS fecha, 
+              hora_inicio::text AS hora_inicio, profesional, sucursal, tratamiento, estado_cita
+       FROM citas WHERE uuid_cita = $1 LIMIT 1`, 
+      [uuid_cita]
+    );
+    
+    if (citaQ.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "Cita no encontrada" });
+    }
+    
+    const cita = citaQ.rows[0];
+    
+    const existe = await pool.query(
+      `SELECT id FROM bot_rescates_log WHERE uuid_cita = $1 LIMIT 1`,
+      [uuid_cita]
+    );
+    
+    const contactadoEn = (estado === 'contactado') ? new Date().toISOString() : null;
+    const respondidoEn = (['reagendo', 'rechazo', 'no_respondio'].includes(estado)) 
+                          ? new Date().toISOString() 
+                          : null;
+    
+    if (existe.rows.length > 0) {
+      const updates = ['estado_rescate = $1'];
+      const values = [estado];
+      let n = 2;
+      if (contactadoEn) { updates.push(`contactado_en = $${n}`); values.push(contactadoEn); n++; }
+      if (respondidoEn) { updates.push(`respondido_en = $${n}`); values.push(respondidoEn); n++; }
+      if (respuesta) { updates.push(`respuesta_paciente = $${n}`); values.push(respuesta); n++; }
+      if (usuario) { updates.push(`usuario_envio = $${n}`); values.push(usuario); n++; }
+      if (mensaje_enviado) { updates.push(`mensaje_enviado = $${n}`); values.push(mensaje_enviado); n++; }
+      values.push(existe.rows[0].id);
+      
+      await pool.query(
+        `UPDATE bot_rescates_log SET ${updates.join(', ')} WHERE id = $${n}`,
+        values
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO bot_rescates_log 
+         (uuid_cita, rut_paciente, nombre_paciente, telefono, fecha_cita_original, hora_cita_original, 
+          profesional, sucursal, tratamiento, estado_cita_original, mensaje_enviado, modo, 
+          estado_rescate, contactado_en, respuesta_paciente, respondido_en, usuario_envio)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'manual',$12,$13,$14,$15,$16)`,
+        [uuid_cita, cita.rut, cita.paciente, cita.telefonos, cita.fecha,
+         cita.hora_inicio, cita.profesional, cita.sucursal, cita.tratamiento, cita.estado_cita,
+         mensaje_enviado || null, estado, contactadoEn, respuesta || null,
+         respondidoEn, usuario || null]
+      );
+    }
+    
+    res.json({ ok: true, uuid_cita, estado, contactado_en: contactadoEn });
+    
+  } catch (err) {
+    console.error('[rescates/marcar]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/rescates/stats?desde=YYYY-MM-DD&hasta=YYYY-MM-DD
+app.get("/api/rescates/stats", async (req, res) => {
+  try {
+    const hoy = new Date();
+    const hace30 = new Date(hoy.getTime() - 30 * 86400000);
+    const desde = req.query.desde || hace30.toISOString().slice(0,10);
+    const hasta = req.query.hasta || hoy.toISOString().slice(0,10);
+    
+    const sql = `
+      SELECT 
+        COUNT(*)::int AS total_intentados,
+        COUNT(*) FILTER (WHERE estado_rescate = 'contactado')::int AS contactados_sin_respuesta,
+        COUNT(*) FILTER (WHERE estado_rescate = 'reagendo')::int AS reagendaron,
+        COUNT(*) FILTER (WHERE estado_rescate = 'rechazo')::int AS rechazaron,
+        COUNT(*) FILTER (WHERE estado_rescate = 'no_respondio')::int AS no_respondieron
+      FROM bot_rescates_log 
+      WHERE fecha_cita_original BETWEEN $1 AND $2 
+        AND contactado_en IS NOT NULL
+    `;
+    const { rows } = await pool.query(sql, [desde, hasta]);
+    const r = rows[0];
+    
+    // Calcular plata recuperada estimada (asumiendo $30k por reagendamiento)
+    const TICKET_PROMEDIO = 30000;
+    const platRecuperadaEstimada = r.reagendaron * TICKET_PROMEDIO;
+    
+    const tasaRecuperacion = r.total_intentados > 0 
+      ? Math.round(100 * r.reagendaron / r.total_intentados) 
+      : 0;
+    
+    res.json({
+      ok: true,
+      periodo: { desde, hasta },
+      total_intentados: r.total_intentados,
+      reagendaron: r.reagendaron,
+      rechazaron: r.rechazaron,
+      no_respondieron: r.no_respondieron,
+      contactados_sin_respuesta: r.contactados_sin_respuesta,
+      tasa_recuperacion_pct: tasaRecuperacion,
+      plata_recuperada_estimada: platRecuperadaEstimada,
+      plata_recuperada_fmt: '$' + platRecuperadaEstimada.toLocaleString('es-CL')
+    });
+    
+  } catch (err) {
+    console.error('[rescates/stats]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ============================================
 // START
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.43.3 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.43.5 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
