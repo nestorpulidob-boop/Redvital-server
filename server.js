@@ -2096,6 +2096,29 @@ async function inicializarBotBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_recordatorios_uuid_cita ON bot_recordatorios_log(uuid_cita)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_recordatorios_estado ON bot_recordatorios_log(estado)`);
 
+    // v5.43.2 - Mapeo automático de 3 profesionales nuevos
+    // (Gladys, Miguelandres = medicina general puros; Viviana = medicina general infantil)
+    await pool.query(`
+      INSERT INTO bot_profesional_especialidad
+        (nombre_normalizado, nombre_display, especialidad_oficial, 
+         subespecialidad_formacion, grupo_clinico, visible, es_sala_o_recurso)
+      VALUES
+        ('gladys quispe porco', 'Gladys Quispe Porco',
+         'Medicina General', NULL, 'medicina_general', TRUE, FALSE),
+        ('miguelandres olivares', 'Miguelandres Olivares',
+         'Medicina General', NULL, 'medicina_general', TRUE, FALSE),
+        ('viviana salazar garcia', 'Viviana Salazar García',
+         'Medicina General', 'Medicina Infantil', 'medicina_general_infantil', TRUE, FALSE)
+      ON CONFLICT (nombre_normalizado) DO UPDATE SET
+        nombre_display = EXCLUDED.nombre_display,
+        especialidad_oficial = EXCLUDED.especialidad_oficial,
+        subespecialidad_formacion = EXCLUDED.subespecialidad_formacion,
+        grupo_clinico = EXCLUDED.grupo_clinico,
+        visible = TRUE,
+        actualizado_en = NOW()
+    `);
+    console.log("[bot BD] 3 profesionales nuevos mapeados (Gladys, Miguelandres, Viviana)");
+
     console.log("[bot BD] Tablas del bot + catálogo + bot_profesional_especialidad + bot_recordatorios_log verificadas");
   } catch (err) {
     console.error("[bot BD] Error inicializando:", err.message);
@@ -2443,8 +2466,8 @@ const BOT_TOOLS = [
   },
   {
     name: "listar_profesionales_por_especialidad",
-    description: "Lista profesionales reales de una especialidad con wording correcto. Usar para especialidades (cardio, gastro, trauma, neuro, gineco, broncopulmonar, dermato, otorrino, geriatria, pediatria, kine, nutricion, matrona, psicologia, psiquiatria, salud_mental, cirugia_endoscopia). NO para medicina_general (ahí no listar) ni exámenes sin profesional.",
-    input_schema: { type: "object", properties: { grupo_clinico: { type: "string", description: "cardiologia | gastroenterologia | traumatologia | neurologia | ginecologia | broncopulmonar | dermatologia | otorrino | geriatria | pediatria | kinesiologia | nutricion | matrona | psicologia | psiquiatria | salud_mental | cirugia_endoscopia | medicina_general" } }, required: ["grupo_clinico"] }
+    description: "Lista profesionales reales de una especialidad con wording correcto. Usar para especialidades (cardio, gastro, trauma, neuro, gineco, broncopulmonar, dermato, otorrino, geriatria, pediatria, medicina_general_infantil, kine, nutricion, matrona, psicologia, psiquiatria, salud_mental, cirugia_endoscopia). NO para medicina_general (ahí no listar) ni exámenes sin profesional.",
+    input_schema: { type: "object", properties: { grupo_clinico: { type: "string", description: "cardiologia | gastroenterologia | traumatologia | neurologia | ginecologia | broncopulmonar | dermatologia | otorrino | geriatria | pediatria | medicina_general_infantil | kinesiologia | nutricion | matrona | psicologia | psiquiatria | salud_mental | cirugia_endoscopia | medicina_general" } }, required: ["grupo_clinico"] }
   },
   {
     name: "consultar_disponibilidad",
@@ -2883,6 +2906,13 @@ Solo cambiá de profesional si el paciente lo pide explícitamente.
 - Si 2+: "Tengo a [Dr.X wording] y [Dr.Y wording]. ¿Con cuál?" — USÁ el campo wording_completo del resultado.
 - Cuando elija: consultar_disponibilidad con uuid_profesional del elegido → mostrá TODOS los días disponibles (regla 9).
 - RUT → crear_reserva.
+
+👶 ATENCIÓN DE NIÑOS (2 grupos disponibles):
+- "pediatra" / "pediatría" → listar_profesionales_por_especialidad("pediatria") → Cristian Arellano, Myriam Vicencio (pediatras de título).
+- "medicina general para niños" / "médico para mi hijo" / "control niño sano" → listar_profesionales_por_especialidad("medicina_general_infantil") → Viviana Salazar García (médica general con formación infantil).
+- Si el paciente dice algo ambiguo como "atención para mi hijo" o "control de niños": preguntá UNA vez:
+  "Para atender a tu hijo tenemos 2 opciones: 1) Pediatra (especialidad de niños), 2) Médico general con formación infantil. ¿Cuál preferís?"
+  Según elija → listar_profesionales_por_especialidad del grupo correspondiente.
 
 🟣 SALUD MENTAL (delicado, 3 grupos):
 - "psicólogo" → listar_profesionales_por_especialidad("psicologia") (no recetan).
