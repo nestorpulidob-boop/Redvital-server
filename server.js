@@ -7,7 +7,7 @@
 // + v5.42: Handoff secretaría + anti-fechas inventadas
 // + v5.43: Bot consulta Reservo SIEMPRE en "qué días tenés"
 //          + multi-fecha automático cuando hay 0 horarios
-// + v5.43.1: Multi-agenda en consultar_disponibilidad (fix bug
+// + v5.43.2: Multi-agenda en consultar_disponibilidad (fix bug
 //            'no hay horas' cuando un tratamiento está en
 //            múltiples agendas, como medicina general)
 // ============================================
@@ -1612,7 +1612,7 @@ app.get("/api/status", async (req, res) => {
     } catch (e) {}
   } catch (e) {}
   res.json({
-    ok: true, servidor: "Redvital Backend v5.43.1",
+    ok: true, servidor: "Redvital Backend v5.43.2",
     timestamp: new Date().toISOString(), bd_conectada: bdConectada,
     total_citas_bd: totalCitas, total_ventas_bd: totalVentas,
     total_webhooks_recibidos: totalWebhooks, ultimo_webhook: ultimoWebhook,
@@ -2070,7 +2070,33 @@ async function inicializarBotBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_prof_esp_grupo ON bot_profesional_especialidad(grupo_clinico)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_prof_esp_visible ON bot_profesional_especialidad(visible)`);
 
-    console.log("[bot BD] Tablas del bot + catálogo + bot_profesional_especialidad verificadas");
+    // v5.43.2 - Tabla de recordatorios manuales/automáticos
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_recordatorios_log (
+        id BIGSERIAL PRIMARY KEY,
+        uuid_cita TEXT,
+        rut_paciente TEXT,
+        nombre_paciente TEXT,
+        telefono TEXT,
+        fecha_cita DATE NOT NULL,
+        hora_cita TEXT,
+        profesional TEXT,
+        sucursal TEXT,
+        mensaje_enviado TEXT,
+        modo TEXT DEFAULT 'manual',
+        estado TEXT DEFAULT 'pendiente',
+        enviado_en TIMESTAMPTZ,
+        respuesta_paciente TEXT,
+        respondido_en TIMESTAMPTZ,
+        usuario_envio TEXT,
+        creado_en TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_recordatorios_fecha ON bot_recordatorios_log(fecha_cita)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_recordatorios_uuid_cita ON bot_recordatorios_log(uuid_cita)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_recordatorios_estado ON bot_recordatorios_log(estado)`);
+
+    console.log("[bot BD] Tablas del bot + catálogo + bot_profesional_especialidad + bot_recordatorios_log verificadas");
   } catch (err) {
     console.error("[bot BD] Error inicializando:", err.message);
   }
@@ -2422,7 +2448,7 @@ const BOT_TOOLS = [
   },
   {
     name: "consultar_disponibilidad",
-    description: "Consulta horarios en vivo. v5.43.1: busca AUTOMÁTICAMENTE en TODAS las agendas que tengan el tratamiento (no solo en la que pasas como uuid_agenda). Pasá CUALQUIER uuid_agenda del listado de agendas del tratamiento — el código se encarga del resto. Devuelve horarios con uuid_profesional, sucursal_uuid, hora_con_segundos, time_zone. uuid_profesional opcional: pasarlo después de elegir profesional; omitir para medicina general.",
+    description: "Consulta horarios en vivo. v5.43.2: busca AUTOMÁTICAMENTE en TODAS las agendas que tengan el tratamiento (no solo en la que pasas como uuid_agenda). Pasá CUALQUIER uuid_agenda del listado de agendas del tratamiento — el código se encarga del resto. Devuelve horarios con uuid_profesional, sucursal_uuid, hora_con_segundos, time_zone. uuid_profesional opcional: pasarlo después de elegir profesional; omitir para medicina general.",
     input_schema: { type: "object", properties: {
       uuid_agenda: { type: "string" },
       uuid_tratamiento: { type: "string" },
@@ -2522,7 +2548,7 @@ async function ejecutarTool(nombre, input) {
     }
 
     if (nombre === "consultar_disponibilidad") {
-      // v5.43.1 MULTI-AGENDA: si el bot vino con uuid_agenda específico,
+      // v5.43.2 MULTI-AGENDA: si el bot vino con uuid_agenda específico,
       // intentamos esa primero, pero si está vacío buscamos en todas las
       // agendas que tengan el tratamiento.
 
@@ -5165,12 +5191,336 @@ app.get("/api/bot/diagnostico", async (req, res) => {
   }
 });
 
+// ============================================================
+// ENDPOINTS DE RECORDATORIOS MANUALES (v5.43.2)
+// ============================================================
+// GET  /api/recordatorios/listado?fecha=YYYY-MM-DD
+// POST /api/recordatorios/marcar { uuid_cita, estado, respuesta? }
+// GET  /api/recordatorios/stats
+// ============================================================
+
+// Formatea teléfono chileno: 56912345678 → +56 9 1234 5678
+function formatearTelefono(tel) {
+  if (!tel) return null;
+  let limpio = String(tel).replace(/[^0-9]/g, '');
+  // Tomar el último número si vino con "/"
+  if (tel.includes('/')) {
+    const partes = tel.split('/').map(p => p.replace(/[^0-9]/g, '')).filter(p => p.length >= 9);
+    if (partes.length > 0) limpio = partes[0];
+  }
+  // Si arranca con 56 y tiene 11 dígitos, OK
+  // Si empieza con 9 y tiene 9 dígitos, agregar 56
+  if (limpio.length === 9 && limpio.startsWith('9')) limpio = '56' + limpio;
+  if (limpio.length === 11 && limpio.startsWith('569')) {
+    return '+56 9 ' + limpio.substring(3, 7) + ' ' + limpio.substring(7);
+  }
+  // Devolver tal cual si no se pudo normalizar
+  return tel;
+}
+
+// Versión cruda para wa.me (sin espacios ni +)
+function telefonoParaWaMe(tel) {
+  if (!tel) return null;
+  let limpio = String(tel).replace(/[^0-9]/g, '');
+  if (tel.includes('/')) {
+    const partes = tel.split('/').map(p => p.replace(/[^0-9]/g, '')).filter(p => p.length >= 9);
+    if (partes.length > 0) limpio = partes[0];
+  }
+  if (limpio.length === 9 && limpio.startsWith('9')) limpio = '56' + limpio;
+  if (limpio.length === 11 && limpio.startsWith('569')) return limpio;
+  if (limpio.length >= 9) return limpio;
+  return null;
+}
+
+// Construye el mensaje del recordatorio
+function construirMensajeRecordatorio(cita) {
+  const dias = ['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
+  const meses = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+  
+  const fechaObj = new Date(cita.fecha + 'T12:00:00');
+  const dia = dias[fechaObj.getDay()];
+  const fechaFmt = String(fechaObj.getDate()).padStart(2,'0') + '/' + String(fechaObj.getMonth()+1).padStart(2,'0');
+  
+  const horaCorta = (cita.hora_inicio || '').substring(0,5);
+  
+  // Nombre solo primer nombre y primer apellido
+  const partes = (cita.paciente || '').trim().split(' ').filter(Boolean);
+  const nombreCorto = partes.length >= 2 ? partes[0] + ' ' + partes[1] : (cita.paciente || 'paciente');
+  
+  const profesional = cita.profesional || 'el profesional';
+  
+  // Sede corta
+  let sedeCorta = cita.sucursal || 'nuestra sede';
+  if (sedeCorta.includes('Victoria')) sedeCorta = 'Victoria 766';
+  else if (sedeCorta.includes('Maturana')) sedeCorta = 'Maturana 293';
+  else if (sedeCorta.includes('Centro Medico')) sedeCorta = 'Victoria 766';
+  
+  return `Hola ${nombreCorto} 👋 te recordamos tu cita mañana ${dia} ${fechaFmt} a las ${horaCorta} con ${profesional} en Redvital ${sedeCorta}. ¿Confirmas asistencia? Responde SÍ o NO. 🙏`;
+}
+
+// GET /api/recordatorios/listado?fecha=YYYY-MM-DD&sucursal=X
+// Devuelve citas para esa fecha con mensaje pre-armado.
+// Si no se pasa fecha, usa MAÑANA por default.
+app.get("/api/recordatorios/listado", async (req, res) => {
+  try {
+    let fechaTarget = req.query.fecha;
+    if (!fechaTarget) {
+      // Default: mañana (en zona Chile UTC-4)
+      const ahoraCL = new Date(Date.now() - 4 * 3600000);
+      const manana = new Date(ahoraCL);
+      manana.setUTCDate(manana.getUTCDate() + 1);
+      fechaTarget = manana.toISOString().slice(0,10);
+    }
+    
+    const sucursal = req.query.sucursal && req.query.sucursal !== 'Ambas' ? req.query.sucursal : null;
+    const params = [fechaTarget];
+    let whereSuc = '';
+    if (sucursal) { params.push(sucursal); whereSuc = ' AND c.sucursal = $2'; }
+    
+    // Traer todas las citas de mañana (excepto eliminadas o ya canceladas)
+    const sql = `
+      SELECT 
+        c.uuid_cita,
+        c.rut,
+        c.paciente,
+        c.telefonos,
+        c.mail,
+        c.fecha::text AS fecha,
+        c.hora_inicio::text AS hora_inicio,
+        c.profesional,
+        c.sucursal,
+        c.tratamiento,
+        c.estado_cita,
+        r.id AS log_id,
+        r.estado AS recordatorio_estado,
+        r.enviado_en::text AS enviado_en,
+        r.respuesta_paciente,
+        r.respondido_en::text AS respondido_en
+      FROM citas c
+      LEFT JOIN bot_recordatorios_log r ON r.uuid_cita = c.uuid_cita 
+        AND r.fecha_cita = c.fecha
+      WHERE c.fecha = $1 ${whereSuc}
+        AND c.estado_cita NOT IN ('Eliminado','Suspendió')
+        AND c.paciente IS NOT NULL
+      ORDER BY c.hora_inicio NULLS LAST, c.profesional
+    `;
+    const { rows } = await pool.query(sql, params);
+    
+    // Estadísticas
+    const stats = {
+      total: rows.length,
+      pendientes: 0,
+      enviados: 0,
+      confirmados: 0,
+      cancelados: 0,
+      sin_telefono: 0
+    };
+    
+    const recordatorios = rows.map(r => {
+      const telefonoFmt = formatearTelefono(r.telefonos);
+      const telefonoWa = telefonoParaWaMe(r.telefonos);
+      const sinTelefono = !telefonoWa;
+      const estado = r.recordatorio_estado || 'pendiente';
+      
+      const mensaje = construirMensajeRecordatorio({
+        paciente: r.paciente,
+        fecha: r.fecha,
+        hora_inicio: r.hora_inicio,
+        profesional: r.profesional,
+        sucursal: r.sucursal
+      });
+      
+      // Link wa.me
+      const wameUrl = telefonoWa 
+        ? `https://wa.me/${telefonoWa}?text=${encodeURIComponent(mensaje)}`
+        : null;
+      
+      // Iniciales
+      const partes = (r.paciente || '').trim().split(' ').filter(Boolean);
+      const iniciales = (partes[0] ? partes[0][0] : '') + (partes[1] ? partes[1][0] : '');
+      
+      // Stats
+      if (sinTelefono) stats.sin_telefono++;
+      if (estado === 'pendiente') stats.pendientes++;
+      else if (estado === 'enviado') stats.enviados++;
+      else if (estado === 'confirmado') stats.confirmados++;
+      else if (estado === 'cancelado') stats.cancelados++;
+      
+      return {
+        uuid_cita: r.uuid_cita,
+        rut: r.rut,
+        paciente: r.paciente,
+        iniciales: iniciales.toUpperCase(),
+        telefono_fmt: telefonoFmt,
+        telefono_wame: telefonoWa,
+        sin_telefono: sinTelefono,
+        mail: r.mail,
+        fecha: r.fecha,
+        hora: (r.hora_inicio || '').substring(0,5),
+        profesional: r.profesional,
+        sucursal: r.sucursal,
+        sucursal_corta: r.sucursal && r.sucursal.includes('Victoria') ? 'Victoria 766' :
+                        r.sucursal && r.sucursal.includes('Maturana') ? 'Maturana 293' :
+                        r.sucursal && r.sucursal.includes('Centro Medico') ? 'Victoria 766' : r.sucursal,
+        tratamiento: r.tratamiento,
+        estado_cita: r.estado_cita,
+        mensaje: mensaje,
+        wame_url: wameUrl,
+        estado: estado,
+        enviado_en: r.enviado_en,
+        respuesta_paciente: r.respuesta_paciente,
+        respondido_en: r.respondido_en
+      };
+    });
+    
+    res.json({
+      ok: true,
+      fecha_consultada: fechaTarget,
+      sucursal: sucursal || 'Ambas',
+      stats: stats,
+      recordatorios: recordatorios
+    });
+    
+  } catch (err) {
+    console.error('[recordatorios/listado]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/recordatorios/marcar 
+// Body: { uuid_cita, estado: 'enviado'|'confirmado'|'cancelado'|'pendiente', 
+//         respuesta?, usuario? }
+app.post("/api/recordatorios/marcar", async (req, res) => {
+  try {
+    const { uuid_cita, estado, respuesta, usuario, mensaje_enviado } = req.body || {};
+    
+    if (!uuid_cita || !estado) {
+      return res.status(400).json({ ok: false, error: "Faltan uuid_cita y estado" });
+    }
+    
+    const estadosValidos = ['pendiente', 'enviado', 'confirmado', 'cancelado', 'no_respondio'];
+    if (!estadosValidos.includes(estado)) {
+      return res.status(400).json({ ok: false, error: "Estado no válido. Usar: " + estadosValidos.join(', ') });
+    }
+    
+    // Buscar datos de la cita
+    const citaQ = await pool.query(
+      `SELECT uuid_cita, rut, paciente, telefonos, fecha::text AS fecha, 
+              hora_inicio::text AS hora_inicio, profesional, sucursal
+       FROM citas WHERE uuid_cita = $1 LIMIT 1`, 
+      [uuid_cita]
+    );
+    
+    if (citaQ.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "Cita no encontrada" });
+    }
+    
+    const cita = citaQ.rows[0];
+    
+    // Buscar si ya existe registro
+    const existe = await pool.query(
+      `SELECT id FROM bot_recordatorios_log WHERE uuid_cita = $1 AND fecha_cita = $2 LIMIT 1`,
+      [uuid_cita, cita.fecha]
+    );
+    
+    const enviadoEn = (estado === 'enviado') ? new Date().toISOString() : null;
+    const respondidoEn = (estado === 'confirmado' || estado === 'cancelado' || estado === 'no_respondio') 
+                          ? new Date().toISOString() 
+                          : null;
+    
+    if (existe.rows.length > 0) {
+      // Update
+      const updates = ['estado = $1'];
+      const values = [estado];
+      let n = 2;
+      if (enviadoEn) { updates.push(`enviado_en = $${n}`); values.push(enviadoEn); n++; }
+      if (respondidoEn) { updates.push(`respondido_en = $${n}`); values.push(respondidoEn); n++; }
+      if (respuesta) { updates.push(`respuesta_paciente = $${n}`); values.push(respuesta); n++; }
+      if (usuario) { updates.push(`usuario_envio = $${n}`); values.push(usuario); n++; }
+      if (mensaje_enviado) { updates.push(`mensaje_enviado = $${n}`); values.push(mensaje_enviado); n++; }
+      values.push(existe.rows[0].id);
+      
+      await pool.query(
+        `UPDATE bot_recordatorios_log SET ${updates.join(', ')} WHERE id = $${n}`,
+        values
+      );
+    } else {
+      // Insert
+      await pool.query(
+        `INSERT INTO bot_recordatorios_log 
+         (uuid_cita, rut_paciente, nombre_paciente, telefono, fecha_cita, hora_cita, 
+          profesional, sucursal, mensaje_enviado, modo, estado, enviado_en, 
+          respuesta_paciente, respondido_en, usuario_envio)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'manual',$10,$11,$12,$13,$14)`,
+        [uuid_cita, cita.rut, cita.paciente, cita.telefonos, cita.fecha,
+         cita.hora_inicio, cita.profesional, cita.sucursal,
+         mensaje_enviado || null, estado, enviadoEn, respuesta || null,
+         respondidoEn, usuario || null]
+      );
+    }
+    
+    res.json({ ok: true, uuid_cita, estado, enviado_en: enviadoEn });
+    
+  } catch (err) {
+    console.error('[recordatorios/marcar]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/recordatorios/stats?desde=YYYY-MM-DD&hasta=YYYY-MM-DD
+// Estadísticas de efectividad
+app.get("/api/recordatorios/stats", async (req, res) => {
+  try {
+    const hoy = new Date();
+    const hace30 = new Date(hoy.getTime() - 30 * 86400000);
+    const desde = req.query.desde || hace30.toISOString().slice(0,10);
+    const hasta = req.query.hasta || hoy.toISOString().slice(0,10);
+    
+    const sql = `
+      SELECT 
+        COUNT(*)::int AS total_enviados,
+        COUNT(*) FILTER (WHERE estado = 'confirmado')::int AS confirmados,
+        COUNT(*) FILTER (WHERE estado = 'cancelado')::int AS cancelados,
+        COUNT(*) FILTER (WHERE estado = 'enviado')::int AS sin_respuesta,
+        COUNT(*) FILTER (WHERE estado = 'no_respondio')::int AS no_respondieron
+      FROM bot_recordatorios_log 
+      WHERE fecha_cita BETWEEN $1 AND $2 
+        AND enviado_en IS NOT NULL
+    `;
+    const { rows } = await pool.query(sql, [desde, hasta]);
+    const r = rows[0];
+    
+    const tasaRespuesta = r.total_enviados > 0 
+      ? Math.round(100 * (r.confirmados + r.cancelados) / r.total_enviados) 
+      : 0;
+    const tasaConfirmacion = r.total_enviados > 0
+      ? Math.round(100 * r.confirmados / r.total_enviados)
+      : 0;
+    
+    res.json({
+      ok: true,
+      periodo: { desde, hasta },
+      total_enviados: r.total_enviados,
+      confirmados: r.confirmados,
+      cancelados: r.cancelados,
+      sin_respuesta: r.sin_respuesta,
+      no_respondieron: r.no_respondieron,
+      tasa_respuesta_pct: tasaRespuesta,
+      tasa_confirmacion_pct: tasaConfirmacion
+    });
+    
+  } catch (err) {
+    console.error('[recordatorios/stats]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ============================================
 // START
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log("Servidor Redvital v5.43.1 corriendo en puerto " + PORT);
+  console.log("Servidor Redvital v5.43.2 corriendo en puerto " + PORT);
   await inicializarBD();
   await inicializarAdsKpis();
   await inicializarBotBD();
