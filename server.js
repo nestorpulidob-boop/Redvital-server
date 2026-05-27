@@ -4973,6 +4973,148 @@ app.get("/api/agenda-semanal", async (req, res) => {
   }
 });
 
+// ============================================================
+// ENDPOINT: GET /api/bot/diagnostico (v5.43)
+// ============================================================
+// Diagnóstico completo del cerebro del bot.
+// Responde tres preguntas:
+//   1. ¿Qué profesionales tiene mapeados en bot_profesional_especialidad?
+//   2. ¿Coinciden con lo sincronizado de Reservo?
+//   3. ¿La sincronización está funcionando?
+//
+// Visible en navegador en formato JSON pretty.
+// URL: https://redvital-server.onrender.com/api/bot/diagnostico
+// ============================================================
+app.get("/api/bot/diagnostico", async (req, res) => {
+  try {
+    // 1. Profesionales mapeados por grupo clínico
+    const mapeados = await pool.query(`
+      SELECT 
+        grupo_clinico,
+        COUNT(*)::int AS total_profesionales,
+        array_agg(nombre_display ORDER BY nombre_display) AS nombres
+      FROM bot_profesional_especialidad
+      WHERE visible = TRUE
+      GROUP BY grupo_clinico
+      ORDER BY grupo_clinico
+    `);
+
+    // 2. Cruce con catálogo Reservo
+    const cruce = await pool.query(`
+      SELECT 
+        pe.nombre_display,
+        pe.grupo_clinico,
+        pe.especialidad_oficial,
+        pe.subespecialidad_formacion,
+        CASE 
+          WHEN cp.nombre_normalizado IS NOT NULL THEN 'OK ✅'
+          ELSE 'NO sincronizado de Reservo ❌'
+        END AS estado_reservo,
+        COUNT(DISTINCT cp.agenda_uuid) FILTER (WHERE cp.activo = TRUE) AS agendas_activas
+      FROM bot_profesional_especialidad pe
+      LEFT JOIN bot_catalogo_profesionales cp
+        ON cp.nombre_normalizado = pe.nombre_normalizado AND cp.activo = TRUE
+      WHERE pe.visible = TRUE
+      GROUP BY pe.nombre_display, pe.grupo_clinico, pe.especialidad_oficial, 
+               pe.subespecialidad_formacion, cp.nombre_normalizado
+      ORDER BY pe.grupo_clinico, pe.nombre_display
+    `);
+
+    // 3. Sincronización: últimos 5 syncs
+    const syncs = await pool.query(`
+      SELECT 
+        id,
+        iniciado_en::text AS cuando,
+        tipo,
+        estado,
+        profesionales_total,
+        profesionales_nuevos,
+        profesionales_actualizados,
+        profesionales_desactivados,
+        tratamientos_total,
+        duracion_ms,
+        error
+      FROM bot_sync_log
+      ORDER BY iniciado_en DESC
+      LIMIT 5
+    `);
+
+    // 4. Profesionales que están en Reservo pero NO mapeados (huecos)
+    const noMapeados = await pool.query(`
+      SELECT DISTINCT 
+        cp.nombre,
+        cp.nombre_normalizado,
+        cp.cargo,
+        array_agg(DISTINCT cp.agenda_sede) AS sedes
+      FROM bot_catalogo_profesionales cp
+      LEFT JOIN bot_profesional_especialidad pe
+        ON pe.nombre_normalizado = cp.nombre_normalizado
+      WHERE cp.activo = TRUE
+        AND pe.nombre_normalizado IS NULL
+      GROUP BY cp.nombre, cp.nombre_normalizado, cp.cargo
+      ORDER BY cp.nombre
+    `);
+
+    // 5. Resumen ejecutivo
+    const totalMapeados = mapeados.rows.reduce((s, r) => s + r.total_profesionales, 0);
+    const totalEnReservoMapeados = cruce.rows.filter(r => r.estado_reservo.includes('OK')).length;
+    const totalSinReservo = cruce.rows.filter(r => !r.estado_reservo.includes('OK')).length;
+    const grupos = mapeados.rows.map(r => r.grupo_clinico);
+    const tieneMedicinaGeneral = grupos.includes('medicina_general');
+    const tieneCardio = grupos.includes('cardiologia');
+
+    // 6. Veredicto automático
+    const problemas = [];
+    if (!tieneMedicinaGeneral) {
+      problemas.push("🚨 CRÍTICO: No hay nadie con grupo_clinico='medicina_general'. El bot NO puede agendar medicina general.");
+    }
+    if (!tieneCardio) {
+      problemas.push("⚠️ ATENCIÓN: No hay nadie con grupo_clinico='cardiologia'.");
+    }
+    if (totalSinReservo > 0) {
+      problemas.push(`⚠️ ATENCIÓN: ${totalSinReservo} profesionales mapeados NO están sincronizados de Reservo.`);
+    }
+    if (noMapeados.rows.length > 5) {
+      problemas.push(`💡 OPORTUNIDAD: ${noMapeados.rows.length} profesionales en Reservo no tienen mapeo en bot_profesional_especialidad.`);
+    }
+    if (syncs.rows.length > 0 && syncs.rows[0].estado === 'error') {
+      problemas.push(`🚨 CRÍTICO: La última sincronización falló con error: ${syncs.rows[0].error}`);
+    }
+    if (syncs.rows.length === 0) {
+      problemas.push("🚨 CRÍTICO: Nunca se ha ejecutado una sincronización con Reservo.");
+    }
+
+    res.json({
+      ok: true,
+      timestamp: new Date().toISOString(),
+      
+      resumen_ejecutivo: {
+        total_profesionales_mapeados: totalMapeados,
+        grupos_clinicos: grupos,
+        tiene_medicina_general: tieneMedicinaGeneral,
+        tiene_cardiologia: tieneCardio,
+        mapeados_y_sincronizados: totalEnReservoMapeados,
+        mapeados_sin_reservo: totalSinReservo,
+        en_reservo_sin_mapear: noMapeados.rows.length
+      },
+
+      problemas_detectados: problemas.length === 0 ? ["✅ Sin problemas detectados"] : problemas,
+      
+      diagnostico_1_profesionales_por_grupo: mapeados.rows,
+      
+      diagnostico_2_cruce_con_reservo: cruce.rows,
+      
+      diagnostico_3_sincronizaciones_recientes: syncs.rows,
+      
+      diagnostico_4_profesionales_en_reservo_sin_mapear: noMapeados.rows
+    });
+
+  } catch (err) {
+    console.error('[bot/diagnostico]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ============================================
 // START
 // ============================================
