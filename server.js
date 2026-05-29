@@ -5975,6 +5975,135 @@ app.get("/api/rescates/stats", async (req, res) => {
 
 // ============================================
 // START
+// ============================================================
+// v5.44 - ENVÍO DE PLANTILLAS TWILIO (Content API) + PRUEBA
+// ------------------------------------------------------------
+// QUÉ HACE: permite enviar las plantillas APROBADAS (rescate /
+// recordatorio) a pacientes en frío (fuera de la ventana de 24h),
+// cosa que el texto libre NO puede hacer.
+//
+// DÓNDE PEGAR: copia TODO este bloque y pégalo en server.js
+// JUSTO ANTES del comentario "// START" (esa línea que dice
+// "// ====== START ======", cerca del final, antes de app.listen).
+//
+// ENV VARS QUE NECESITA (agrégalas en Render → Environment):
+//   TWILIO_CONTENT_SID_RESCATE=HX3fea16bc49b996a68e5c7b06e025540c
+//   TWILIO_CONTENT_SID_RECORDATORIO=HX23b072c62eb8d7c02343f11d8377aefd
+//   (y confirma que TWILIO_FROM sea  whatsapp:+56920577848  -> el número
+//    REAL, NO el sandbox tipo whatsapp:+14155238886)
+// ============================================================
+
+// --- Envía una PLANTILLA aprobada por Twilio Content API ---
+async function twilioEnviarPlantilla(to, contentSid, variables) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM) {
+    console.warn('[twilio plantilla] credenciales no configuradas');
+    return { ok: false, error: 'credenciales twilio no configuradas' };
+  }
+  if (!contentSid) return { ok: false, error: 'falta contentSid' };
+
+  // Reutiliza tu helper existente: devuelve dígitos tipo 56912345678
+  const digits = telefonoParaWaMe(to);
+  if (!digits) return { ok: false, error: 'telefono invalido: ' + to };
+  const toFormat = `whatsapp:+${digits}`;
+
+  try {
+    const params = new URLSearchParams();
+    params.append('From', TWILIO_FROM);
+    params.append('To', toFormat);
+    params.append('ContentSid', contentSid);
+    if (variables && Object.keys(variables).length > 0) {
+      params.append('ContentVariables', JSON.stringify(variables));
+    }
+    const r = await axios.post(
+      `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
+      params.toString(),
+      { auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 15000, validateStatus: () => true });
+    if (r.status >= 400) {
+      console.error('[twilio plantilla]', r.status, JSON.stringify(r.data));
+      return { ok: false, status: r.status, data: r.data };
+    }
+    return { ok: true, sid: r.data.sid, status: r.data.status, data: r.data };
+  } catch (err) {
+    console.error('[twilio plantilla] error', err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+// --- Construye las 3 variables de la plantilla rescate_suspension ---
+// Plantilla: "Hola {{1}} ... tu cita del {{2}} con {{3}} ..."
+function variablesRescate(cita) {
+  const fechaObj = new Date(cita.fecha + 'T12:00:00');
+  const fechaFmt = String(fechaObj.getDate()).padStart(2, '0') + '/' +
+                   String(fechaObj.getMonth() + 1).padStart(2, '0');
+  const partes = (cita.paciente || '').trim().split(' ').filter(Boolean);
+  const nombre = partes.length >= 1 ? partes[0] : 'paciente';
+  const profesional = cita.profesional || 'tu profesional';
+  return { "1": nombre, "2": fechaFmt, "3": profesional };
+}
+
+// --- Construye las 5 variables de la plantilla recordatorio_cita_24h ---
+// Plantilla: "Hola {{1}} ... cita mañana {{2}} a las {{3}} con {{4}} en Redvital {{5}}."
+function variablesRecordatorio(cita) {
+  const fechaObj = new Date(cita.fecha + 'T12:00:00');
+  const fechaFmt = String(fechaObj.getDate()).padStart(2, '0') + '/' +
+                   String(fechaObj.getMonth() + 1).padStart(2, '0');
+  const hora = (cita.hora_inicio || '').substring(0, 5);
+  const partes = (cita.paciente || '').trim().split(' ').filter(Boolean);
+  const nombre = partes.length >= 2 ? partes[0] + ' ' + partes[1] : (cita.paciente || 'paciente');
+  const profesional = cita.profesional || 'el profesional';
+  let sede = cita.sucursal || 'nuestra sede';
+  if (sede.includes('Victoria')) sede = 'Victoria 766';
+  else if (sede.includes('Maturana')) sede = 'Maturana 293';
+  else if (sede.includes('Centro Medico')) sede = 'Victoria 766';
+  return { "1": nombre, "2": fechaFmt, "3": hora, "4": profesional, "5": sede };
+}
+
+// ============================================================
+// PRUEBA A 1 NÚMERO (capa 2 - test). Envía 1 mensaje REAL.
+// ------------------------------------------------------------
+// CÓMO PROBARLO desde el navegador del celular (abre la URL):
+//   https://redvital-server.onrender.com/api/rescates/enviar-prueba?telefono=56912345678&tipo=rescate&confirmar=si
+//   https://redvital-server.onrender.com/api/rescates/enviar-prueba?telefono=56912345678&tipo=recordatorio&confirmar=si
+// (pon TU propio número en 'telefono', formato 569XXXXXXXX)
+// Solo envía si confirmar=si (para que no se dispare por accidente).
+// ============================================================
+app.get("/api/rescates/enviar-prueba", async (req, res) => {
+  try {
+    const telefono = req.query.telefono;
+    const tipo = (req.query.tipo || 'rescate').toLowerCase();
+    const confirmar = req.query.confirmar;
+
+    if (!telefono) return res.status(400).json({ ok: false, error: "Falta ?telefono=569XXXXXXXX" });
+    if (confirmar !== 'si') {
+      return res.json({ ok: false, aviso: "Agrega &confirmar=si para enviar de verdad (esto manda 1 mensaje real).", telefono, tipo });
+    }
+
+    let contentSid, variables;
+    if (tipo === 'recordatorio') {
+      contentSid = process.env.TWILIO_CONTENT_SID_RECORDATORIO;
+      variables = { "1": "Néstor", "2": "30/05", "3": "10:00", "4": "Dr. Lodolo", "5": "Victoria 766" };
+    } else {
+      contentSid = process.env.TWILIO_CONTENT_SID_RESCATE;
+      variables = { "1": "Néstor", "2": "28/05", "3": "Dr. Lodolo" };
+    }
+
+    if (!contentSid) {
+      return res.status(400).json({
+        ok: false,
+        error: `Falta la env var del Content SID para tipo='${tipo}'. Agrégala en Render.`,
+        falta: tipo === 'recordatorio' ? 'TWILIO_CONTENT_SID_RECORDATORIO' : 'TWILIO_CONTENT_SID_RESCATE'
+      });
+    }
+
+    const r = await twilioEnviarPlantilla(telefono, contentSid, variables);
+    res.json({ ok: r.ok, enviado_a: telefono, tipo, variables, resultado: r, from_configurado: TWILIO_FROM || '(no seteado)' });
+  } catch (err) {
+    console.error('[rescates/enviar-prueba]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 // ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
