@@ -3225,15 +3225,98 @@ async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
     tools_log: toolsLog, error: 'max_iteraciones' };
 }
 
+// ============================================================
+// v5.46 - Captura de confirmaciones (SÍ/NO) a recordatorios y rescates
+// ------------------------------------------------------------
+// Si el paciente responde a un recordatorio/rescate enviado HOY que sigue
+// pendiente, marca el estado. Devuelve:
+//   { manejado:true, tipo:'recordatorio'|'rescate', respuesta:'si'|'no' }
+//   o null si el mensaje no corresponde a una confirmación pendiente.
+// ============================================================
+function _interpretarRespuesta(texto) {
+  const t = (texto || '').trim().toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  // SÍ
+  if (/^(1|si|si confirmo|confirmo|confirmado|dale|ya|obvio|asistire|asisto|voy|si voy)\b/.test(t)) return 'si';
+  if (t === '1' || t === 'si' || t === 'sí') return 'si';
+  // NO
+  if (/^(2|no|no puedo|no voy|no podre|no asistire|cancelar|cancela|reagendar|reagenda)\b/.test(t)) return 'no';
+  if (t === '2' || t === 'no') return 'no';
+  return null;
+}
+
+async function detectarConfirmacion(wa_id, texto) {
+  const resp = _interpretarRespuesta(texto);
+  if (!resp) return null;
+
+  const digits = (wa_id || '').replace(/\D/g, '');
+  const hoy = new Date(Date.now() - 4 * 3600000).toISOString().slice(0, 10);
+
+  // 1) ¿Hay un RECORDATORIO enviado (estado 'enviado') a este número, reciente?
+  const reco = await pool.query(
+    `SELECT id FROM bot_recordatorios_log
+     WHERE regexp_replace(telefono, '\\D', '', 'g') LIKE '%' || $1
+       AND estado = 'enviado'
+     ORDER BY enviado_en DESC LIMIT 1`,
+    [digits.slice(-8)]
+  );
+  if (reco.rows.length > 0) {
+    const nuevoEstado = resp === 'si' ? 'confirmado' : 'cancelado';
+    await pool.query(
+      `UPDATE bot_recordatorios_log
+       SET estado=$1, respuesta_paciente=$2, respondido_en=$3 WHERE id=$4`,
+      [nuevoEstado, texto.substring(0, 200), new Date().toISOString(), reco.rows[0].id]
+    );
+    return { manejado: true, tipo: 'recordatorio', respuesta: resp };
+  }
+
+  // 2) ¿Hay un RESCATE contactado a este número?
+  const res = await pool.query(
+    `SELECT id FROM bot_rescates_log
+     WHERE regexp_replace(telefono, '\\D', '', 'g') LIKE '%' || $1
+       AND estado_rescate = 'contactado'
+     ORDER BY contactado_en DESC LIMIT 1`,
+    [digits.slice(-8)]
+  );
+  if (res.rows.length > 0) {
+    const nuevoEstado = resp === 'si' ? 'reagendo' : 'rechazo';
+    await pool.query(
+      `UPDATE bot_rescates_log
+       SET estado_rescate=$1, respuesta_paciente=$2, respondido_en=$3 WHERE id=$4`,
+      [nuevoEstado, texto.substring(0, 200), new Date().toISOString(), res.rows[0].id]
+    );
+    return { manejado: true, tipo: 'rescate', respuesta: resp };
+  }
+
+  return null;
+}
+
 async function procesarMensajeBot(wa_id, texto, referral, provider) {
   provider = provider || 'meta';
   console.log(`[bot] mensaje IN [${provider}] ${wa_id}: ${texto ? texto.substring(0, 80) : '(sin texto)'}`);
   await upsertPaciente(wa_id, texto, referral);
   await guardarMensaje(wa_id, 'in', texto);
+
+  // v5.46: ¿es respuesta a un recordatorio/rescate?
+  let conf = null;
+  try { conf = await detectarConfirmacion(wa_id, texto); }
+  catch (e) { console.error('[confirmacion] error', e.message); }
+
+  if (conf && conf.respuesta === 'si') {
+    // Confirmó: marcamos (ya hecho) y NO lo molestamos con el bot.
+    const msg = conf.tipo === 'recordatorio'
+      ? '¡Perfecto! ✅ Tu asistencia quedó confirmada. ¡Te esperamos! 🙌'
+      : '¡Genial! ✅ Te contactaremos para coordinar tu nueva hora. 🙌';
+    await enviarMensajeWhatsApp(provider, wa_id, msg);
+    await guardarMensaje(wa_id, 'out', msg, { datos: { confirmacion: conf } });
+    return;
+  }
+  // Si dijo NO (o cualquier otra cosa), dejamos que el bot responda y ofrezca ayuda.
+
   const resultado = await procesarConversacionConTools(texto || '(mensaje sin texto)', { waId: wa_id });
   await enviarMensajeWhatsApp(provider, wa_id, resultado.texto);
   await guardarMensaje(wa_id, 'out', resultado.texto, {
-    datos: { tools_log: resultado.tools_log, iteraciones: resultado.iteraciones, provider: provider },
+    datos: { tools_log: resultado.tools_log, iteraciones: resultado.iteraciones, provider: provider, confirmacion: conf },
     error: resultado.ok ? null : (resultado.error ? JSON.stringify(resultado.error).substring(0, 500) : null)
   });
 }
@@ -6355,6 +6438,118 @@ async function run(tipo, enviar){
     out.textContent = JSON.stringify(j,null,2);
   }catch(e){ out.textContent='Error: '+e.message; }
 }
+</script>
+</body></html>`);
+});
+
+// ============================================
+// ============================================================
+// v5.46 - PÁGINA DE CONFIRMACIONES DEL DÍA (para la secretaría)
+// GET /api/panel-confirmaciones
+// Muestra, de los recordatorios y rescates, quién respondió SÍ / NO / sin responder.
+// ============================================================
+app.get("/api/confirmaciones-data", async (req, res) => {
+  try {
+    const fecha = req.query.fecha || new Date(Date.now() - 4 * 3600000).toISOString().slice(0, 10);
+    // Recordatorios de citas de esa fecha
+    const reco = await pool.query(
+      `SELECT nombre_paciente, telefono, hora_cita, profesional, sucursal, estado, respuesta_paciente, respondido_en::text AS respondido_en
+       FROM bot_recordatorios_log WHERE fecha_cita = $1 ORDER BY estado, hora_cita`,
+      [fecha]
+    );
+    // Rescates contactados (últimos 7 días de actividad)
+    const res2 = await pool.query(
+      `SELECT nombre_paciente, telefono, fecha_cita_original::text AS fecha_cita, profesional, sucursal, estado_rescate, respuesta_paciente, respondido_en::text AS respondido_en
+       FROM bot_rescates_log
+       WHERE contactado_en >= NOW() - INTERVAL '7 days'
+       ORDER BY estado_rescate`
+    );
+    res.json({ ok: true, fecha, recordatorios: reco.rows, rescates: res2.rows });
+  } catch (err) {
+    console.error('[confirmaciones-data]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/panel-confirmaciones", (req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Confirmaciones RedVital</title>
+<style>
+  body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:0 auto;padding:16px;background:#f4f7fb;color:#13243a}
+  h1{font-size:20px} h2{font-size:16px;margin-top:24px}
+  .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}
+  input[type=date]{padding:8px;border:1px solid #ccd;border-radius:8px}
+  button{border:0;border-radius:8px;padding:9px 14px;font-weight:600;cursor:pointer;background:#1b4fd1;color:#fff}
+  table{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;font-size:13px;margin-top:8px}
+  th,td{padding:9px 10px;text-align:left;border-bottom:1px solid #eef2f7}
+  th{background:#f0f4fa;font-size:12px;text-transform:uppercase;color:#5b6b80}
+  .si{color:#1b8f4d;font-weight:700}
+  .no{color:#c0392b;font-weight:700}
+  .pend{color:#92580a}
+  .pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:12px}
+  .count{background:#fff;border-radius:10px;padding:10px 14px;font-weight:700;display:inline-block;margin-right:8px;font-size:13px}
+</style></head><body>
+<h1>✅ Confirmaciones RedVital</h1>
+<div class="bar">
+  <label>Fecha de las citas (recordatorios): <input id="fecha" type="date"></label>
+  <button onclick="cargar()">Ver</button>
+</div>
+<div id="resumen"></div>
+<h2>🔔 Recordatorios (citas del día elegido)</h2>
+<div id="tabla_reco">Cargando...</div>
+<h2>♻️ Rescates (últimos 7 días)</h2>
+<div id="tabla_res"></div>
+
+<script>
+function hoyCL(){ var d=new Date(Date.now()-4*3600000); return d.toISOString().slice(0,10); }
+function estadoReco(e){
+  if(e==='confirmado') return '<span class="si">SÍ confirmó</span>';
+  if(e==='cancelado') return '<span class="no">NO / cancela</span>';
+  if(e==='enviado') return '<span class="pend">Sin responder</span>';
+  return e||'-';
+}
+function estadoRes(e){
+  if(e==='reagendo') return '<span class="si">Quiere reagendar</span>';
+  if(e==='rechazo') return '<span class="no">No por ahora</span>';
+  if(e==='contactado') return '<span class="pend">Sin responder</span>';
+  return e||'-';
+}
+function tabla(rows, tipo){
+  if(!rows.length) return '<p style="color:#5b6b80">Sin datos.</p>';
+  var th = tipo==='reco'
+    ? '<tr><th>Paciente</th><th>Hora</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th></tr>'
+    : '<tr><th>Paciente</th><th>Cita original</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th></tr>';
+  var body = rows.map(function(r){
+    if(tipo==='reco'){
+      return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+(r.hora_cita||'').substring(0,5)+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoReco(r.estado)+'</td><td>'+(r.respuesta_paciente||'')+'</td></tr>';
+    } else {
+      return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+(r.fecha_cita||'-')+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoRes(r.estado_rescate)+'</td><td>'+(r.respuesta_paciente||'')+'</td></tr>';
+    }
+  }).join('');
+  return '<table>'+th+body+'</table>';
+}
+async function cargar(){
+  var f=document.getElementById('fecha').value || hoyCL();
+  document.getElementById('tabla_reco').textContent='Cargando...';
+  try{
+    var r=await fetch('/api/confirmaciones-data?fecha='+f);
+    var j=await r.json();
+    if(!j.ok){ document.getElementById('tabla_reco').textContent='Error: '+j.error; return; }
+    var siR=j.recordatorios.filter(function(x){return x.estado==='confirmado'}).length;
+    var noR=j.recordatorios.filter(function(x){return x.estado==='cancelado'}).length;
+    var pR=j.recordatorios.filter(function(x){return x.estado==='enviado'}).length;
+    document.getElementById('resumen').innerHTML=
+      '<span class="count si">Confirmaron: '+siR+'</span>'+
+      '<span class="count no">No/cancela: '+noR+'</span>'+
+      '<span class="count pend">Sin responder: '+pR+'</span>';
+    document.getElementById('tabla_reco').innerHTML=tabla(j.recordatorios,'reco');
+    document.getElementById('tabla_res').innerHTML=tabla(j.rescates,'res');
+  }catch(e){ document.getElementById('tabla_reco').textContent='Error: '+e.message; }
+}
+document.getElementById('fecha').value=hoyCL();
+cargar();
 </script>
 </body></html>`);
 });
