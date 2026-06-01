@@ -6105,6 +6105,252 @@ app.get("/api/rescates/enviar-prueba", async (req, res) => {
   }
 });
 // ============================================
+// ============================================================
+// v5.45 - ENVÍO MASIVO MANUAL (botón) recordatorios + rescates
+// ------------------------------------------------------------
+// DÓNDE PEGAR: en server.js, JUSTO ANTES del bloque "// START"
+// (después del endpoint enviar-prueba que ya pegaste).
+//
+// SEGURIDAD: por defecto NO envía. Hace "previsualización" (dice a
+// cuántos se enviaría). Solo envía de verdad si confirmar === 'ENVIAR'.
+//
+// CÓMO USARLO: abre en el navegador:
+//   https://redvital-server.onrender.com/api/panel-envios
+// y ahí tienes los 2 botones (Previsualizar / Enviar ahora).
+//
+// NECESITA estas env vars en Render (ya las pusiste):
+//   TWILIO_CONTENT_SID_RESCATE, TWILIO_CONTENT_SID_RECORDATORIO
+// ============================================================
+
+function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+const _ENVIO_DELAY_MS = 700;   // respiro entre mensajes (rate limit Tier 1)
+const _ENVIO_CAP = 120;        // máximo por clic (para no exceder el tiempo de request)
+
+// --- upsert en bot_recordatorios_log ---
+async function upsertRecordatorioLog(cita, estado, mensaje, modo) {
+  const enviadoEn = new Date().toISOString();
+  const existe = await pool.query(
+    `SELECT id FROM bot_recordatorios_log WHERE uuid_cita = $1 AND fecha_cita = $2 LIMIT 1`,
+    [cita.uuid_cita, cita.fecha]
+  );
+  if (existe.rows.length > 0) {
+    await pool.query(
+      `UPDATE bot_recordatorios_log SET estado=$1, enviado_en=$2, mensaje_enviado=$3, modo=$4, usuario_envio=$5 WHERE id=$6`,
+      [estado, enviadoEn, mensaje, modo, 'envio_masivo', existe.rows[0].id]
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO bot_recordatorios_log
+        (uuid_cita, rut_paciente, nombre_paciente, telefono, fecha_cita, hora_cita,
+         profesional, sucursal, mensaje_enviado, modo, estado, enviado_en, usuario_envio)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [cita.uuid_cita, cita.rut, cita.paciente, cita.telefonos, cita.fecha, cita.hora_inicio,
+       cita.profesional, cita.sucursal, mensaje, modo, estado, enviadoEn, 'envio_masivo']
+    );
+  }
+}
+
+// --- upsert en bot_rescates_log ---
+async function upsertRescateLog(cita, estado, mensaje, modo) {
+  const contactadoEn = new Date().toISOString();
+  const existe = await pool.query(
+    `SELECT id FROM bot_rescates_log WHERE uuid_cita = $1 LIMIT 1`, [cita.uuid_cita]
+  );
+  if (existe.rows.length > 0) {
+    await pool.query(
+      `UPDATE bot_rescates_log SET estado_rescate=$1, contactado_en=$2, mensaje_enviado=$3, modo=$4, usuario_envio=$5 WHERE id=$6`,
+      [estado, contactadoEn, mensaje, modo, 'envio_masivo', existe.rows[0].id]
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO bot_rescates_log
+        (uuid_cita, rut_paciente, nombre_paciente, telefono, fecha_cita_original, hora_cita_original,
+         profesional, sucursal, tratamiento, estado_cita_original, mensaje_enviado, modo,
+         estado_rescate, contactado_en, usuario_envio)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+      [cita.uuid_cita, cita.rut, cita.paciente, cita.telefonos, cita.fecha, cita.hora_inicio,
+       cita.profesional, cita.sucursal, cita.tratamiento, cita.estado_cita, mensaje, modo,
+       estado, contactadoEn, 'envio_masivo']
+    );
+  }
+}
+
+// ===== RECORDATORIOS: envío masivo =====
+// POST /api/recordatorios/enviar-masivo  { fecha?, sucursal?, confirmar }
+app.post("/api/recordatorios/enviar-masivo", async (req, res) => {
+  try {
+    const { fecha, sucursal, confirmar } = req.body || {};
+    const contentSid = process.env.TWILIO_CONTENT_SID_RECORDATORIO;
+    if (!contentSid) return res.status(400).json({ ok: false, error: "Falta env var TWILIO_CONTENT_SID_RECORDATORIO en Render" });
+
+    let fechaTarget = fecha;
+    if (!fechaTarget) {
+      const ahoraCL = new Date(Date.now() - 4 * 3600000);
+      const manana = new Date(ahoraCL); manana.setUTCDate(manana.getUTCDate() + 1);
+      fechaTarget = manana.toISOString().slice(0, 10);
+    }
+    const params = [fechaTarget];
+    let whereSuc = '';
+    if (sucursal && sucursal !== 'Ambas') { params.push(sucursal); whereSuc = ' AND c.sucursal = $2'; }
+
+    const sql = `
+      SELECT c.uuid_cita, c.rut, c.paciente, c.telefonos, c.fecha::text AS fecha,
+             c.hora_inicio::text AS hora_inicio, c.profesional, c.sucursal, c.tratamiento, c.estado_cita,
+             r.estado AS recordatorio_estado
+      FROM citas c
+      LEFT JOIN bot_recordatorios_log r ON r.uuid_cita = c.uuid_cita AND r.fecha_cita = c.fecha
+      WHERE c.fecha = $1 ${whereSuc}
+        AND c.estado_cita NOT IN ('Eliminado','Suspendió')
+        AND c.paciente IS NOT NULL
+      ORDER BY c.hora_inicio NULLS LAST`;
+    const { rows } = await pool.query(sql, params);
+
+    const elegibles = []; let sinTelefono = 0, yaEnviados = 0;
+    for (const r of rows) {
+      if (!telefonoParaWaMe(r.telefonos)) { sinTelefono++; continue; }
+      if (r.recordatorio_estado && r.recordatorio_estado !== 'pendiente') { yaEnviados++; continue; }
+      elegibles.push(r);
+    }
+
+    if (confirmar !== 'ENVIAR') {
+      return res.json({ ok: true, modo: 'PREVISUALIZACION (no se envió nada)', fecha: fechaTarget,
+        total_citas: rows.length, se_enviarian: elegibles.length, sin_telefono: sinTelefono, ya_enviados: yaEnviados });
+    }
+
+    const lote = elegibles.slice(0, _ENVIO_CAP);
+    let enviados = 0, fallidos = 0; const errores = [];
+    for (const r of lote) {
+      const env = await twilioEnviarPlantilla(r.telefonos, contentSid, variablesRecordatorio(r));
+      if (env.ok) { enviados++; await upsertRecordatorioLog(r, 'enviado', construirMensajeRecordatorio(r), 'twilio_auto'); }
+      else { fallidos++; if (errores.length < 10) errores.push({ paciente: r.paciente, error: env.error || env.data }); }
+      await _sleep(_ENVIO_DELAY_MS);
+    }
+    const restantes = elegibles.length - lote.length;
+    res.json({ ok: true, modo: 'ENVIADO', fecha: fechaTarget, enviados, fallidos,
+      sin_telefono: sinTelefono, ya_enviados: yaEnviados, restantes,
+      nota: restantes > 0 ? `Quedan ${restantes} por enviar: vuelve a apretar el botón.` : 'Todos procesados.',
+      errores });
+  } catch (err) {
+    console.error('[recordatorios/enviar-masivo]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ===== RESCATES: envío masivo =====
+// POST /api/rescates/enviar-masivo  { dias?, sucursal?, confirmar }
+app.post("/api/rescates/enviar-masivo", async (req, res) => {
+  try {
+    const { dias, sucursal, confirmar } = req.body || {};
+    const contentSid = process.env.TWILIO_CONTENT_SID_RESCATE;
+    if (!contentSid) return res.status(400).json({ ok: false, error: "Falta env var TWILIO_CONTENT_SID_RESCATE en Render" });
+
+    const d = parseInt(dias) || 7;
+    const ahora = new Date();
+    const fechaHasta = new Date(ahora.getTime() - 1 * 86400000).toISOString().slice(0, 10);
+    const fechaDesde = new Date(ahora.getTime() - d * 86400000).toISOString().slice(0, 10);
+    const params = [fechaDesde, fechaHasta];
+    let whereSuc = '';
+    if (sucursal && sucursal !== 'Ambas') { params.push(sucursal); whereSuc = ' AND c.sucursal = $3'; }
+
+    const sql = `
+      SELECT c.uuid_cita, c.rut, c.paciente, c.telefonos, c.fecha::text AS fecha,
+             c.hora_inicio::text AS hora_inicio, c.profesional, c.sucursal, c.tratamiento, c.estado_cita,
+             r.estado_rescate
+      FROM citas c
+      LEFT JOIN bot_rescates_log r ON r.uuid_cita = c.uuid_cita
+      WHERE c.fecha BETWEEN $1 AND $2 ${whereSuc}
+        AND c.estado_cita IN ('Suspendió','No llegó')
+        AND c.paciente IS NOT NULL
+      ORDER BY c.fecha DESC`;
+    const { rows } = await pool.query(sql, params);
+
+    const elegibles = []; let sinTelefono = 0, yaContactados = 0;
+    for (const r of rows) {
+      if (!telefonoParaWaMe(r.telefonos)) { sinTelefono++; continue; }
+      if (r.estado_rescate && r.estado_rescate !== 'pendiente') { yaContactados++; continue; }
+      elegibles.push(r);
+    }
+
+    if (confirmar !== 'ENVIAR') {
+      return res.json({ ok: true, modo: 'PREVISUALIZACION (no se envió nada)', periodo: { desde: fechaDesde, hasta: fechaHasta },
+        total: rows.length, se_enviarian: elegibles.length, sin_telefono: sinTelefono, ya_contactados: yaContactados });
+    }
+
+    const lote = elegibles.slice(0, _ENVIO_CAP);
+    let enviados = 0, fallidos = 0; const errores = [];
+    for (const r of lote) {
+      const env = await twilioEnviarPlantilla(r.telefonos, contentSid, variablesRescate(r));
+      if (env.ok) { enviados++; await upsertRescateLog(r, 'contactado', construirMensajeRescate(r), 'twilio_auto'); }
+      else { fallidos++; if (errores.length < 10) errores.push({ paciente: r.paciente, error: env.error || env.data }); }
+      await _sleep(_ENVIO_DELAY_MS);
+    }
+    const restantes = elegibles.length - lote.length;
+    res.json({ ok: true, modo: 'ENVIADO', enviados, fallidos,
+      sin_telefono: sinTelefono, ya_contactados: yaContactados, restantes,
+      nota: restantes > 0 ? `Quedan ${restantes} por enviar: vuelve a apretar el botón.` : 'Todos procesados.',
+      errores });
+  } catch (err) {
+    console.error('[rescates/enviar-masivo]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ===== PANEL con los botones (abrir en el navegador) =====
+// GET /api/panel-envios
+app.get("/api/panel-envios", (req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Envios RedVital</title>
+<style>
+  body{font-family:system-ui,Arial,sans-serif;max-width:640px;margin:0 auto;padding:20px;background:#f4f7fb;color:#13243a}
+  h1{font-size:20px}
+  .card{background:#fff;border-radius:14px;padding:18px;margin:16px 0;box-shadow:0 2px 10px rgba(0,0,0,.06)}
+  .card h2{font-size:17px;margin:0 0 4px}
+  .card p{color:#5b6b80;font-size:13px;margin:0 0 14px}
+  button{border:0;border-radius:10px;padding:12px 16px;font-size:15px;font-weight:600;cursor:pointer;margin-right:8px}
+  .prev{background:#e7eefb;color:#1b4fd1}
+  .send{background:#1b8f4d;color:#fff}
+  pre{background:#0f1b2d;color:#d6e2f5;padding:14px;border-radius:10px;overflow:auto;font-size:12px;white-space:pre-wrap;margin-top:12px}
+  .warn{background:#fff5e6;border:1px solid #ffd591;border-radius:10px;padding:10px;font-size:13px;color:#92580a}
+</style></head><body>
+<h1>Envios RedVital</h1>
+<div class="warn">Primero aprieta <b>Previsualizar</b> para ver a cuantos se enviaria. <b>Enviar ahora</b> manda mensajes reales por WhatsApp.</div>
+
+<div class="card">
+  <h2>Recordatorios</h2>
+  <p>Citas de manana. Manda la plantilla recordatorio_cita_24h.</p>
+  <button class="prev" onclick="run('recordatorios',false)">Previsualizar</button>
+  <button class="send" onclick="run('recordatorios',true)">Enviar ahora</button>
+</div>
+
+<div class="card">
+  <h2>Rescates (no asistieron)</h2>
+  <p>Suspendidos / no-show de los ultimos 7 dias. Manda rescate_suspension.</p>
+  <button class="prev" onclick="run('rescates',false)">Previsualizar</button>
+  <button class="send" onclick="run('rescates',true)">Enviar ahora</button>
+</div>
+
+<pre id="out">Aqui aparece el resultado...</pre>
+
+<script>
+async function run(tipo, enviar){
+  var out=document.getElementById('out');
+  if(enviar && !confirm('Seguro? Esto envia mensajes REALES por WhatsApp a los pacientes.')) return;
+  out.textContent='Procesando...';
+  var url = tipo==='recordatorios' ? '/api/recordatorios/enviar-masivo' : '/api/rescates/enviar-masivo';
+  try{
+    var r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(enviar?{confirmar:'ENVIAR'}:{})});
+    var j = await r.json();
+    out.textContent = JSON.stringify(j,null,2);
+  }catch(e){ out.textContent='Error: '+e.message; }
+}
+</script>
+</body></html>`);
+});
+
+// ============================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log("Servidor Redvital v5.43.5 corriendo en puerto " + PORT);
