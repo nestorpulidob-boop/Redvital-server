@@ -6179,7 +6179,7 @@ async function upsertRescateLog(cita, estado, mensaje, modo) {
 // POST /api/recordatorios/enviar-masivo  { fecha?, sucursal?, confirmar }
 app.post("/api/recordatorios/enviar-masivo", async (req, res) => {
   try {
-    const { fecha, sucursal, confirmar } = req.body || {};
+    const { fecha, sucursal, confirmar, limite } = req.body || {};
     const contentSid = process.env.TWILIO_CONTENT_SID_RECORDATORIO;
     if (!contentSid) return res.status(400).json({ ok: false, error: "Falta env var TWILIO_CONTENT_SID_RECORDATORIO en Render" });
 
@@ -6217,7 +6217,8 @@ app.post("/api/recordatorios/enviar-masivo", async (req, res) => {
         total_citas: rows.length, se_enviarian: elegibles.length, sin_telefono: sinTelefono, ya_enviados: yaEnviados });
     }
 
-    const lote = elegibles.slice(0, _ENVIO_CAP);
+    const _cap = (limite && parseInt(limite) > 0) ? Math.min(parseInt(limite), _ENVIO_CAP) : _ENVIO_CAP;
+    const lote = elegibles.slice(0, _cap);
     let enviados = 0, fallidos = 0; const errores = [];
     for (const r of lote) {
       const env = await twilioEnviarPlantilla(r.telefonos, contentSid, variablesRecordatorio(r));
@@ -6240,7 +6241,7 @@ app.post("/api/recordatorios/enviar-masivo", async (req, res) => {
 // POST /api/rescates/enviar-masivo  { dias?, sucursal?, confirmar }
 app.post("/api/rescates/enviar-masivo", async (req, res) => {
   try {
-    const { dias, sucursal, confirmar } = req.body || {};
+    const { dias, sucursal, confirmar, limite } = req.body || {};
     const contentSid = process.env.TWILIO_CONTENT_SID_RESCATE;
     if (!contentSid) return res.status(400).json({ ok: false, error: "Falta env var TWILIO_CONTENT_SID_RESCATE en Render" });
 
@@ -6276,7 +6277,8 @@ app.post("/api/rescates/enviar-masivo", async (req, res) => {
         total: rows.length, se_enviarian: elegibles.length, sin_telefono: sinTelefono, ya_contactados: yaContactados });
     }
 
-    const lote = elegibles.slice(0, _ENVIO_CAP);
+    const _cap = (limite && parseInt(limite) > 0) ? Math.min(parseInt(limite), _ENVIO_CAP) : _ENVIO_CAP;
+    const lote = elegibles.slice(0, _cap);
     let enviados = 0, fallidos = 0; const errores = [];
     for (const r of lote) {
       const env = await twilioEnviarPlantilla(r.telefonos, contentSid, variablesRescate(r));
@@ -6320,6 +6322,7 @@ app.get("/api/panel-envios", (req, res) => {
 <div class="card">
   <h2>Recordatorios</h2>
   <p>Citas de manana. Manda la plantilla recordatorio_cita_24h.</p>
+  <label style="font-size:13px;color:#5b6b80">Cuantos enviar (vacio = todos): <input id="lim_reco" type="number" min="1" placeholder="todos" style="width:90px;padding:6px;border:1px solid #ccd;border-radius:8px"></label><br><br>
   <button class="prev" onclick="run('recordatorios',false)">Previsualizar</button>
   <button class="send" onclick="run('recordatorios',true)">Enviar ahora</button>
 </div>
@@ -6327,6 +6330,7 @@ app.get("/api/panel-envios", (req, res) => {
 <div class="card">
   <h2>Rescates (no asistieron)</h2>
   <p>Suspendidos / no-show de los ultimos 7 dias. Manda rescate_suspension.</p>
+  <label style="font-size:13px;color:#5b6b80">Cuantos enviar (vacio = todos): <input id="lim_res" type="number" min="1" placeholder="todos" style="width:90px;padding:6px;border:1px solid #ccd;border-radius:8px"></label><br><br>
   <button class="prev" onclick="run('rescates',false)">Previsualizar</button>
   <button class="send" onclick="run('rescates',true)">Enviar ahora</button>
 </div>
@@ -6339,9 +6343,14 @@ async function run(tipo, enviar){
   if(enviar && !confirm('Seguro? Esto envia mensajes REALES por WhatsApp a los pacientes.')) return;
   out.textContent='Procesando...';
   var url = tipo==='recordatorios' ? '/api/recordatorios/enviar-masivo' : '/api/rescates/enviar-masivo';
+  var limEl = document.getElementById(tipo==='recordatorios' ? 'lim_reco' : 'lim_res');
+  var lim = limEl && limEl.value ? parseInt(limEl.value) : null;
+  var payload = {};
+  if(enviar) payload.confirmar = 'ENVIAR';
+  if(lim) payload.limite = lim;
   try{
     var r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(enviar?{confirmar:'ENVIAR'}:{})});
+      body: JSON.stringify(payload)});
     var j = await r.json();
     out.textContent = JSON.stringify(j,null,2);
   }catch(e){ out.textContent='Error: '+e.message; }
