@@ -6498,6 +6498,10 @@ app.get("/api/panel-confirmaciones", (req, res) => {
   .pend{color:#92580a}
   .pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:12px}
   .count{background:#fff;border-radius:10px;padding:10px 14px;font-weight:700;display:inline-block;margin-right:8px;font-size:13px}
+  .alerta{background:#e6f6ec;border:2px solid #1b8f4d;border-radius:12px;padding:14px;margin:14px 0}
+  .alerta h2{margin:0 0 8px;color:#157a40}
+  .wabtn{display:inline-block;background:#25D366;color:#fff;padding:7px 14px;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px}
+  .rerow{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #cdeccf;flex-wrap:wrap}
 </style></head><body>
 <h1>✅ Confirmaciones RedVital</h1>
 <div class="bar">
@@ -6505,6 +6509,7 @@ app.get("/api/panel-confirmaciones", (req, res) => {
   <button onclick="cargar()">Ver</button>
 </div>
 <div id="resumen"></div>
+<div id="reagendar_box"></div>
 <h2>🔔 Recordatorios (citas del día elegido)</h2>
 <div id="tabla_reco">Cargando...</div>
 <h2>♻️ Rescates (últimos 7 días)</h2>
@@ -6554,6 +6559,22 @@ async function cargar(){
       '<span class="count pend">Sin responder: '+pR+'</span>';
     document.getElementById('tabla_reco').innerHTML=tabla(j.recordatorios,'reco');
     document.getElementById('tabla_res').innerHTML=tabla(j.rescates,'res');
+
+    // CAJA DESTACADA: pacientes que quieren reagendar -> botón WhatsApp directo
+    var quieren=(j.rescates||[]).filter(function(x){return x.estado_rescate==='reagendo'});
+    var box=document.getElementById('reagendar_box');
+    if(quieren.length){
+      var items=quieren.map(function(r){
+        var tel=(r.telefono||'').replace(/\D/g,'');
+        if(tel.length===9) tel='56'+tel; else if(tel.length===8) tel='569'+tel;
+        var msg=encodeURIComponent('Hola '+(r.nombre_paciente||'')+', le escribimos de Redvital para ayudarle a reagendar su hora. ¿Qué día le acomoda?');
+        var btn = tel ? '<a class="wabtn" href="https://wa.me/'+tel+'?text='+msg+'" target="_blank">📱 Escribir por WhatsApp</a>' : '<span style="color:#c0392b">Sin teléfono</span>';
+        return '<div class="rerow"><div><strong>'+(r.nombre_paciente||'-')+'</strong> · faltó el '+(r.fecha_cita||'-')+' con '+(r.profesional||'-')+'<br><span style="font-family:monospace;color:#557">'+(r.telefono||'')+'</span></div>'+btn+'</div>';
+      }).join('');
+      box.innerHTML='<div class="alerta"><h2>🔔 '+quieren.length+' paciente(s) quieren REAGENDAR — contactar</h2>'+items+'</div>';
+    } else {
+      box.innerHTML='';
+    }
   }catch(e){ document.getElementById('tabla_reco').textContent='Error: '+e.message; }
 }
 document.getElementById('fecha').value=hoyCL();
