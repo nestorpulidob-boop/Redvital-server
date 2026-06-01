@@ -2203,6 +2203,8 @@ async function inicializarBotBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_fecha ON bot_rescates_log(fecha_cita_original)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_uuid_cita ON bot_rescates_log(uuid_cita)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_estado ON bot_rescates_log(estado_rescate)`);
+    await pool.query(`ALTER TABLE bot_rescates_log ADD COLUMN IF NOT EXISTS secretaria_contacto_en TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE bot_rescates_log ADD COLUMN IF NOT EXISTS secretaria_contacto_por TEXT`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_rut ON bot_rescates_log(rut_paciente)`);
 
     // v5.43.3 - Mapeo automático de 3 profesionales nuevos
@@ -6456,6 +6458,28 @@ async function run(tipo, enviar){
 // GET /api/panel-confirmaciones
 // Muestra, de los recordatorios y rescates, quién respondió SÍ / NO / sin responder.
 // ============================================================
+// v5.47 - Marcar que la secretaría ya contactó a un paciente de rescate (compartido)
+app.post("/api/rescates/marcar-contactado", async (req, res) => {
+  try {
+    const { id, quien } = req.body || {};
+    if (!id) return res.status(400).json({ ok: false, error: "Falta id" });
+    await pool.query(
+      `UPDATE bot_rescates_log SET secretaria_contacto_en = NOW(), secretaria_contacto_por = $2 WHERE id = $1`,
+      [id, (quien || 'secretaria').substring(0, 40)]
+    );
+    res.json({ ok: true, id });
+  } catch (err) {
+    console.error('[marcar-contactado]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// v5.47 - Clave simple para autorizar envíos desde el link de secretarias
+const _CLAVE_ENVIO = process.env.CLAVE_ENVIO || 'redvital2026';
+app.get("/api/verificar-clave", (req, res) => {
+  res.json({ ok: (req.query.clave || '') === _CLAVE_ENVIO });
+});
+
 app.get("/api/confirmaciones-data", async (req, res) => {
   try {
     const fecha = req.query.fecha || new Date(Date.now() - 4 * 3600000).toISOString().slice(0, 10);
@@ -6467,7 +6491,8 @@ app.get("/api/confirmaciones-data", async (req, res) => {
     );
     // Rescates contactados (últimos 7 días de actividad)
     const res2 = await pool.query(
-      `SELECT nombre_paciente, telefono, fecha_cita_original::text AS fecha_cita, profesional, sucursal, estado_rescate, respuesta_paciente, respondido_en::text AS respondido_en
+      `SELECT id, nombre_paciente, telefono, fecha_cita_original::text AS fecha_cita, profesional, sucursal, estado_rescate, respuesta_paciente, respondido_en::text AS respondido_en,
+              secretaria_contacto_en::text AS secretaria_contacto_en, secretaria_contacto_por
        FROM bot_rescates_log
        WHERE contactado_en >= NOW() - INTERVAL '7 days'
        ORDER BY estado_rescate`
@@ -6488,24 +6513,51 @@ app.get("/api/panel-confirmaciones", (req, res) => {
   body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:0 auto;padding:16px;background:#f4f7fb;color:#13243a}
   h1{font-size:20px} h2{font-size:16px;margin-top:24px}
   .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}
-  input[type=date]{padding:8px;border:1px solid #ccd;border-radius:8px}
+  input[type=date],input[type=password]{padding:8px;border:1px solid #ccd;border-radius:8px}
   button{border:0;border-radius:8px;padding:9px 14px;font-weight:600;cursor:pointer;background:#1b4fd1;color:#fff}
+  .prev{background:#e7eefb;color:#1b4fd1}
+  .send{background:#1b8f4d;color:#fff}
   table{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;font-size:13px;margin-top:8px}
   th,td{padding:9px 10px;text-align:left;border-bottom:1px solid #eef2f7}
   th{background:#f0f4fa;font-size:12px;text-transform:uppercase;color:#5b6b80}
-  .si{color:#1b8f4d;font-weight:700}
-  .no{color:#c0392b;font-weight:700}
-  .pend{color:#92580a}
-  .pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:12px}
+  .si{color:#1b8f4d;font-weight:700} .no{color:#c0392b;font-weight:700} .pend{color:#92580a}
   .count{background:#fff;border-radius:10px;padding:10px 14px;font-weight:700;display:inline-block;margin-right:8px;font-size:13px}
   .alerta{background:#e6f6ec;border:2px solid #1b8f4d;border-radius:12px;padding:14px;margin:14px 0}
   .alerta h2{margin:0 0 8px;color:#157a40}
   .wabtn{display:inline-block;background:#25D366;color:#fff;padding:7px 14px;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px}
+  .wabtn.hecho{background:#c0392b}
   .rerow{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #cdeccf;flex-wrap:wrap}
+  .card{background:#fff;border-radius:12px;padding:14px;margin:12px 0;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+  .warn{background:#fff5e6;border:1px solid #ffd591;border-radius:10px;padding:10px;font-size:13px;color:#92580a;margin:10px 0}
+  .out{background:#0f1b2d;color:#d6e2f5;padding:10px;border-radius:8px;font-size:12px;white-space:pre-wrap;margin-top:8px}
 </style></head><body>
 <h1>✅ Confirmaciones RedVital</h1>
+
+<div class="card">
+  <h3 style="margin-top:0">Enviar mensajes</h3>
+  <div class="warn">Para enviar necesitas la clave. Primero "Previsualizar" (no envía). "Enviar ahora" manda WhatsApp reales.</div>
+  <div class="bar">
+    <input id="clave" type="password" placeholder="clave para enviar">
+    <button onclick="verificar()">Desbloquear envío</button>
+    <span id="clave-msg" style="font-size:13px"></span>
+  </div>
+  <div id="envio-controles" style="display:none">
+    <div class="bar">
+      <strong style="font-size:13px">Recordatorios (mañana):</strong>
+      <button class="prev" onclick="accion('recordatorios',false)">Previsualizar</button>
+      <button class="send" onclick="accion('recordatorios',true)">Enviar ahora</button>
+    </div>
+    <div class="bar">
+      <strong style="font-size:13px">Rescates (7 días):</strong>
+      <button class="prev" onclick="accion('rescates',false)">Previsualizar</button>
+      <button class="send" onclick="accion('rescates',true)">Enviar ahora</button>
+    </div>
+    <div id="envio-out" class="out" style="display:none"></div>
+  </div>
+</div>
+
 <div class="bar">
-  <label>Fecha de las citas (recordatorios): <input id="fecha" type="date"></label>
+  <label>Fecha de citas (recordatorios): <input id="fecha" type="date"></label>
   <button onclick="cargar()">Ver</button>
 </div>
 <div id="resumen"></div>
@@ -6516,7 +6568,30 @@ app.get("/api/panel-confirmaciones", (req, res) => {
 <div id="tabla_res"></div>
 
 <script>
+var CLAVE_OK = '';
 function hoyCL(){ var d=new Date(Date.now()-4*3600000); return d.toISOString().slice(0,10); }
+async function verificar(){
+  var c=document.getElementById('clave').value;
+  var m=document.getElementById('clave-msg');
+  try{
+    var r=await fetch('/api/verificar-clave?clave='+encodeURIComponent(c));
+    var j=await r.json();
+    if(j.ok){ CLAVE_OK=c; document.getElementById('envio-controles').style.display='block'; m.textContent='✅ Envío desbloqueado'; m.style.color='#1b8f4d'; }
+    else { m.textContent='❌ Clave incorrecta'; m.style.color='#c0392b'; }
+  }catch(e){ m.textContent='Error: '+e.message; }
+}
+async function accion(tipo, enviar){
+  if(enviar && !confirm('¿Segura? Esto envía mensajes REALES por WhatsApp a los pacientes.')) return;
+  var out=document.getElementById('envio-out'); out.style.display='block'; out.textContent='Procesando...';
+  var url = tipo==='recordatorios' ? '/api/recordatorios/enviar-masivo' : '/api/rescates/enviar-masivo';
+  var payload = enviar ? {confirmar:'ENVIAR'} : {};
+  try{
+    var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    var j=await r.json();
+    out.textContent = JSON.stringify(j,null,2);
+    if(enviar) cargar();
+  }catch(e){ out.textContent='Error: '+e.message; }
+}
 function estadoReco(e){
   if(e==='confirmado') return '<span class="si">SÍ confirmó</span>';
   if(e==='cancelado') return '<span class="no">NO / cancela</span>';
@@ -6529,25 +6604,29 @@ function estadoRes(e){
   if(e==='contactado') return '<span class="pend">Sin responder</span>';
   return e||'-';
 }
-function tabla(rows, tipo){
+function tablaReco(rows){
   if(!rows.length) return '<p style="color:#5b6b80">Sin datos.</p>';
-  var th = tipo==='reco'
-    ? '<tr><th>Paciente</th><th>Hora</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th></tr>'
-    : '<tr><th>Paciente</th><th>Cita original</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th></tr>';
-  var body = rows.map(function(r){
-    if(tipo==='reco'){
-      return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+(r.hora_cita||'').substring(0,5)+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoReco(r.estado)+'</td><td>'+(r.respuesta_paciente||'')+'</td></tr>';
-    } else {
-      return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+(r.fecha_cita||'-')+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoRes(r.estado_rescate)+'</td><td>'+(r.respuesta_paciente||'')+'</td></tr>';
-    }
+  var body=rows.map(function(r){
+    return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+(r.hora_cita||'').substring(0,5)+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoReco(r.estado)+'</td><td>'+(r.respuesta_paciente||'')+'</td></tr>';
   }).join('');
-  return '<table>'+th+body+'</table>';
+  return '<table><tr><th>Paciente</th><th>Hora</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th></tr>'+body+'</table>';
+}
+function tablaRes(rows){
+  if(!rows.length) return '<p style="color:#5b6b80">Sin datos.</p>';
+  var body=rows.map(function(r){
+    return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+(r.fecha_cita||'-')+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoRes(r.estado_rescate)+'</td><td>'+(r.respuesta_paciente||'')+'</td></tr>';
+  }).join('');
+  return '<table><tr><th>Paciente</th><th>Cita original</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th></tr>'+body+'</table>';
+}
+async function marcarContactado(id, btn){
+  btn.classList.add('hecho'); btn.textContent='✅ Ya contactado';
+  try{ await fetch('/api/rescates/marcar-contactado',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})}); }catch(e){}
 }
 async function cargar(){
   var f=document.getElementById('fecha').value || hoyCL();
   document.getElementById('tabla_reco').textContent='Cargando...';
   try{
-    var r=await fetch('/api/confirmaciones-data?fecha='+f);
+    var r=await fetch('/api/confirmaciones-data?fecha='+f,{cache:'no-store'});
     var j=await r.json();
     if(!j.ok){ document.getElementById('tabla_reco').textContent='Error: '+j.error; return; }
     var siR=j.recordatorios.filter(function(x){return x.estado==='confirmado'}).length;
@@ -6557,10 +6636,9 @@ async function cargar(){
       '<span class="count si">Confirmaron: '+siR+'</span>'+
       '<span class="count no">No/cancela: '+noR+'</span>'+
       '<span class="count pend">Sin responder: '+pR+'</span>';
-    document.getElementById('tabla_reco').innerHTML=tabla(j.recordatorios,'reco');
-    document.getElementById('tabla_res').innerHTML=tabla(j.rescates,'res');
+    document.getElementById('tabla_reco').innerHTML=tablaReco(j.recordatorios);
+    document.getElementById('tabla_res').innerHTML=tablaRes(j.rescates);
 
-    // CAJA DESTACADA: pacientes que quieren reagendar -> botón WhatsApp directo
     var quieren=(j.rescates||[]).filter(function(x){return x.estado_rescate==='reagendo'});
     var box=document.getElementById('reagendar_box');
     if(quieren.length){
@@ -6568,17 +6646,21 @@ async function cargar(){
         var tel=(r.telefono||'').replace(/\D/g,'');
         if(tel.length===9) tel='56'+tel; else if(tel.length===8) tel='569'+tel;
         var msg=encodeURIComponent('Hola '+(r.nombre_paciente||'')+', le escribimos de Redvital para ayudarle a reagendar su hora. ¿Qué día le acomoda?');
-        var btn = tel ? '<a class="wabtn" href="https://wa.me/'+tel+'?text='+msg+'" target="_blank">📱 Escribir por WhatsApp</a>' : '<span style="color:#c0392b">Sin teléfono</span>';
+        var yaHecho = !!r.secretaria_contacto_en;
+        var cls = yaHecho ? 'wabtn hecho' : 'wabtn';
+        var txt = yaHecho ? '✅ Ya contactado' : '📱 Escribir por WhatsApp';
+        var btn = tel
+          ? '<a class="'+cls+'" href="https://wa.me/'+tel+'?text='+msg+'" target="_blank" onclick="marcarContactado('+r.id+',this)">'+txt+'</a>'
+          : '<span style="color:#c0392b">Sin teléfono</span>';
         return '<div class="rerow"><div><strong>'+(r.nombre_paciente||'-')+'</strong> · faltó el '+(r.fecha_cita||'-')+' con '+(r.profesional||'-')+'<br><span style="font-family:monospace;color:#557">'+(r.telefono||'')+'</span></div>'+btn+'</div>';
       }).join('');
       box.innerHTML='<div class="alerta"><h2>🔔 '+quieren.length+' paciente(s) quieren REAGENDAR — contactar</h2>'+items+'</div>';
-    } else {
-      box.innerHTML='';
-    }
+    } else { box.innerHTML=''; }
   }catch(e){ document.getElementById('tabla_reco').textContent='Error: '+e.message; }
 }
 document.getElementById('fecha').value=hoyCL();
 cargar();
+setInterval(cargar, 60000);
 </script>
 </body></html>`);
 });
