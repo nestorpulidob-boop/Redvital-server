@@ -6288,16 +6288,20 @@ app.post("/api/recordatorios/enviar-masivo", async (req, res) => {
       ORDER BY c.hora_inicio NULLS LAST`;
     const { rows } = await pool.query(sql, params);
 
-    const elegibles = []; let sinTelefono = 0, yaEnviados = 0;
+    const elegibles = []; let sinTelefono = 0, yaEnviados = 0, duplicados = 0;
+    const _vistos = new Set();
     for (const r of rows) {
-      if (!telefonoParaWaMe(r.telefonos)) { sinTelefono++; continue; }
+      const _dig = telefonoParaWaMe(r.telefonos);
+      if (!_dig) { sinTelefono++; continue; }
       if (r.recordatorio_estado && r.recordatorio_estado !== 'pendiente') { yaEnviados++; continue; }
+      if (_vistos.has(_dig)) { duplicados++; continue; }  // mismo número, ya tomamos su cita más temprana
+      _vistos.add(_dig);
       elegibles.push(r);
     }
 
     if (confirmar !== 'ENVIAR') {
       return res.json({ ok: true, modo: 'PREVISUALIZACION (no se envió nada)', fecha: fechaTarget,
-        total_citas: rows.length, se_enviarian: elegibles.length, sin_telefono: sinTelefono, ya_enviados: yaEnviados });
+        total_citas: rows.length, se_enviarian: elegibles.length, sin_telefono: sinTelefono, ya_enviados: yaEnviados, duplicados_omitidos: duplicados });
     }
 
     const _cap = (limite && parseInt(limite) > 0) ? Math.min(parseInt(limite), _ENVIO_CAP) : _ENVIO_CAP;
@@ -6348,16 +6352,20 @@ app.post("/api/rescates/enviar-masivo", async (req, res) => {
       ORDER BY c.fecha DESC`;
     const { rows } = await pool.query(sql, params);
 
-    const elegibles = []; let sinTelefono = 0, yaContactados = 0;
+    const elegibles = []; let sinTelefono = 0, yaContactados = 0, duplicados = 0;
+    const _vistos = new Set();
     for (const r of rows) {
-      if (!telefonoParaWaMe(r.telefonos)) { sinTelefono++; continue; }
+      const _dig = telefonoParaWaMe(r.telefonos);
+      if (!_dig) { sinTelefono++; continue; }
       if (r.estado_rescate && r.estado_rescate !== 'pendiente') { yaContactados++; continue; }
+      if (_vistos.has(_dig)) { duplicados++; continue; }
+      _vistos.add(_dig);
       elegibles.push(r);
     }
 
     if (confirmar !== 'ENVIAR') {
       return res.json({ ok: true, modo: 'PREVISUALIZACION (no se envió nada)', periodo: { desde: fechaDesde, hasta: fechaHasta },
-        total: rows.length, se_enviarian: elegibles.length, sin_telefono: sinTelefono, ya_contactados: yaContactados });
+        total: rows.length, se_enviarian: elegibles.length, sin_telefono: sinTelefono, ya_contactados: yaContactados, duplicados_omitidos: duplicados });
     }
 
     const _cap = (limite && parseInt(limite) > 0) ? Math.min(parseInt(limite), _ENVIO_CAP) : _ENVIO_CAP;
