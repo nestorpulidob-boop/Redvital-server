@@ -6352,6 +6352,13 @@ app.post("/api/rescates/enviar-masivo", async (req, res) => {
       WHERE c.fecha BETWEEN $1 AND $2 ${whereSuc}
         AND c.estado_cita IN ('Suspendió','No llegó')
         AND c.paciente IS NOT NULL
+        -- v5.49: excluir si el paciente YA tiene una cita futura agendada (reagendó por su cuenta)
+        AND NOT EXISTS (
+          SELECT 1 FROM citas c2
+          WHERE c2.id_paciente = c.id_paciente
+            AND c2.fecha >= CURRENT_DATE
+            AND c2.estado_cita NOT IN ('Eliminado','Suspendió','No llegó')
+        )
       ORDER BY c.fecha DESC`;
     const { rows } = await pool.query(sql, params);
 
@@ -6502,6 +6509,18 @@ app.post("/api/rescates/reenviar-uno", async (req, res) => {
     if (!telefonoParaWaMe(r.telefonos))
       return res.json({ ok: false, error: "Sin teléfono válido." });
 
+    // v5.49: no reenviar si el paciente ya tiene una cita futura (reagendó solo)
+    const fut = await pool.query(
+      `SELECT 1 FROM citas cf
+       JOIN citas co ON co.uuid_cita = (SELECT uuid_cita FROM bot_rescates_log WHERE id = $1)
+       WHERE cf.id_paciente = co.id_paciente
+         AND cf.fecha >= CURRENT_DATE
+         AND cf.estado_cita NOT IN ('Eliminado','Suspendió','No llegó')
+       LIMIT 1`, [id]
+    );
+    if (fut.rows.length > 0)
+      return res.json({ ok: false, error: "El paciente ya tiene una cita futura agendada. No se reenvía." });
+
     const env = await twilioEnviarPlantilla(r.telefonos, contentSid, variablesRescate(r));
     if (!env.ok) return res.json({ ok: false, error: env.error || env.data });
 
@@ -6522,13 +6541,21 @@ app.post("/api/rescates/reenviar-masivo", async (req, res) => {
 
     // Candidatos: contactados, sin respuesta, >=48h, nunca reenviados
     const { rows } = await pool.query(
-      `SELECT id, nombre_paciente AS paciente, telefono AS telefonos, fecha_cita_original::text AS fecha, profesional
-       FROM bot_rescates_log
-       WHERE estado_rescate = 'contactado'
-         AND reenviado_en IS NULL
-         AND contactado_en <= NOW() - INTERVAL '48 hours'
-         AND contactado_en >= NOW() - INTERVAL '7 days'
-       ORDER BY contactado_en ASC`
+      `SELECT b.id, b.nombre_paciente AS paciente, b.telefono AS telefonos, b.fecha_cita_original::text AS fecha, b.profesional
+       FROM bot_rescates_log b
+       WHERE b.estado_rescate = 'contactado'
+         AND b.reenviado_en IS NULL
+         AND b.contactado_en <= NOW() - INTERVAL '48 hours'
+         AND b.contactado_en >= NOW() - INTERVAL '7 days'
+         -- v5.49: no reenviar si ya tiene cita futura (reagendó solo)
+         AND NOT EXISTS (
+           SELECT 1 FROM citas cf
+           JOIN citas co ON co.uuid_cita = b.uuid_cita
+           WHERE cf.id_paciente = co.id_paciente
+             AND cf.fecha >= CURRENT_DATE
+             AND cf.estado_cita NOT IN ('Eliminado','Suspendió','No llegó')
+         )
+       ORDER BY b.contactado_en ASC`
     );
 
     const elegibles = []; let sinTelefono = 0;
