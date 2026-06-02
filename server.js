@@ -6513,6 +6513,52 @@ app.post("/api/rescates/reenviar-uno", async (req, res) => {
   }
 });
 
+// v5.48 - Reenvío MASIVO a todos los que no respondieron y ya pasaron 48h (un solo reenvío c/u)
+app.post("/api/rescates/reenviar-masivo", async (req, res) => {
+  try {
+    const { confirmar } = req.body || {};
+    const contentSid = process.env.TWILIO_CONTENT_SID_RESCATE;
+    if (!contentSid) return res.status(400).json({ ok: false, error: "Falta TWILIO_CONTENT_SID_RESCATE" });
+
+    // Candidatos: contactados, sin respuesta, >=48h, nunca reenviados
+    const { rows } = await pool.query(
+      `SELECT id, nombre_paciente AS paciente, telefono AS telefonos, fecha_cita_original::text AS fecha, profesional
+       FROM bot_rescates_log
+       WHERE estado_rescate = 'contactado'
+         AND reenviado_en IS NULL
+         AND contactado_en <= NOW() - INTERVAL '48 hours'
+         AND contactado_en >= NOW() - INTERVAL '7 days'
+       ORDER BY contactado_en ASC`
+    );
+
+    const elegibles = []; let sinTelefono = 0;
+    for (const r of rows) {
+      if (!telefonoParaWaMe(r.telefonos)) { sinTelefono++; continue; }
+      elegibles.push(r);
+    }
+
+    if (confirmar !== 'ENVIAR') {
+      return res.json({ ok: true, modo: 'PREVISUALIZACION (no se reenvió nada)',
+        se_reenviarian: elegibles.length, sin_telefono: sinTelefono });
+    }
+
+    const lote = elegibles.slice(0, _ENVIO_CAP);
+    let enviados = 0, fallidos = 0; const errores = [];
+    for (const r of lote) {
+      const env = await twilioEnviarPlantilla(r.telefonos, contentSid, variablesRescate(r));
+      if (env.ok) { enviados++; await pool.query(`UPDATE bot_rescates_log SET reenviado_en = NOW() WHERE id = $1`, [r.id]); }
+      else { fallidos++; if (errores.length < 10) errores.push({ paciente: r.paciente, error: env.error || env.data }); }
+      await _sleep(_ENVIO_DELAY_MS);
+    }
+    const restantes = elegibles.length - lote.length;
+    res.json({ ok: true, modo: 'REENVIADO', enviados, fallidos, sin_telefono: sinTelefono, restantes,
+      nota: restantes > 0 ? `Quedan ${restantes}: vuelve a apretar.` : 'Todos los de 48h reenviados.', errores });
+  } catch (err) {
+    console.error('[rescates/reenviar-masivo]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // v5.47 - Clave simple para autorizar envíos desde el link de secretarias
 const _CLAVE_ENVIO = process.env.CLAVE_ENVIO || 'redvital2026';
 app.get("/api/verificar-clave", (req, res) => {
@@ -6593,6 +6639,11 @@ app.get("/api/panel-confirmaciones", (req, res) => {
       <button class="prev" onclick="accion('rescates',false)">Previsualizar</button>
       <button class="send" onclick="accion('rescates',true)">Enviar ahora</button>
     </div>
+    <div class="bar">
+      <strong style="font-size:13px">Reenviar a los que NO respondieron (+48h):</strong>
+      <button class="prev" onclick="accionReenvio(false)">Previsualizar</button>
+      <button class="send" style="background:#c9a227" onclick="accionReenvio(true)">Reenviar a todos</button>
+    </div>
     <div id="envio-out" class="out" style="display:none"></div>
   </div>
 </div>
@@ -6620,6 +6671,16 @@ async function verificar(){
     if(j.ok){ CLAVE_OK=c; document.getElementById('envio-controles').style.display='block'; m.textContent='✅ Envío desbloqueado'; m.style.color='#1b8f4d'; }
     else { m.textContent='❌ Clave incorrecta'; m.style.color='#c0392b'; }
   }catch(e){ m.textContent='Error: '+e.message; }
+}
+async function accionReenvio(enviar){
+  if(enviar && !confirm('¿Reenviar el mensaje a TODOS los que no respondieron hace +48h? (cada uno recibe máximo un reenvío)')) return;
+  var out=document.getElementById('envio-out'); out.style.display='block'; out.textContent='Procesando...';
+  try{
+    var r=await fetch('/api/rescates/reenviar-masivo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(enviar?{confirmar:'ENVIAR'}:{})});
+    var j=await r.json();
+    out.textContent=JSON.stringify(j,null,2);
+    if(enviar) cargar();
+  }catch(e){ out.textContent='Error: '+e.message; }
 }
 async function accion(tipo, enviar){
   if(enviar && !confirm('¿Segura? Esto envía mensajes REALES por WhatsApp a los pacientes.')) return;
