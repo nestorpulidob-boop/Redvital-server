@@ -2205,6 +2205,7 @@ async function inicializarBotBD() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_estado ON bot_rescates_log(estado_rescate)`);
     await pool.query(`ALTER TABLE bot_rescates_log ADD COLUMN IF NOT EXISTS secretaria_contacto_en TIMESTAMPTZ`);
     await pool.query(`ALTER TABLE bot_rescates_log ADD COLUMN IF NOT EXISTS secretaria_contacto_por TEXT`);
+    await pool.query(`ALTER TABLE bot_rescates_log ADD COLUMN IF NOT EXISTS reenviado_en TIMESTAMPTZ`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_rut ON bot_rescates_log(rut_paciente)`);
 
     // v5.43.3 - Mapeo automático de 3 profesionales nuevos
@@ -6474,6 +6475,44 @@ app.post("/api/rescates/marcar-contactado", async (req, res) => {
   }
 });
 
+// v5.48 - Reenvío único a un paciente de rescate que NO respondió (>=48h)
+app.post("/api/rescates/reenviar-uno", async (req, res) => {
+  try {
+    const { id } = req.body || {};
+    if (!id) return res.status(400).json({ ok: false, error: "Falta id" });
+    const contentSid = process.env.TWILIO_CONTENT_SID_RESCATE;
+    if (!contentSid) return res.status(400).json({ ok: false, error: "Falta TWILIO_CONTENT_SID_RESCATE" });
+
+    const q = await pool.query(
+      `SELECT id, nombre_paciente AS paciente, telefono AS telefonos, fecha_cita_original::text AS fecha,
+              profesional, estado_rescate, reenviado_en,
+              EXTRACT(EPOCH FROM (NOW() - contactado_en))/3600 AS horas
+       FROM bot_rescates_log WHERE id = $1 LIMIT 1`, [id]
+    );
+    if (!q.rows.length) return res.status(404).json({ ok: false, error: "No encontrado" });
+    const r = q.rows[0];
+
+    // FRENOS de seguridad (server-side, no solo en el botón):
+    if (r.estado_rescate !== 'contactado')
+      return res.json({ ok: false, error: "Este paciente ya respondió o cambió de estado, no se reenvía." });
+    if (r.reenviado_en)
+      return res.json({ ok: false, error: "Ya se le reenvió una vez. No se reenvía de nuevo." });
+    if (Number(r.horas) < 48)
+      return res.json({ ok: false, error: "Aún no pasan 48h desde el primer envío." });
+    if (!telefonoParaWaMe(r.telefonos))
+      return res.json({ ok: false, error: "Sin teléfono válido." });
+
+    const env = await twilioEnviarPlantilla(r.telefonos, contentSid, variablesRescate(r));
+    if (!env.ok) return res.json({ ok: false, error: env.error || env.data });
+
+    await pool.query(`UPDATE bot_rescates_log SET reenviado_en = NOW() WHERE id = $1`, [id]);
+    res.json({ ok: true, reenviado_a: r.paciente });
+  } catch (err) {
+    console.error('[rescates/reenviar-uno]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // v5.47 - Clave simple para autorizar envíos desde el link de secretarias
 const _CLAVE_ENVIO = process.env.CLAVE_ENVIO || 'redvital2026';
 app.get("/api/verificar-clave", (req, res) => {
@@ -6492,7 +6531,9 @@ app.get("/api/confirmaciones-data", async (req, res) => {
     // Rescates contactados (últimos 7 días de actividad)
     const res2 = await pool.query(
       `SELECT id, nombre_paciente, telefono, fecha_cita_original::text AS fecha_cita, profesional, sucursal, estado_rescate, respuesta_paciente, respondido_en::text AS respondido_en,
-              secretaria_contacto_en::text AS secretaria_contacto_en, secretaria_contacto_por
+              secretaria_contacto_en::text AS secretaria_contacto_en, secretaria_contacto_por,
+              contactado_en::text AS contactado_en, reenviado_en::text AS reenviado_en,
+              EXTRACT(EPOCH FROM (NOW() - contactado_en))/3600 AS horas_desde_envio
        FROM bot_rescates_log
        WHERE contactado_en >= NOW() - INTERVAL '7 days'
        ORDER BY estado_rescate`
@@ -6611,12 +6652,29 @@ function tablaReco(rows){
   }).join('');
   return '<table><tr><th>Paciente</th><th>Hora</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th></tr>'+body+'</table>';
 }
+function botonReenvio(r){
+  // Solo si: no respondió (contactado), pasaron >=48h, y no se reenvió antes
+  if(r.estado_rescate!=='contactado') return '';
+  if(r.reenviado_en) return '<span style="font-size:11px;color:#999">ya reenviado</span>';
+  if(Number(r.horas_desde_envio||0) < 48) return '<span style="font-size:11px;color:#bbb">esperar 48h</span>';
+  return '<button onclick="reenviarUno('+r.id+',this)" style="background:transparent;border:1px solid #c9a227;color:#9a7b15;padding:4px 9px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">↻ Reenviar</button>';
+}
 function tablaRes(rows){
   if(!rows.length) return '<p style="color:#5b6b80">Sin datos.</p>';
   var body=rows.map(function(r){
-    return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+(r.fecha_cita||'-')+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoRes(r.estado_rescate)+'</td><td>'+(r.respuesta_paciente||'')+'</td></tr>';
+    return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+(r.fecha_cita||'-')+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoRes(r.estado_rescate)+'</td><td>'+(r.respuesta_paciente||'')+'</td><td>'+botonReenvio(r)+'</td></tr>';
   }).join('');
-  return '<table><tr><th>Paciente</th><th>Cita original</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th></tr>'+body+'</table>';
+  return '<table><tr><th>Paciente</th><th>Cita original</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th><th>Reenvío</th></tr>'+body+'</table>';
+}
+async function reenviarUno(id, btn){
+  if(!confirm('¿Reenviar el mensaje de recuperación a este paciente? (solo se puede una vez)')) return;
+  btn.disabled=true; btn.textContent='Enviando...';
+  try{
+    var r=await fetch('/api/rescates/reenviar-uno',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});
+    var j=await r.json();
+    if(j.ok){ btn.outerHTML='<span style="font-size:11px;color:#1b8f4d">✓ reenviado</span>'; }
+    else { btn.disabled=false; btn.textContent='↻ Reenviar'; alert('No se pudo: '+(j.error||'')); }
+  }catch(e){ btn.disabled=false; btn.textContent='↻ Reenviar'; alert('Error: '+e.message); }
 }
 async function marcarContactado(id, btn){
   btn.classList.add('hecho'); btn.textContent='✅ Ya contactado';
