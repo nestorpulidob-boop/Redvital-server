@@ -6570,7 +6570,7 @@ app.get("/api/confirmaciones-data", async (req, res) => {
     const fecha = req.query.fecha || new Date(Date.now() - 4 * 3600000).toISOString().slice(0, 10);
     // Recordatorios de citas de esa fecha
     const reco = await pool.query(
-      `SELECT nombre_paciente, telefono, hora_cita, profesional, sucursal, estado, respuesta_paciente, respondido_en::text AS respondido_en
+      `SELECT nombre_paciente, telefono, fecha_cita::text AS fecha_cita, hora_cita, profesional, sucursal, estado, respuesta_paciente, respondido_en::text AS respondido_en
        FROM bot_recordatorios_log WHERE fecha_cita = $1 ORDER BY estado, hora_cita`,
       [fecha]
     );
@@ -6706,12 +6706,18 @@ function estadoRes(e){
   if(e==='contactado') return '<span class="pend">Sin responder</span>';
   return e||'-';
 }
+function fmtFecha(f){
+  if(!f) return '-';
+  var p=f.split('-'); // YYYY-MM-DD
+  if(p.length===3) return p[2]+'/'+p[1];
+  return f;
+}
 function tablaReco(rows){
   if(!rows.length) return '<p style="color:#5b6b80">Sin datos.</p>';
   var body=rows.map(function(r){
-    return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+(r.hora_cita||'').substring(0,5)+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoReco(r.estado)+'</td><td>'+(r.respuesta_paciente||'')+'</td></tr>';
+    return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+fmtFecha(r.fecha_cita)+'</td><td>'+(r.hora_cita||'').substring(0,5)+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoReco(r.estado)+'</td><td>'+(r.respuesta_paciente||'')+'</td></tr>';
   }).join('');
-  return '<table><tr><th>Paciente</th><th>Hora</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th></tr>'+body+'</table>';
+  return '<table><tr><th>Paciente</th><th>Fecha</th><th>Hora</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th></tr>'+body+'</table>';
 }
 function botonReenvio(r){
   // Solo si: no respondió (contactado), pasaron >=48h, y no se reenvió antes
