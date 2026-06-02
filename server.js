@@ -6645,7 +6645,8 @@ async function cargar(){
       var items=quieren.map(function(r){
         var tel=(r.telefono||'').replace(/\D/g,'');
         if(tel.length===9) tel='56'+tel; else if(tel.length===8) tel='569'+tel;
-        var msg=encodeURIComponent('Hola '+(r.nombre_paciente||'')+', le escribimos de Redvital para ayudarle a reagendar su hora. ¿Qué día le acomoda?');
+        var _primerNombre=((r.nombre_paciente||'').trim().split(' ')[0])||'';
+        var msg=encodeURIComponent('Hola '+_primerNombre+', le hablamos de Centro Médico RedVital. Vimos que no pudo asistir a su hora, ¿le ayudamos a reagendar?');
         var yaHecho = !!r.secretaria_contacto_en;
         var cls = yaHecho ? 'wabtn hecho' : 'wabtn';
         var txt = yaHecho ? '✅ Ya contactado' : '📱 Escribir por WhatsApp';
