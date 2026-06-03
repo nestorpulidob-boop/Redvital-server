@@ -6784,7 +6784,10 @@ function botonReenvio(r){
   return '<button onclick="reenviarUno('+r.id+',this)" style="background:transparent;border:1px solid #c9a227;color:#9a7b15;padding:4px 9px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">↻ Reenviar</button>';
 }
 function tablaRes(rows){
-  if(!rows.length) return '<p style="color:#5b6b80">Sin datos.</p>';
+  var verOcultos=document.getElementById('verOcultos') && document.getElementById('verOcultos').checked;
+  // Mostrar solo los contactados sin responder (los que dijeron SÍ ya están arriba; los que dijeron NO se ocultan)
+  rows = rows.filter(function(r){ return verOcultos ? true : (r.estado_rescate==='contactado'); });
+  if(!rows.length) return '<p style="color:#5b6b80">Sin pendientes. 🎉</p>';
   var body=rows.map(function(r){
     return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+(r.fecha_cita||'-')+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoRes(r.estado_rescate)+'</td><td>'+(r.respuesta_paciente||'')+'</td><td>'+botonReenvio(r)+'</td></tr>';
   }).join('');
