@@ -6822,7 +6822,8 @@ async function cargar(){
     document.getElementById('tabla_reco').innerHTML=tablaReco(j.recordatorios);
     document.getElementById('tabla_res').innerHTML=tablaRes(j.rescates);
 
-    var quieren=(j.rescates||[]).filter(function(x){return x.estado_rescate==='reagendo'});
+    var verOcultos2=document.getElementById('verOcultos') && document.getElementById('verOcultos').checked;
+    var quieren=(j.rescates||[]).filter(function(x){return x.estado_rescate==='reagendo' && (verOcultos2 ? true : !x.secretaria_contacto_en)});
     var box=document.getElementById('reagendar_box');
     if(quieren.length){
       var items=quieren.map(function(r){
