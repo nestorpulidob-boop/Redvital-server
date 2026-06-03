@@ -2206,6 +2206,7 @@ async function inicializarBotBD() {
     await pool.query(`ALTER TABLE bot_rescates_log ADD COLUMN IF NOT EXISTS secretaria_contacto_en TIMESTAMPTZ`);
     await pool.query(`ALTER TABLE bot_rescates_log ADD COLUMN IF NOT EXISTS secretaria_contacto_por TEXT`);
     await pool.query(`ALTER TABLE bot_rescates_log ADD COLUMN IF NOT EXISTS reenviado_en TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE bot_recordatorios_log ADD COLUMN IF NOT EXISTS gestionado_en TIMESTAMPTZ`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_rut ON bot_rescates_log(rut_paciente)`);
 
     // v5.43.3 - Mapeo automático de 3 profesionales nuevos
@@ -6532,6 +6533,23 @@ app.post("/api/rescates/reenviar-uno", async (req, res) => {
   }
 });
 
+// v5.50 - Marcar recordatorio como gestionado/listo (compartido). toggle: 1 marca, 0 desmarca
+app.post("/api/recordatorios/marcar-gestionado", async (req, res) => {
+  try {
+    const { id, marcar } = req.body || {};
+    if (!id) return res.status(400).json({ ok: false, error: "Falta id" });
+    if (marcar === 0 || marcar === false) {
+      await pool.query(`UPDATE bot_recordatorios_log SET gestionado_en = NULL WHERE id = $1`, [id]);
+    } else {
+      await pool.query(`UPDATE bot_recordatorios_log SET gestionado_en = NOW() WHERE id = $1`, [id]);
+    }
+    res.json({ ok: true, id });
+  } catch (err) {
+    console.error('[marcar-gestionado]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // v5.48 - Reenvío MASIVO a todos los que no respondieron y ya pasaron 48h (un solo reenvío c/u)
 app.post("/api/rescates/reenviar-masivo", async (req, res) => {
   try {
@@ -6597,7 +6615,7 @@ app.get("/api/confirmaciones-data", async (req, res) => {
     const fecha = req.query.fecha || new Date(Date.now() - 4 * 3600000).toISOString().slice(0, 10);
     // Recordatorios de citas de esa fecha
     const reco = await pool.query(
-      `SELECT nombre_paciente, telefono, fecha_cita::text AS fecha_cita, hora_cita, profesional, sucursal, estado, respuesta_paciente, respondido_en::text AS respondido_en
+      `SELECT id, nombre_paciente, telefono, fecha_cita::text AS fecha_cita, hora_cita, profesional, sucursal, estado, respuesta_paciente, respondido_en::text AS respondido_en, gestionado_en::text AS gestionado_en
        FROM bot_recordatorios_log WHERE fecha_cita = $1 ORDER BY estado, hora_cita`,
       [fecha]
     );
@@ -6678,6 +6696,7 @@ app.get("/api/panel-confirmaciones", (req, res) => {
 <div class="bar">
   <label>Fecha de citas (recordatorios): <input id="fecha" type="date"></label>
   <button onclick="cargar()">Ver</button>
+  <label style="margin-left:12px"><input type="checkbox" id="verOcultos" onchange="cargar()"> Ver también los ya gestionados/contactados</label>
 </div>
 <div id="resumen"></div>
 <div id="reagendar_box"></div>
@@ -6740,11 +6759,22 @@ function fmtFecha(f){
   return f;
 }
 function tablaReco(rows){
-  if(!rows.length) return '<p style="color:#5b6b80">Sin datos.</p>';
-  var body=rows.map(function(r){
-    return '<tr><td>'+(r.nombre_paciente||'-')+'</td><td>'+fmtFecha(r.fecha_cita)+'</td><td>'+(r.hora_cita||'').substring(0,5)+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoReco(r.estado)+'</td><td>'+(r.respuesta_paciente||'')+'</td></tr>';
+  var verOcultos=document.getElementById('verOcultos') && document.getElementById('verOcultos').checked;
+  var vis=rows.filter(function(r){ return verOcultos ? true : !r.gestionado_en; });
+  if(!vis.length) return '<p style="color:#5b6b80">Sin pendientes. 🎉</p>';
+  var body=vis.map(function(r){
+    var chk = r.gestionado_en
+      ? '<button onclick="gestionarReco('+r.id+',0,this)" style="background:#eee;border:0;padding:5px 10px;border-radius:6px;font-size:12px;cursor:pointer">↩ deshacer</button>'
+      : '<button onclick="gestionarReco('+r.id+',1,this)" style="background:#1b8f4d;color:#fff;border:0;padding:5px 10px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">✓ Listo</button>';
+    var op = r.gestionado_en ? ' style="opacity:.5"' : '';
+    return '<tr'+op+'><td>'+(r.nombre_paciente||'-')+'</td><td>'+fmtFecha(r.fecha_cita)+'</td><td>'+(r.hora_cita||'').substring(0,5)+'</td><td>'+(r.profesional||'-')+'</td><td>'+(r.sucursal||'-')+'</td><td>'+estadoReco(r.estado)+'</td><td>'+(r.respuesta_paciente||'')+'</td><td>'+chk+'</td></tr>';
   }).join('');
-  return '<table><tr><th>Paciente</th><th>Fecha</th><th>Hora</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th></tr>'+body+'</table>';
+  return '<table><tr><th>Paciente</th><th>Fecha</th><th>Hora</th><th>Profesional</th><th>Sede</th><th>Estado</th><th>Respondió</th><th>Gestión</th></tr>'+body+'</table>';
+}
+async function gestionarReco(id, marcar, btn){
+  btn.disabled=true;
+  try{ await fetch('/api/recordatorios/marcar-gestionado',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,marcar:marcar})}); cargar(); }
+  catch(e){ btn.disabled=false; alert('Error: '+e.message); }
 }
 function botonReenvio(r){
   // Solo si: no respondió (contactado), pasaron >=48h, y no se reenvió antes
@@ -6773,6 +6803,7 @@ async function reenviarUno(id, btn){
 async function marcarContactado(id, btn){
   btn.classList.add('hecho'); btn.textContent='✅ Ya contactado';
   try{ await fetch('/api/rescates/marcar-contactado',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})}); }catch(e){}
+  setTimeout(cargar, 800);
 }
 async function cargar(){
   var f=document.getElementById('fecha').value || hoyCL();
