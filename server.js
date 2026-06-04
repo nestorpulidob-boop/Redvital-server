@@ -2207,6 +2207,8 @@ async function inicializarBotBD() {
     await pool.query(`ALTER TABLE bot_rescates_log ADD COLUMN IF NOT EXISTS secretaria_contacto_por TEXT`);
     await pool.query(`ALTER TABLE bot_rescates_log ADD COLUMN IF NOT EXISTS reenviado_en TIMESTAMPTZ`);
     await pool.query(`ALTER TABLE bot_recordatorios_log ADD COLUMN IF NOT EXISTS gestionado_en TIMESTAMPTZ`);
+    await pool.query(`ALTER TABLE bot_pacientes ADD COLUMN IF NOT EXISTS no_contactar BOOLEAN DEFAULT FALSE`);
+    await pool.query(`ALTER TABLE bot_pacientes ADD COLUMN IF NOT EXISTS no_contactar_en TIMESTAMPTZ`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_rut ON bot_rescates_log(rut_paciente)`);
 
     // v5.43.3 - Mapeo automático de 3 profesionales nuevos
@@ -3237,6 +3239,28 @@ async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
 //   { manejado:true, tipo:'recordatorio'|'rescate', respuesta:'si'|'no' }
 //   o null si el mensaje no corresponde a una confirmación pendiente.
 // ============================================================
+// v5.52 - Detecta si el paciente pide NO ser contactado más
+function _pideNoContactar(texto) {
+  const t = (texto || '').trim().toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  if (!t) return false;
+  return /\b(no me escriban|no me escriba|no escriban|no me contacten|no me contacte|no me molesten|no molesten|no me manden|dejen de escribir|dejen de mandar|no escribirme|escribirme mas|escribirme más|borrenme|borrar mi numero|sacar mi numero|sacarme de|no quiero recibir|no quiero mensajes|dar de baja|darme de baja|stop|unsubscribe)\b/.test(t);
+}
+
+// v5.52 - Marca a un paciente como "no contactar" (por últimos 8 dígitos del teléfono)
+async function marcarNoContactar(wa_id) {
+  const digits = (wa_id || '').replace(/\D/g, '');
+  if (digits.length < 8) return;
+  try {
+    // Marca en bot_pacientes por wa_id
+    await pool.query(
+      `UPDATE bot_pacientes SET no_contactar = TRUE, no_contactar_en = NOW()
+       WHERE regexp_replace(wa_id, '\\D', '', 'g') LIKE '%' || $1`,
+      [digits.slice(-8)]
+    );
+  } catch (e) { console.error('[marcarNoContactar]', e.message); }
+}
+
 function _interpretarRespuesta(texto) {
   const t = (texto || '').trim().toLowerCase()
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
@@ -3318,10 +3342,30 @@ async function procesarMensajeBot(wa_id, texto, referral, provider) {
   await upsertPaciente(wa_id, texto, referral);
   await guardarMensaje(wa_id, 'in', texto);
 
+  // v5.52: ¿pide que no lo contacten más?
+  if (_pideNoContactar(texto)) {
+    await marcarNoContactar(wa_id);
+    // Si tenía un rescate/recordatorio pendiente, lo marcamos como rechazo/cancelado
+    try {
+      const digits = (wa_id || '').replace(/\D/g, '');
+      await pool.query(
+        `UPDATE bot_rescates_log SET estado_rescate='rechazo', respuesta_paciente=$2, respondido_en=NOW()
+         WHERE regexp_replace(telefono, '\\D', '', 'g') LIKE '%' || $1 AND estado_rescate='contactado'`,
+        [digits.slice(-8), texto.substring(0, 200)]
+      );
+      await pool.query(
+        `UPDATE bot_recordatorios_log SET estado='cancelado', respuesta_paciente=$2, respondido_en=NOW()
+         WHERE regexp_replace(telefono, '\\D', '', 'g') LIKE '%' || $1 AND estado='enviado'`,
+        [digits.slice(-8), texto.substring(0, 200)]
+      );
+    } catch (e) { console.error('[no-contactar marcar]', e.message); }
+    const msg = 'Entendido, no te enviaremos más mensajes. Disculpá la molestia 🙏';
+    await enviarMensajeWhatsApp(provider, wa_id, msg);
+    await guardarMensaje(wa_id, 'out', msg, { datos: { no_contactar: true } });
+    return;
+  }
+
   // v5.46: ¿es respuesta a un recordatorio/rescate?
-  let conf = null;
-  try { conf = await detectarConfirmacion(wa_id, texto); }
-  catch (e) { console.error('[confirmacion] error', e.message); }
 
   if (conf && conf.respuesta === 'si') {
     // Confirmó: marcamos (ya hecho) y NO lo molestamos con el bot.
@@ -6323,8 +6367,13 @@ app.post("/api/recordatorios/enviar-masivo", async (req, res) => {
       FROM citas c
       LEFT JOIN bot_recordatorios_log r ON r.uuid_cita = c.uuid_cita AND r.fecha_cita = c.fecha
       WHERE c.fecha = $1 ${whereSuc}
-        AND c.estado_cita NOT IN ('Eliminado','Suspendió')
+        AND c.estado_cita NOT IN ('Eliminado','Suspendió','Atendido','Llegó')
         AND c.paciente IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM bot_pacientes bp
+          WHERE bp.no_contactar = TRUE
+            AND regexp_replace(c.telefonos, '\D', '', 'g') LIKE '%' || RIGHT(regexp_replace(bp.wa_id, '\D', '', 'g'), 8)
+        )
       ORDER BY c.hora_inicio NULLS LAST`;
     const { rows } = await pool.query(sql, params);
 
@@ -6395,6 +6444,11 @@ app.post("/api/rescates/enviar-masivo", async (req, res) => {
           WHERE c2.id_paciente = c.id_paciente
             AND c2.fecha >= CURRENT_DATE
             AND c2.estado_cita NOT IN ('Eliminado','Suspendió','No llegó')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM bot_pacientes bp
+          WHERE bp.no_contactar = TRUE
+            AND regexp_replace(c.telefonos, '\D', '', 'g') LIKE '%' || RIGHT(regexp_replace(bp.wa_id, '\D', '', 'g'), 8)
         )
       ORDER BY c.fecha DESC`;
     const { rows } = await pool.query(sql, params);
@@ -6936,7 +6990,12 @@ app.listen(PORT, async () => {
                    r.estado AS recordatorio_estado
             FROM citas c
             LEFT JOIN bot_recordatorios_log r ON r.uuid_cita = c.uuid_cita AND r.fecha_cita = c.fecha
-            WHERE c.fecha = $1 AND c.estado_cita NOT IN ('Eliminado','Suspendió') AND c.paciente IS NOT NULL
+            WHERE c.fecha = $1 AND c.estado_cita NOT IN ('Eliminado','Suspendió','Atendido','Llegó') AND c.paciente IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM bot_pacientes bp
+                WHERE bp.no_contactar = TRUE
+                  AND regexp_replace(c.telefonos, '\D', '', 'g') LIKE '%' || RIGHT(regexp_replace(bp.wa_id, '\D', '', 'g'), 8)
+              )
             ORDER BY c.hora_inicio NULLS LAST`, [fechaT]);
           const vistos = new Set(); let env = 0;
           for (const r of rows) {
@@ -6966,6 +7025,11 @@ app.listen(PORT, async () => {
             LEFT JOIN bot_rescates_log r ON r.uuid_cita = c.uuid_cita
             WHERE c.fecha BETWEEN $1 AND $2 AND c.estado_cita IN ('Suspendió','No llegó') AND c.paciente IS NOT NULL
               AND NOT EXISTS (SELECT 1 FROM citas c2 WHERE c2.id_paciente = c.id_paciente AND c2.fecha >= CURRENT_DATE AND c2.estado_cita NOT IN ('Eliminado','Suspendió','No llegó'))
+              AND NOT EXISTS (
+                SELECT 1 FROM bot_pacientes bp
+                WHERE bp.no_contactar = TRUE
+                  AND regexp_replace(c.telefonos, '\D', '', 'g') LIKE '%' || RIGHT(regexp_replace(bp.wa_id, '\D', '', 'g'), 8)
+              )
             ORDER BY c.fecha DESC`, [desde, hasta]);
           const vistos = new Set(); let env = 0;
           for (const r of rows) {
