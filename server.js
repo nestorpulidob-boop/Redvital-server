@@ -2209,6 +2209,24 @@ async function inicializarBotBD() {
     await pool.query(`ALTER TABLE bot_recordatorios_log ADD COLUMN IF NOT EXISTS gestionado_en TIMESTAMPTZ`);
     await pool.query(`ALTER TABLE bot_pacientes ADD COLUMN IF NOT EXISTS no_contactar BOOLEAN DEFAULT FALSE`);
     await pool.query(`ALTER TABLE bot_pacientes ADD COLUMN IF NOT EXISTS no_contactar_en TIMESTAMPTZ`);
+    // v5.53 - Registro de reactivación de pacientes dormidos (para no repetir)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_reactivacion_log (
+        id BIGSERIAL PRIMARY KEY,
+        id_paciente TEXT,
+        rut TEXT,
+        nombre_paciente TEXT,
+        telefono TEXT,
+        ultima_cita_previa DATE,
+        dias_sin_volver INT,
+        mensaje_enviado TEXT,
+        estado TEXT DEFAULT 'contactado',
+        respuesta_paciente TEXT,
+        respondido_en TIMESTAMPTZ,
+        contactado_en TIMESTAMPTZ DEFAULT NOW()
+      )`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_reactiv_paciente ON bot_reactivacion_log(id_paciente)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_reactiv_contactado ON bot_reactivacion_log(contactado_en)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_rescates_rut ON bot_rescates_log(rut_paciente)`);
 
     // v5.43.3 - Mapeo automático de 3 profesionales nuevos
@@ -3333,6 +3351,25 @@ async function detectarConfirmacion(wa_id, texto) {
     return { manejado: true, tipo: 'rescate', respuesta: resp };
   }
 
+  // 3) ¿Hay una REACTIVACIÓN reciente a este número sin responder?
+  const rea = await pool.query(
+    `SELECT id FROM bot_reactivacion_log
+     WHERE regexp_replace(telefono, '\\D', '', 'g') LIKE '%' || $1
+       AND estado = 'contactado'
+     ORDER BY contactado_en DESC LIMIT 1`,
+    [digits.slice(-8)]
+  );
+  if (rea.rows.length > 0) {
+    if (!resp) return { manejado: true, tipo: 'reactivacion', respuesta: 'ambiguo', hay_pendiente: true };
+    const nuevoEstado = resp === 'si' ? 'interesado' : 'rechazo';
+    await pool.query(
+      `UPDATE bot_reactivacion_log
+       SET estado=$1, respuesta_paciente=$2, respondido_en=$3 WHERE id=$4`,
+      [nuevoEstado, texto.substring(0, 200), new Date().toISOString(), rea.rows[0].id]
+    );
+    return { manejado: true, tipo: 'reactivacion', respuesta: resp };
+  }
+
   return null;
 }
 
@@ -3369,12 +3406,17 @@ async function procesarMensajeBot(wa_id, texto, referral, provider) {
 
   if (conf && conf.respuesta === 'si') {
     // Confirmó: marcamos (ya hecho) y NO lo molestamos con el bot.
-    const msg = conf.tipo === 'recordatorio'
-      ? '¡Perfecto! ✅ Tu asistencia quedó confirmada. ¡Te esperamos! 🙌'
-      : '¡Genial! ✅ Te contactaremos para coordinar tu nueva hora. 🙌';
-    await enviarMensajeWhatsApp(provider, wa_id, msg);
-    await guardarMensaje(wa_id, 'out', msg, { datos: { confirmacion: conf } });
-    return;
+    if (conf.tipo === 'reactivacion') {
+      // Dijo que quiere agendar: dejamos que el bot lo ayude (no cortamos aquí).
+      // Cae al flujo normal del bot más abajo.
+    } else {
+      const msg = conf.tipo === 'recordatorio'
+        ? '¡Perfecto! ✅ Tu asistencia quedó confirmada. ¡Te esperamos! 🙌'
+        : '¡Genial! ✅ Te contactaremos para coordinar tu nueva hora. 🙌';
+      await enviarMensajeWhatsApp(provider, wa_id, msg);
+      await guardarMensaje(wa_id, 'out', msg, { datos: { confirmacion: conf } });
+      return;
+    }
   }
 
   if (conf && conf.respuesta === 'no') {
@@ -3388,12 +3430,16 @@ async function procesarMensajeBot(wa_id, texto, referral, provider) {
   }
 
   if (conf && conf.respuesta === 'ambiguo' && conf.hay_pendiente) {
-    // Había un recordatorio/rescate pendiente pero no entendimos el SÍ/NO.
-    // Respondemos neutro y amable, sin meter al bot (evita el "error técnico").
-    const msg = `¡Hola! 👋 Gracias por tu mensaje. Para confirmar o reagendar tu hora, nuestra secretaría te ayuda directo por aquí: ${WHATSAPP_SECRETARIAS} 🙏`;
-    await enviarMensajeWhatsApp(provider, wa_id, msg);
-    await guardarMensaje(wa_id, 'out', msg, { datos: { confirmacion: conf } });
-    return;
+    if (conf.tipo === 'reactivacion') {
+      // Respuesta abierta a una reactivación (ej: "qué tienen?"): que el bot lo ayude a agendar.
+      // Cae al flujo normal del bot más abajo.
+    } else {
+      // Recordatorio/rescate pendiente pero no entendimos el SÍ/NO: neutro y amable.
+      const msg = `¡Hola! 👋 Gracias por tu mensaje. Para confirmar o reagendar tu hora, nuestra secretaría te ayuda directo por aquí: ${WHATSAPP_SECRETARIAS} 🙏`;
+      await enviarMensajeWhatsApp(provider, wa_id, msg);
+      await guardarMensaje(wa_id, 'out', msg, { datos: { confirmacion: conf } });
+      return;
+    }
   }
   // Si no había recordatorio/rescate pendiente, es una conversación normal: que responda el bot.
 
@@ -6489,6 +6535,104 @@ app.post("/api/rescates/enviar-masivo", async (req, res) => {
   }
 });
 
+// ============================================================
+// v5.53 - REACTIVACIÓN DE PACIENTES DORMIDOS (90+ días sin volver)
+// ------------------------------------------------------------
+// Plantilla Marketing 'reactivacion_paciente' (1 variable: nombre).
+// Env var: TWILIO_CONTENT_SID_REACTIVACION
+// Tope diario: REACTIVACION_TOPE_DIARIO (default 60)
+// Interruptor cron: REACTIVACION_AUTOMATICA_ACTIVO=true (default OFF)
+// ============================================================
+const _REACTIVACION_TOPE = parseInt(process.env.REACTIVACION_TOPE_DIARIO) || 60;
+
+function variablesReactivacion(pac) {
+  const partes = (pac.paciente || '').trim().split(' ').filter(Boolean);
+  const nombre = partes.length >= 1 ? partes[0] : 'paciente';
+  return { "1": nombre };
+}
+
+// Trae candidatos a reactivar: atendidos, 90+ días sin volver, sin cita futura,
+// no contactados nunca por reactivación, y no en lista no-contactar.
+async function _candidatosReactivacion(limite) {
+  const noVuelven = "('Eliminado','Suspendió','No llegó')";
+  const { rows } = await pool.query(`
+    WITH datos_paciente AS (
+      SELECT DISTINCT ON (id_paciente) id_paciente, paciente, telefonos, rut
+      FROM citas WHERE id_paciente IS NOT NULL
+      ORDER BY id_paciente, fecha DESC
+    ), historia AS (
+      SELECT id_paciente, MAX(fecha) AS ultima_cita,
+        COUNT(*) FILTER (WHERE estado_cita IN ('Atendido','Llegó'))::int AS atendidas_total
+      FROM citas WHERE id_paciente IS NOT NULL GROUP BY id_paciente
+    ), con_futuro AS (
+      SELECT DISTINCT id_paciente FROM citas
+      WHERE fecha >= CURRENT_DATE AND estado_cita NOT IN ${noVuelven} AND id_paciente IS NOT NULL
+    )
+    SELECT h.id_paciente, dp.paciente, dp.telefonos, dp.rut,
+      h.ultima_cita::text AS ultima_cita,
+      (CURRENT_DATE - h.ultima_cita)::int AS dias_sin_volver
+    FROM historia h JOIN datos_paciente dp USING (id_paciente)
+    WHERE h.atendidas_total >= 1
+      AND h.ultima_cita < CURRENT_DATE - INTERVAL '90 days'
+      AND h.id_paciente NOT IN (SELECT id_paciente FROM con_futuro)
+      AND h.id_paciente NOT IN (SELECT id_paciente::text FROM bot_reactivacion_log WHERE id_paciente IS NOT NULL)
+      AND NOT EXISTS (
+        SELECT 1 FROM bot_pacientes bp WHERE bp.no_contactar = TRUE
+          AND regexp_replace(dp.telefonos, '\D', '', 'g') LIKE '%' || RIGHT(regexp_replace(bp.wa_id, '\D', '', 'g'), 8)
+      )
+    ORDER BY h.ultima_cita ASC
+    LIMIT $1`, [limite || 500]);
+  return rows;
+}
+
+// POST /api/reactivacion/enviar  { confirmar }  -> dry-run salvo confirmar='ENVIAR'
+app.post("/api/reactivacion/enviar", async (req, res) => {
+  try {
+    const { confirmar, limite } = req.body || {};
+    const contentSid = process.env.TWILIO_CONTENT_SID_REACTIVACION;
+    if (!contentSid) return res.status(400).json({ ok: false, error: "Falta env var TWILIO_CONTENT_SID_REACTIVACION en Render" });
+
+    const tope = (limite && parseInt(limite) > 0) ? Math.min(parseInt(limite), _REACTIVACION_TOPE) : _REACTIVACION_TOPE;
+    const candidatos = await _candidatosReactivacion(500);
+
+    const elegibles = []; let sinTelefono = 0; const vistos = new Set();
+    for (const c of candidatos) {
+      const d = telefonoParaWaMe(c.telefonos);
+      if (!d) { sinTelefono++; continue; }
+      if (vistos.has(d)) continue; vistos.add(d);
+      elegibles.push(c);
+    }
+
+    if (confirmar !== 'ENVIAR') {
+      return res.json({ ok: true, modo: 'PREVISUALIZACION (no se envió nada)',
+        candidatos_totales: candidatos.length, se_enviarian_hoy: Math.min(elegibles.length, tope),
+        elegibles_con_telefono: elegibles.length, sin_telefono: sinTelefono, tope_diario: tope });
+    }
+
+    const lote = elegibles.slice(0, tope);
+    let enviados = 0, fallidos = 0; const errores = [];
+    for (const c of lote) {
+      const env = await twilioEnviarPlantilla(c.telefonos, contentSid, variablesReactivacion(c));
+      if (env.ok) {
+        enviados++;
+        await pool.query(
+          `INSERT INTO bot_reactivacion_log (id_paciente, rut, nombre_paciente, telefono, ultima_cita_previa, dias_sin_volver, mensaje_enviado, estado, contactado_en)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'contactado',NOW())`,
+          [c.id_paciente, c.rut, c.paciente, c.telefonos, c.ultima_cita, c.dias_sin_volver, 'reactivacion_paciente']
+        );
+      } else { fallidos++; if (errores.length < 10) errores.push({ paciente: c.paciente, error: env.error || env.data }); }
+      await _sleep(_ENVIO_DELAY_MS);
+    }
+    const restantes = elegibles.length - lote.length;
+    res.json({ ok: true, modo: 'ENVIADO', enviados, fallidos, sin_telefono: sinTelefono, restantes,
+      nota: restantes > 0 ? `Quedan ${restantes} dormidos. Mañana se mandan los siguientes ${tope}.` : 'No quedan más dormidos por reactivar.',
+      errores });
+  } catch (err) {
+    console.error('[reactivacion/enviar]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ===== PANEL con los botones (abrir en el navegador) =====
 // GET /api/panel-envios
 app.get("/api/panel-envios", (req, res) => {
@@ -6527,9 +6671,26 @@ app.get("/api/panel-envios", (req, res) => {
   <button class="send" onclick="run('rescates',true)">Enviar ahora</button>
 </div>
 
+<div class="card">
+  <h2>Reactivación (dormidos +90 días)</h2>
+  <p>Pacientes que se atendieron pero llevan 90+ dias sin volver y no tienen hora futura. Manda reactivacion_paciente. Tope diario de seguridad.</p>
+  <button class="prev" onclick="runReactiv(false)">Previsualizar</button>
+  <button class="send" onclick="runReactiv(true)">Enviar ahora</button>
+</div>
+
 <pre id="out">Aqui aparece el resultado...</pre>
 
 <script>
+async function runReactiv(enviar){
+  var out=document.getElementById('out');
+  if(enviar && !confirm('Seguro? Esto envia mensajes de reactivacion REALES por WhatsApp (marketing). Respeta el tope diario.')) return;
+  out.textContent='Procesando...';
+  try{
+    var r=await fetch('/api/reactivacion/enviar',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(enviar?{confirmar:'ENVIAR'}:{})});
+    var j=await r.json();
+    out.textContent=JSON.stringify(j,null,2);
+  }catch(e){ out.textContent='Error: '+e.message; }
+}
 async function run(tipo, enviar){
   var out=document.getElementById('out');
   if(enviar && !confirm('Seguro? Esto envia mensajes REALES por WhatsApp a los pacientes.')) return;
@@ -7044,6 +7205,32 @@ app.listen(PORT, async () => {
           console.log('[cron 8am] Rescates enviados:', env);
         }
       } catch (e) { console.error('[cron 8am rescates]', e.message); }
+
+      // REACTIVACIÓN de pacientes dormidos (interruptor propio)
+      try {
+        if (String(process.env.REACTIVACION_AUTOMATICA_ACTIVO).toLowerCase() === 'true') {
+          const contentRe = process.env.TWILIO_CONTENT_SID_REACTIVACION;
+          if (contentRe) {
+            const candidatos = await _candidatosReactivacion(500);
+            const vistos = new Set(); let env = 0;
+            for (const c of candidatos) {
+              const d = telefonoParaWaMe(c.telefonos); if (!d) continue;
+              if (vistos.has(d)) continue; vistos.add(d);
+              if (env >= _REACTIVACION_TOPE) break;
+              const r = await twilioEnviarPlantilla(c.telefonos, contentRe, variablesReactivacion(c));
+              if (r.ok) {
+                env++;
+                await pool.query(
+                  `INSERT INTO bot_reactivacion_log (id_paciente, rut, nombre_paciente, telefono, ultima_cita_previa, dias_sin_volver, mensaje_enviado, estado, contactado_en)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,'contactado',NOW())`,
+                  [c.id_paciente, c.rut, c.paciente, c.telefonos, c.ultima_cita, c.dias_sin_volver, 'reactivacion_paciente']);
+              }
+              await _sleep(_ENVIO_DELAY_MS);
+            }
+            console.log('[cron 8am] Reactivación enviados:', env);
+          }
+        }
+      } catch (e) { console.error('[cron 8am reactivacion]', e.message); }
 
       console.log('[cron 8am] Envío automático diario completado.');
     } catch (err) {
