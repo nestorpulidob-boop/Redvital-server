@@ -3240,18 +3240,32 @@ async function procesarConversacionConTools(mensajeUsuario, opciones = {}) {
 function _interpretarRespuesta(texto) {
   const t = (texto || '').trim().toLowerCase()
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-  // SÍ
-  if (/^(1|si|si confirmo|confirmo|confirmado|dale|ya|obvio|asistire|asisto|voy|si voy)\b/.test(t)) return 'si';
-  if (t === '1' || t === 'si' || t === 'sí') return 'si';
-  // NO
-  if (/^(2|no|no puedo|no voy|no podre|no asistire|cancelar|cancela|reagendar|reagenda)\b/.test(t)) return 'no';
-  if (t === '2' || t === 'no') return 'no';
+  if (!t) return null;
+
+  // Atajos exactos (1 = sí, 2 = no)
+  if (t === '1') return 'si';
+  if (t === '2') return 'no';
+
+  // NO primero (más específico): "no puedo", "no voy", "reagendar", etc.
+  // \b = límite de palabra, buscamos en CUALQUIER parte del mensaje.
+  const NO = /\b(no puedo|no voy|no podre|no podré|no asistire|no asistiré|no asisto|no ire|no iré|no alcanzo|no me sirve|reagendar|reagenda|reagende|reagendo|cancelar|cancela|cancelo|anular|posponer|otra fecha|otro dia|otro día)\b/;
+  if (NO.test(t)) return 'no';
+
+  // SÍ: "si", "sip", "sipo", "siii", "confirmo", "ahi estare", "voy", "asisto", "dale", "obvio"
+  const SI = /\b(si|sii+|sip|sipo|sips|claro|confirmo|confirmado|confirmada|dale|obvio|por supuesto|asistire|asistiré|asisto|ahi estare|ahí estaré|ahi voy|alli estare|alli estaré|cuente con|cuenten con|ahi estoy|presente)\b/;
+  if (SI.test(t)) return 'si';
+
+  // "voy" suelto (pero no si ya dijo "no voy", que se captó arriba)
+  if (/\bvoy\b/.test(t)) return 'si';
+
+  // "no" suelto al final (después de descartar todo lo de arriba)
+  if (/\bno\b/.test(t)) return 'no';
+
   return null;
 }
 
 async function detectarConfirmacion(wa_id, texto) {
   const resp = _interpretarRespuesta(texto);
-  if (!resp) return null;
 
   const digits = (wa_id || '').replace(/\D/g, '');
   const hoy = new Date(Date.now() - 4 * 3600000).toISOString().slice(0, 10);
@@ -3265,6 +3279,8 @@ async function detectarConfirmacion(wa_id, texto) {
     [digits.slice(-8)]
   );
   if (reco.rows.length > 0) {
+    // Si no se entendió la respuesta, marcamos que hay pendiente pero sin cambiar estado.
+    if (!resp) return { manejado: true, tipo: 'recordatorio', respuesta: 'ambiguo', hay_pendiente: true };
     const nuevoEstado = resp === 'si' ? 'confirmado' : 'cancelado';
     await pool.query(
       `UPDATE bot_recordatorios_log
@@ -3283,6 +3299,7 @@ async function detectarConfirmacion(wa_id, texto) {
     [digits.slice(-8)]
   );
   if (res.rows.length > 0) {
+    if (!resp) return { manejado: true, tipo: 'rescate', respuesta: 'ambiguo', hay_pendiente: true };
     const nuevoEstado = resp === 'si' ? 'reagendo' : 'rechazo';
     await pool.query(
       `UPDATE bot_rescates_log
@@ -3315,7 +3332,26 @@ async function procesarMensajeBot(wa_id, texto, referral, provider) {
     await guardarMensaje(wa_id, 'out', msg, { datos: { confirmacion: conf } });
     return;
   }
-  // Si dijo NO (o cualquier otra cosa), dejamos que el bot responda y ofrezca ayuda.
+
+  if (conf && conf.respuesta === 'no') {
+    // Dijo NO / reagendar: respondemos amable y derivamos a secretaría. NO metemos al bot.
+    const msg = conf.tipo === 'recordatorio'
+      ? `Entendido, gracias por avisar 🙏 Para reagendar tu hora escríbele a nuestra secretaría: ${WHATSAPP_SECRETARIAS}`
+      : `Gracias por responder 🙏 Para coordinar tu nueva hora escríbele a nuestra secretaría: ${WHATSAPP_SECRETARIAS}`;
+    await enviarMensajeWhatsApp(provider, wa_id, msg);
+    await guardarMensaje(wa_id, 'out', msg, { datos: { confirmacion: conf } });
+    return;
+  }
+
+  if (conf && conf.respuesta === 'ambiguo' && conf.hay_pendiente) {
+    // Había un recordatorio/rescate pendiente pero no entendimos el SÍ/NO.
+    // Respondemos neutro y amable, sin meter al bot (evita el "error técnico").
+    const msg = `¡Hola! 👋 Gracias por tu mensaje. Para confirmar o reagendar tu hora, nuestra secretaría te ayuda directo por aquí: ${WHATSAPP_SECRETARIAS} 🙏`;
+    await enviarMensajeWhatsApp(provider, wa_id, msg);
+    await guardarMensaje(wa_id, 'out', msg, { datos: { confirmacion: conf } });
+    return;
+  }
+  // Si no había recordatorio/rescate pendiente, es una conversación normal: que responda el bot.
 
   const resultado = await procesarConversacionConTools(texto || '(mensaje sin texto)', { waId: wa_id });
   await enviarMensajeWhatsApp(provider, wa_id, resultado.texto);
