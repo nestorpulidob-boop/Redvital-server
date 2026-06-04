@@ -6869,4 +6869,87 @@ app.listen(PORT, async () => {
     sincronizarCatalogo('programada').catch(err => console.error('[sync programada]', err.message));
   }, 6 * 60 * 60 * 1000);
   console.log('[sync] Programada: primera en 30s, después cada 6h');
+
+  // ============================================================
+  // v5.51 - CRON ENVÍO AUTOMÁTICO 8:00 AM (hora Chile, UTC-4)
+  // Interruptor: ENVIO_AUTOMATICO_ACTIVO=true en Render (default OFF)
+  // Revisa cada 15 min si es la hora; envía 1 vez al día.
+  // ============================================================
+  let _ultimoEnvioAutoFecha = null;
+  async function _chequeoEnvioAutomatico() {
+    try {
+      if (String(process.env.ENVIO_AUTOMATICO_ACTIVO).toLowerCase() !== 'true') return;
+      const ahoraCL = new Date(Date.now() - 4 * 3600000);
+      const hora = ahoraCL.getUTCHours();      // hora "Chile" porque restamos 4h
+      const fechaCL = ahoraCL.toISOString().slice(0, 10);
+      // Disparar entre las 8:00 y 8:14 (la ventana del chequeo de 15 min)
+      if (hora !== 8) return;
+      if (_ultimoEnvioAutoFecha === fechaCL) return; // ya envié hoy
+      _ultimoEnvioAutoFecha = fechaCL;
+      console.log('[cron 8am] Iniciando envío automático diario...');
+
+      // RECORDATORIOS de mañana
+      try {
+        const contentR = process.env.TWILIO_CONTENT_SID_RECORDATORIO;
+        if (contentR) {
+          const manana = new Date(ahoraCL); manana.setUTCDate(manana.getUTCDate() + 1);
+          const fechaT = manana.toISOString().slice(0, 10);
+          const { rows } = await pool.query(`
+            SELECT c.uuid_cita, c.rut, c.paciente, c.telefonos, c.fecha::text AS fecha,
+                   c.hora_inicio::text AS hora_inicio, c.profesional, c.sucursal, c.tratamiento, c.estado_cita,
+                   r.estado AS recordatorio_estado
+            FROM citas c
+            LEFT JOIN bot_recordatorios_log r ON r.uuid_cita = c.uuid_cita AND r.fecha_cita = c.fecha
+            WHERE c.fecha = $1 AND c.estado_cita NOT IN ('Eliminado','Suspendió') AND c.paciente IS NOT NULL
+            ORDER BY c.hora_inicio NULLS LAST`, [fechaT]);
+          const vistos = new Set(); let env = 0;
+          for (const r of rows) {
+            const d = telefonoParaWaMe(r.telefonos); if (!d) continue;
+            if (r.recordatorio_estado && r.recordatorio_estado !== 'pendiente') continue;
+            if (vistos.has(d)) continue; vistos.add(d);
+            if (env >= _ENVIO_CAP) break;
+            const res = await twilioEnviarPlantilla(r.telefonos, contentR, variablesRecordatorio(r));
+            if (res.ok) { env++; await upsertRecordatorioLog(r, 'enviado', construirMensajeRecordatorio(r), 'twilio_auto'); }
+            await _sleep(_ENVIO_DELAY_MS);
+          }
+          console.log('[cron 8am] Recordatorios enviados:', env);
+        }
+      } catch (e) { console.error('[cron 8am recordatorios]', e.message); }
+
+      // RESCATES (faltaron últimos 7 días, sin cita futura)
+      try {
+        const contentS = process.env.TWILIO_CONTENT_SID_RESCATE;
+        if (contentS) {
+          const hasta = new Date(ahoraCL.getTime() - 1 * 86400000).toISOString().slice(0, 10);
+          const desde = new Date(ahoraCL.getTime() - 7 * 86400000).toISOString().slice(0, 10);
+          const { rows } = await pool.query(`
+            SELECT c.uuid_cita, c.rut, c.paciente, c.telefonos, c.fecha::text AS fecha,
+                   c.hora_inicio::text AS hora_inicio, c.profesional, c.sucursal, c.tratamiento, c.estado_cita,
+                   r.estado_rescate
+            FROM citas c
+            LEFT JOIN bot_rescates_log r ON r.uuid_cita = c.uuid_cita
+            WHERE c.fecha BETWEEN $1 AND $2 AND c.estado_cita IN ('Suspendió','No llegó') AND c.paciente IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM citas c2 WHERE c2.id_paciente = c.id_paciente AND c2.fecha >= CURRENT_DATE AND c2.estado_cita NOT IN ('Eliminado','Suspendió','No llegó'))
+            ORDER BY c.fecha DESC`, [desde, hasta]);
+          const vistos = new Set(); let env = 0;
+          for (const r of rows) {
+            const d = telefonoParaWaMe(r.telefonos); if (!d) continue;
+            if (r.estado_rescate && r.estado_rescate !== 'pendiente') continue;
+            if (vistos.has(d)) continue; vistos.add(d);
+            if (env >= _ENVIO_CAP) break;
+            const res = await twilioEnviarPlantilla(r.telefonos, contentS, variablesRescate(r));
+            if (res.ok) { env++; await upsertRescateLog(r, 'contactado', construirMensajeRescate(r), 'twilio_auto'); }
+            await _sleep(_ENVIO_DELAY_MS);
+          }
+          console.log('[cron 8am] Rescates enviados:', env);
+        }
+      } catch (e) { console.error('[cron 8am rescates]', e.message); }
+
+      console.log('[cron 8am] Envío automático diario completado.');
+    } catch (err) {
+      console.error('[cron 8am]', err.message);
+    }
+  }
+  setInterval(_chequeoEnvioAutomatico, 15 * 60 * 1000); // cada 15 min
+  console.log('[cron 8am] Programado (revisa cada 15 min; activo solo si ENVIO_AUTOMATICO_ACTIVO=true)');
 });
