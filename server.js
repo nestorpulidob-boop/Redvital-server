@@ -6413,7 +6413,7 @@ app.post("/api/recordatorios/enviar-masivo", async (req, res) => {
       FROM citas c
       LEFT JOIN bot_recordatorios_log r ON r.uuid_cita = c.uuid_cita AND r.fecha_cita = c.fecha
       WHERE c.fecha = $1 ${whereSuc}
-        AND c.estado_cita NOT IN ('Eliminado','Suspendió','Atendido','Llegó')
+        AND c.estado_cita NOT IN ('Eliminado','Suspendió','Atendido','Llegó','Lista de Espera')
         AND c.paciente IS NOT NULL
         AND NOT EXISTS (
           SELECT 1 FROM bot_pacientes bp
@@ -7151,7 +7151,7 @@ app.listen(PORT, async () => {
                    r.estado AS recordatorio_estado
             FROM citas c
             LEFT JOIN bot_recordatorios_log r ON r.uuid_cita = c.uuid_cita AND r.fecha_cita = c.fecha
-            WHERE c.fecha = $1 AND c.estado_cita NOT IN ('Eliminado','Suspendió','Atendido','Llegó') AND c.paciente IS NOT NULL
+            WHERE c.fecha = $1 AND c.estado_cita NOT IN ('Eliminado','Suspendió','Atendido','Llegó','Lista de Espera') AND c.paciente IS NOT NULL
               AND NOT EXISTS (
                 SELECT 1 FROM bot_pacientes bp
                 WHERE bp.no_contactar = TRUE
