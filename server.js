@@ -3403,6 +3403,9 @@ async function procesarMensajeBot(wa_id, texto, referral, provider) {
   }
 
   // v5.46: ¿es respuesta a un recordatorio/rescate?
+  let conf = null;
+  try { conf = await detectarConfirmacion(wa_id, texto); }
+  catch (e) { console.error('[confirmacion] error', e.message); }
 
   if (conf && conf.respuesta === 'si') {
     // Confirmó: marcamos (ya hecho) y NO lo molestamos con el bot.
