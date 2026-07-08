@@ -4753,7 +4753,7 @@ app.get("/api/kpis/tablero", async (req, res) => {
         COUNT(*) FILTER (WHERE estado_cita IN ${CA})::int AS canceladas,
         COUNT(DISTINCT COALESCE(NULLIF(rut,''), id_paciente::text))::int AS pacientes_unicos,
         COUNT(DISTINCT profesional)::int AS profesionales_activos,
-        COUNT(DISTINCT COALESCE(NULLIF(especialidad,''), tratamiento))::int AS especialidades_activas
+        COUNT(DISTINCT COALESCE(NULLIF(tratamiento,''), NULLIF(agenda,'')))::int AS especialidades_activas
       FROM citas
       WHERE fecha BETWEEN $1::date AND $2::date AND ${filtroSuc}
     `;
