@@ -6784,6 +6784,104 @@ async function _candidatosReactivacion(limite) {
 }
 
 // POST /api/reactivacion/enviar  { confirmar }  -> dry-run salvo confirmar='ENVIAR'
+// ============================================================
+// GET /api/reactivacion/resultados (v5.55)
+// Mide cuántos pacientes contactados VOLVIERON de verdad (tuvieron cita
+// atendida después de ser contactados) y cuánta plata generaron.
+// ============================================================
+app.get("/api/reactivacion/resultados", async (req, res) => {
+  try {
+    const A = inList(ESTADOS.ATENDIDA);
+    const VV = inList(ESTADOS_VENTA_VALIDA);
+
+    // Resumen general: contactados, respondieron, recuperados (volvieron a atenderse)
+    const resumenSql = `
+      WITH contactos AS (
+        SELECT DISTINCT ON (id_paciente) id_paciente, nombre_paciente, telefono, rut,
+          contactado_en, estado, ultima_cita_previa
+        FROM bot_reactivacion_log
+        WHERE id_paciente IS NOT NULL
+        ORDER BY id_paciente, contactado_en DESC
+      )
+      SELECT
+        COUNT(*)::int AS total_contactados,
+        COUNT(*) FILTER (WHERE estado = 'interesado')::int AS respondieron_interesados,
+        COUNT(*) FILTER (WHERE estado = 'rechazo')::int AS rechazaron,
+        COUNT(*) FILTER (WHERE EXISTS (
+          SELECT 1 FROM citas c
+          WHERE c.id_paciente = contactos.id_paciente::text
+            AND c.estado_cita IN ${A}
+            AND c.fecha > contactos.contactado_en::date
+        ))::int AS recuperados
+      FROM contactos
+    `;
+
+    // Plata generada por los recuperados (ventas después del contacto)
+    const plataSql = `
+      WITH contactos AS (
+        SELECT DISTINCT ON (id_paciente) id_paciente, contactado_en
+        FROM bot_reactivacion_log WHERE id_paciente IS NOT NULL
+        ORDER BY id_paciente, contactado_en DESC
+      )
+      SELECT COALESCE(SUM(v.valor_pagado),0)::bigint AS ingreso_recuperado,
+        COUNT(DISTINCT v.id_paciente)::int AS pacientes_con_venta
+      FROM ventas v JOIN contactos ct ON ct.id_paciente = v.id_paciente::text
+      WHERE v.estado_venta IN ${VV}
+        AND v.fecha > ct.contactado_en::date
+    `;
+
+    // Lista detallada de los recuperados (para ver quiénes son)
+    const listaSql = `
+      WITH contactos AS (
+        SELECT DISTINCT ON (id_paciente) id_paciente, nombre_paciente, telefono, contactado_en
+        FROM bot_reactivacion_log WHERE id_paciente IS NOT NULL
+        ORDER BY id_paciente, contactado_en DESC
+      )
+      SELECT ct.nombre_paciente, ct.telefono, ct.contactado_en::date AS contactado,
+        MIN(c.fecha) AS volvio_el,
+        COALESCE((SELECT SUM(v.valor_pagado) FROM ventas v
+          WHERE v.id_paciente::text = ct.id_paciente AND v.fecha > ct.contactado_en::date
+            AND v.estado_venta IN ${VV}),0)::bigint AS gasto
+      FROM contactos ct
+      JOIN citas c ON c.id_paciente = ct.id_paciente::text
+        AND c.estado_cita IN ${A} AND c.fecha > ct.contactado_en::date
+      GROUP BY ct.nombre_paciente, ct.telefono, ct.contactado_en, ct.id_paciente
+      ORDER BY volvio_el DESC
+      LIMIT 100
+    `;
+
+    const [resumenR, plataR, listaR] = await Promise.all([
+      pool.query(resumenSql),
+      pool.query(plataSql),
+      pool.query(listaSql),
+    ]);
+
+    const r = resumenR.rows[0] || {};
+    const p = plataR.rows[0] || {};
+    const totalContactados = r.total_contactados || 0;
+    const recuperados = r.recuperados || 0;
+
+    // Costo estimado: ~$0.03 por mensaje de marketing (referencia Twilio+Meta)
+    const costoEstimado = Math.round(totalContactados * 0.03 * 950); // en CLP aprox (0.03 USD * ~950)
+
+    res.json({
+      ok: true,
+      total_contactados: totalContactados,
+      respondieron_interesados: r.respondieron_interesados || 0,
+      rechazaron: r.rechazaron || 0,
+      recuperados: recuperados,
+      tasa_recuperacion: totalContactados ? +(100 * recuperados / totalContactados).toFixed(1) : 0,
+      ingreso_recuperado: Number(p.ingreso_recuperado || 0),
+      costo_estimado_clp: costoEstimado,
+      retorno_inversion: costoEstimado > 0 ? +(Number(p.ingreso_recuperado || 0) / costoEstimado).toFixed(1) : 0,
+      lista_recuperados: listaR.rows || [],
+    });
+  } catch (err) {
+    console.error('[reactivacion/resultados]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post("/api/reactivacion/enviar", async (req, res) => {
   try {
     const { confirmar, limite } = req.body || {};
