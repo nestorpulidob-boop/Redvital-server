@@ -4730,6 +4730,157 @@ app.get("/api/marketing/roi", async (req, res) => {
 });
 
 // ============================================================
+// ENDPOINT: GET /api/kpis/tablero (v5.54) - Tablero ejecutivo de KPIs
+// Junta las 5 áreas: operación, dinero, pacientes, pérdidas, equipo
+// ============================================================
+app.get("/api/kpis/tablero", async (req, res) => {
+  try {
+    const { desde, hasta, sucursal } = parseRango(req);
+    const A = inList(ESTADOS.ATENDIDA);
+    const NS = inList(ESTADOS.NO_SHOW);
+    const SU = inList(ESTADOS.SUSPENDIDA);
+    const CA = inList(ESTADOS.CANCELADA);
+    const VV = inList(ESTADOS_VENTA_VALIDA);
+    const filtroSuc = "($3::text IS NULL OR sucursal = $3)";
+
+    // 1) Bloque de CITAS (operación + pérdidas + equipo)
+    const citasSql = `
+      SELECT
+        COUNT(*)::int AS total_citas,
+        COUNT(*) FILTER (WHERE estado_cita IN ${A})::int AS atendidas,
+        COUNT(*) FILTER (WHERE estado_cita IN ${NS})::int AS no_show,
+        COUNT(*) FILTER (WHERE estado_cita IN ${SU})::int AS suspendidas,
+        COUNT(*) FILTER (WHERE estado_cita IN ${CA})::int AS canceladas,
+        COUNT(DISTINCT COALESCE(NULLIF(rut,''), id_paciente::text))::int AS pacientes_unicos,
+        COUNT(DISTINCT profesional)::int AS profesionales_activos,
+        COUNT(DISTINCT COALESCE(NULLIF(especialidad,''), tratamiento))::int AS especialidades_activas
+      FROM citas
+      WHERE fecha BETWEEN $1::date AND $2::date AND ${filtroSuc}
+    `;
+
+    // 2) Bloque de VENTAS (dinero)
+    const ventasSql = `
+      SELECT
+        COALESCE(SUM(valor_pagado),0)::bigint AS ingresos,
+        COUNT(*)::int AS num_ventas,
+        COUNT(DISTINCT id_paciente)::int AS pacientes_pagaron
+      FROM ventas
+      WHERE fecha BETWEEN $1::date AND $2::date
+        AND estado_venta IN ${VV}
+        AND ($3::text IS NULL OR sucursal = $3)
+    `;
+
+    // 3) Pacientes nuevos vs recurrentes en el período
+    const nuevosSql = `
+      WITH primera AS (
+        SELECT id_paciente, MIN(fecha) AS pf FROM citas WHERE id_paciente IS NOT NULL GROUP BY id_paciente
+      )
+      SELECT
+        COUNT(DISTINCT c.id_paciente) FILTER (WHERE p.pf BETWEEN $1::date AND $2::date)::int AS nuevos,
+        COUNT(DISTINCT c.id_paciente) FILTER (WHERE p.pf < $1::date)::int AS recurrentes
+      FROM citas c JOIN primera p ON p.id_paciente = c.id_paciente
+      WHERE c.fecha BETWEEN $1::date AND $2::date AND ${filtroSuc} AND c.id_paciente IS NOT NULL
+    `;
+
+    // 4) Tasa de retorno: de los nuevos que tuvieron 1a cita hace 30-180 días, ¿cuántos volvieron después?
+    const retornoSql = `
+      WITH primera AS (
+        SELECT id_paciente, MIN(fecha) AS pf FROM citas WHERE id_paciente IS NOT NULL GROUP BY id_paciente
+      ), base AS (
+        SELECT p.id_paciente, p.pf FROM primera p
+        WHERE p.pf BETWEEN CURRENT_DATE - INTERVAL '180 days' AND CURRENT_DATE - INTERVAL '30 days'
+      )
+      SELECT
+        COUNT(*)::int AS base_nuevos,
+        COUNT(*) FILTER (WHERE EXISTS (
+          SELECT 1 FROM citas c2 WHERE c2.id_paciente = b.id_paciente AND c2.fecha > b.pf
+            AND c2.estado_cita IN ${A}
+        ))::int AS volvieron
+      FROM base b
+    `;
+
+    // 5) Profesionales: productividad y no-show por profesional (top)
+    const profSql = `
+      SELECT profesional,
+        COUNT(*) FILTER (WHERE estado_cita IN ${A})::int AS atendidas,
+        COUNT(*) FILTER (WHERE estado_cita IN ${NS})::int AS no_show,
+        COUNT(*)::int AS total
+      FROM citas
+      WHERE fecha BETWEEN $1::date AND $2::date AND ${filtroSuc}
+        AND profesional IS NOT NULL AND profesional <> ''
+      GROUP BY profesional
+      ORDER BY atendidas DESC
+      LIMIT 10
+    `;
+
+    const params = [desde, hasta, sucursal];
+    const [citasR, ventasR, nuevosR, retornoR, profR] = await Promise.all([
+      pool.query(citasSql, params),
+      pool.query(ventasSql, params),
+      pool.query(nuevosSql, params),
+      pool.query(retornoSql, []),
+      pool.query(profSql, params),
+    ]);
+
+    const c = citasR.rows[0] || {};
+    const v = ventasR.rows[0] || {};
+    const n = nuevosR.rows[0] || {};
+    const r = retornoR.rows[0] || {};
+
+    const totalCitas = c.total_citas || 0;
+    const perdidas = (c.no_show || 0) + (c.suspendidas || 0) + (c.canceladas || 0);
+    const ticketPromedio = v.num_ventas > 0 ? Math.round(v.ingresos / v.num_ventas) : 0;
+    const ingresoPerdidoEstimado = (c.no_show || 0) * (ticketPromedio || TICKET_PROMEDIO);
+
+    res.json({
+      ok: true,
+      periodo: { desde, hasta },
+      operacion: {
+        total_citas: totalCitas,
+        atendidas: c.atendidas || 0,
+        pct_atencion: totalCitas ? +(100 * (c.atendidas || 0) / totalCitas).toFixed(1) : 0,
+        pct_no_show: totalCitas ? +(100 * (c.no_show || 0) / totalCitas).toFixed(1) : 0,
+        profesionales_activos: c.profesionales_activos || 0,
+        especialidades_activas: c.especialidades_activas || 0,
+      },
+      dinero: {
+        ingresos: Number(v.ingresos || 0),
+        num_ventas: v.num_ventas || 0,
+        ticket_promedio: ticketPromedio,
+        ingreso_por_atencion: (c.atendidas || 0) ? Math.round(Number(v.ingresos || 0) / c.atendidas) : 0,
+      },
+      pacientes: {
+        unicos: c.pacientes_unicos || 0,
+        nuevos: n.nuevos || 0,
+        recurrentes: n.recurrentes || 0,
+        pct_nuevos: (c.pacientes_unicos) ? +(100 * (n.nuevos || 0) / c.pacientes_unicos).toFixed(1) : 0,
+        tasa_retorno: r.base_nuevos ? +(100 * (r.volvieron || 0) / r.base_nuevos).toFixed(1) : 0,
+        retorno_base: r.base_nuevos || 0,
+        retorno_volvieron: r.volvieron || 0,
+      },
+      perdidas: {
+        no_show: c.no_show || 0,
+        suspendidas: c.suspendidas || 0,
+        canceladas: c.canceladas || 0,
+        total_perdidas: perdidas,
+        pct_perdidas: totalCitas ? +(100 * perdidas / totalCitas).toFixed(1) : 0,
+        ingreso_perdido_estimado: ingresoPerdidoEstimado,
+      },
+      equipo: (profR.rows || []).map(p => ({
+        profesional: p.profesional,
+        atendidas: p.atendidas,
+        no_show: p.no_show,
+        total: p.total,
+        pct_no_show: p.total ? +(100 * p.no_show / p.total).toFixed(1) : 0,
+      })),
+    });
+  } catch (err) {
+    console.error('[kpis/tablero]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================================
 // ENDPOINT: GET /api/metas/equilibrio (v5.41)
 // ============================================================
 app.get("/api/metas/equilibrio", async (req, res) => {
