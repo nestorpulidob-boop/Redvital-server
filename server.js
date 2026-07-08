@@ -398,7 +398,7 @@ function parseRango(req) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(desde) || !/^\d{4}-\d{2}-\d{2}$/.test(hasta)) {
     throw new Error("Formato de fecha invalido. Usar YYYY-MM-DD");
   }
-  return { desde, hasta, sede, sucursal: sucursalFromSede(sede) };
+  return { desde, hasta, sede, sucursal: sucursalFromSede(sede), limite: req.query.limite };
 }
 
 const FILTRO = `fecha BETWEEN $1::date AND $2::date AND ($3::text IS NULL OR sucursal = $3)`;
@@ -764,6 +764,46 @@ async function metricaPacientesNuevos({ desde, hasta, sucursal }) {
     citas_promedio_nuevos: r.pacientes_nuevos ? +((r.citas_nuevos || 0) / r.pacientes_nuevos).toFixed(2) : 0,
     citas_promedio_recurrentes: r.pacientes_recurrentes ? +((r.citas_recurrentes || 0) / r.pacientes_recurrentes).toFixed(2) : 0
   };
+}
+
+// v5.54 - Pacientes VIP: los que MÁS acuden (atendidas) y cuánto han gastado
+async function metricaPacientesVIP({ desde, hasta, sucursal, limite }) {
+  const lim = Math.min(parseInt(limite) || 30, 100);
+  const sql = `
+    WITH atendidas AS (
+      SELECT c.id_paciente,
+        MAX(c.paciente) AS paciente,
+        MAX(NULLIF(c.rut,'')) AS rut,
+        MAX(NULLIF(c.telefonos,'')) AS telefonos,
+        MAX(NULLIF(c.mail,'')) AS mail,
+        COUNT(*) FILTER (WHERE c.estado_cita IN ${inList(ESTADOS.ATENDIDA)})::int AS visitas,
+        MAX(c.fecha) FILTER (WHERE c.estado_cita IN ${inList(ESTADOS.ATENDIDA)}) AS ultima_visita,
+        MIN(c.fecha) AS primera_visita
+      FROM citas c
+      WHERE c.fecha BETWEEN $1::date AND $2::date
+        AND ($3::text IS NULL OR c.sucursal = $3)
+        AND c.id_paciente IS NOT NULL
+      GROUP BY c.id_paciente
+    ), gasto AS (
+      SELECT id_paciente, COALESCE(SUM(valor_pagado),0)::bigint AS gastado
+      FROM ventas
+      WHERE fecha BETWEEN $1::date AND $2::date
+        AND estado_venta IN ${inList(ESTADOS_VENTA_VALIDA)}
+        AND id_paciente IS NOT NULL
+      GROUP BY id_paciente
+    )
+    SELECT a.id_paciente, a.paciente, a.rut, a.telefonos, a.mail,
+      a.visitas, a.ultima_visita, a.primera_visita,
+      COALESCE(g.gastado, 0)::bigint AS gastado,
+      (CURRENT_DATE - a.ultima_visita)::int AS dias_desde_ultima
+    FROM atendidas a
+    LEFT JOIN gasto g ON g.id_paciente = a.id_paciente
+    WHERE a.visitas >= 1
+    ORDER BY a.visitas DESC, gastado DESC
+    LIMIT ${lim}
+  `;
+  const { rows } = await pool.query(sql, [desde, hasta, sucursal]);
+  return rows;
 }
 
 async function metricaOrigenAmpliado({ desde, hasta, sucursal }) {
@@ -1373,6 +1413,7 @@ app.get("/api/metricas/profesional-comparativa", wrap(metricaProfesionalComparat
 app.get("/api/metricas/alertas", wrap(metricaAlertas));
 app.get("/api/metricas/origen-ampliado", wrap(metricaOrigenAmpliado));
 app.get("/api/metricas/pacientes-nuevos", wrap(metricaPacientesNuevos));
+app.get("/api/metricas/pacientes-vip", wrap(metricaPacientesVIP));
 
 app.get("/api/campanias", async (req, res) => {
   try {
