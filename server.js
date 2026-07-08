@@ -6809,7 +6809,7 @@ app.get("/api/reactivacion/resultados", async (req, res) => {
         COUNT(*) FILTER (WHERE estado = 'rechazo')::int AS rechazaron,
         COUNT(*) FILTER (WHERE EXISTS (
           SELECT 1 FROM citas c
-          WHERE c.id_paciente = contactos.id_paciente::text
+          WHERE c.id_paciente::text = contactos.id_paciente
             AND c.estado_cita IN ${A}
             AND c.fecha > contactos.contactado_en::date
         ))::int AS recuperados
@@ -6843,7 +6843,7 @@ app.get("/api/reactivacion/resultados", async (req, res) => {
           WHERE v.id_paciente::text = ct.id_paciente AND v.fecha > ct.contactado_en::date
             AND v.estado_venta IN ${VV}),0)::bigint AS gasto
       FROM contactos ct
-      JOIN citas c ON c.id_paciente = ct.id_paciente::text
+      JOIN citas c ON c.id_paciente::text = ct.id_paciente
         AND c.estado_cita IN ${A} AND c.fecha > ct.contactado_en::date
       GROUP BY ct.nombre_paciente, ct.telefono, ct.contactado_en, ct.id_paciente
       ORDER BY volvio_el DESC
