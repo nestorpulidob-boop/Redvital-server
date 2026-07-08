@@ -6773,7 +6773,7 @@ async function _candidatosReactivacion(limite) {
     WHERE h.atendidas_total >= 1
       AND h.ultima_cita < CURRENT_DATE - INTERVAL '90 days'
       AND h.id_paciente NOT IN (SELECT id_paciente FROM con_futuro)
-      AND h.id_paciente NOT IN (SELECT id_paciente::text FROM bot_reactivacion_log WHERE id_paciente IS NOT NULL)
+      AND h.id_paciente::text NOT IN (SELECT id_paciente::text FROM bot_reactivacion_log WHERE id_paciente IS NOT NULL)
       AND NOT EXISTS (
         SELECT 1 FROM bot_pacientes bp WHERE bp.no_contactar = TRUE
           AND regexp_replace(dp.telefonos, '\D', '', 'g') LIKE '%' || RIGHT(regexp_replace(bp.wa_id, '\D', '', 'g'), 8)
