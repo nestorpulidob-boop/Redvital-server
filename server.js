@@ -6797,7 +6797,7 @@ app.get("/api/reactivacion/resultados", async (req, res) => {
     // Resumen general: contactados, respondieron, recuperados (volvieron a atenderse)
     const resumenSql = `
       WITH contactos AS (
-        SELECT DISTINCT ON (id_paciente) id_paciente, nombre_paciente, telefono, rut,
+        SELECT DISTINCT ON (id_paciente) id_paciente::text AS id_paciente, nombre_paciente, telefono, rut,
           contactado_en, estado, ultima_cita_previa
         FROM bot_reactivacion_log
         WHERE id_paciente IS NOT NULL
@@ -6819,7 +6819,7 @@ app.get("/api/reactivacion/resultados", async (req, res) => {
     // Plata generada por los recuperados (ventas después del contacto)
     const plataSql = `
       WITH contactos AS (
-        SELECT DISTINCT ON (id_paciente) id_paciente, contactado_en
+        SELECT DISTINCT ON (id_paciente) id_paciente::text AS id_paciente, contactado_en
         FROM bot_reactivacion_log WHERE id_paciente IS NOT NULL
         ORDER BY id_paciente, contactado_en DESC
       )
@@ -6833,7 +6833,7 @@ app.get("/api/reactivacion/resultados", async (req, res) => {
     // Lista detallada de los recuperados (para ver quiénes son)
     const listaSql = `
       WITH contactos AS (
-        SELECT DISTINCT ON (id_paciente) id_paciente, nombre_paciente, telefono, contactado_en
+        SELECT DISTINCT ON (id_paciente) id_paciente::text AS id_paciente, nombre_paciente, telefono, contactado_en
         FROM bot_reactivacion_log WHERE id_paciente IS NOT NULL
         ORDER BY id_paciente, contactado_en DESC
       )
