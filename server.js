@@ -4774,12 +4774,15 @@ app.get("/api/kpis/tablero", async (req, res) => {
     const nuevosSql = `
       WITH primera AS (
         SELECT id_paciente, MIN(fecha) AS pf FROM citas WHERE id_paciente IS NOT NULL GROUP BY id_paciente
+      ), en_periodo AS (
+        SELECT DISTINCT c.id_paciente, p.pf
+        FROM citas c JOIN primera p ON p.id_paciente = c.id_paciente
+        WHERE c.fecha BETWEEN $1::date AND $2::date AND ${filtroSuc} AND c.id_paciente IS NOT NULL
       )
       SELECT
-        COUNT(DISTINCT c.id_paciente) FILTER (WHERE p.pf BETWEEN $1::date AND $2::date)::int AS nuevos,
-        COUNT(DISTINCT c.id_paciente) FILTER (WHERE p.pf < $1::date)::int AS recurrentes
-      FROM citas c JOIN primera p ON p.id_paciente = c.id_paciente
-      WHERE c.fecha BETWEEN $1::date AND $2::date AND ${filtroSuc} AND c.id_paciente IS NOT NULL
+        COUNT(*) FILTER (WHERE pf BETWEEN $1::date AND $2::date)::int AS nuevos,
+        COUNT(*) FILTER (WHERE pf < $1::date)::int AS recurrentes
+      FROM en_periodo
     `;
 
     // 4) Tasa de retorno: de los nuevos que tuvieron 1a cita hace 30-180 días, ¿cuántos volvieron después?
